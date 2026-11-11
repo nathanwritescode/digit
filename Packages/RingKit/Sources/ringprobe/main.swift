@@ -49,7 +49,7 @@ func fail(_ message: String) -> Never {
 
 var arguments = Array(CommandLine.arguments.dropFirst())
 
-func option(_ flag: String) -> String? {
+@MainActor func option(_ flag: String) -> String? {
     guard let i = arguments.firstIndex(of: flag) else { return nil }
     guard i + 1 < arguments.count else { fail("\(flag) needs a value") }
     let value = arguments[i + 1]
@@ -57,7 +57,7 @@ func option(_ flag: String) -> String? {
     return value
 }
 
-func flag(_ name: String) -> Bool {
+@MainActor func flag(_ name: String) -> Bool {
     guard arguments.contains(name) else { return false }
     arguments.removeAll { $0 == name }
     return true
@@ -80,7 +80,7 @@ let connection = trace ? RingConnection(onRawBytes: traceBytes) : RingConnection
 
 func connect() async throws -> RingSession {
     try await connection.connect { ($0.name ?? "").localizedCaseInsensitiveContains(ringName) }
-    return RingSession(connection: connection)
+    return RingSession(link: connection)
 }
 
 let timestamps: DateFormatter = {

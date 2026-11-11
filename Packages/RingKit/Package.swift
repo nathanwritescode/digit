@@ -15,15 +15,14 @@ let package = Package(
         // CoreBluetooth link to the ring.
         .target(
             name: "RingTransport",
-            dependencies: ["RingProtocol"],
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            dependencies: ["RingProtocol"]
         ),
         // macOS command-line tool for probing a ring and capturing raw data.
         .executableTarget(
             name: "ringprobe",
-            dependencies: ["RingProtocol", "RingTransport"],
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            dependencies: ["RingProtocol", "RingTransport"]
         ),
         .testTarget(name: "RingProtocolTests", dependencies: ["RingProtocol"]),
+        .testTarget(name: "RingTransportTests", dependencies: ["RingProtocol", "RingTransport"]),
     ]
 )
