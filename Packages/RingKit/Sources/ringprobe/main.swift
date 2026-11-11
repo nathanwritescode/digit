@@ -91,7 +91,7 @@ func recordCount(_ kind: HistoryKind, _ bytes: [UInt8]) -> String {
     case .sleep:
         let sessions = SleepSession.decode(bytes, timeZone: zone)
         return "\(sessions.count) sessions, \(sessions.reduce(0) { $0 + $1.stages.count }) stages"
-    case .combined: return "no decoder yet"
+    case .combined: return "\(CombinedRecord.decode(bytes, timeZone: zone).count) records"
     }
 }
 
@@ -114,7 +114,10 @@ func describe(_ kind: HistoryKind, _ bytes: [UInt8]) {
             }
         }
     case .combined:
-        print("  (no decoder yet; raw bytes only)")
+        func text(_ value: Int?) -> String { value.map(String.init) ?? "-" }
+        for r in CombinedRecord.decode(bytes, timeZone: zone) {
+            print("  \(timestamps.string(from: r.time))  \(r.steps) steps, hr \(text(r.heartRate)), SpO2 \(text(r.spo2)), resp \(text(r.respirationRate)), HRV \(text(r.hrv)), CVRR \(text(r.cvrr))")
+        }
     }
 }
 

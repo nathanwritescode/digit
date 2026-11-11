@@ -82,7 +82,7 @@ Continuous integration (`.github/workflows/ci.yml`) runs `swift build` and `swif
 | History transfer sequence (header, data, end frame with checksum, acknowledgement) | Verified, including a transfer spanning three data frames |
 | Acknowledging a transfer | Does not discard it: a second fetch right after returned identical bytes |
 | Activity, sleep and heart record decoders | Verified against one real night: the Swift decoders matched an independent decode for all three, and the owner confirmed the sleep times matched their night (recorded on #6). Test fixtures remain synthetic |
-| Combined record (`0x0509`, 20 bytes) | Layout matches documentation; no Swift decoder yet. Timestamp, steps, heart rate, SpO2, respiration, HRV and CVRR are plausible and agree with the other records |
+| Combined record (`0x0509`, 20 bytes) | Layout matches documentation. `CombinedRecord` decodes it (synthetic tests only; the Swift decoder has not yet been checked against a real capture). Timestamp, steps, heart rate, SpO2, respiration, HRV and CVRR are plausible and agree with the other records |
 | Heart-rate monitor interval (`0x010C`, payload `[enabled, minutes]`) | Verified at 1, 5 and 10 minutes: ack `00`, and readings arrive at that spacing, aligned to the clock. Before any setting was sent the ring measured hourly, presumably its default. Off, and reading the setting back, are untested |
 | Battery percentage (device info byte 5) | Unverified: it has read 100% at every check so far |
 | `0x0220` live snapshot, `0x0533` body data | Ring replies unsupported |
