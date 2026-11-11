@@ -6,7 +6,7 @@ let usage = """
 ringprobe: talk to a YCBT smart ring from a Mac.
 
   ringprobe scan [seconds]              list nearby Bluetooth devices
-  ringprobe info                        firmware and battery (today's activity with --show)
+  ringprobe info                        firmware and battery (device id and today's activity with --show)
   ringprobe settime                     set the ring's clock to this Mac's local time
   ringprobe history <kind>|all --save <dir>
                                         fetch stored history: \(HistoryKind.allCases.map(\.name).joined(separator: ", "))
@@ -14,7 +14,8 @@ ringprobe: talk to a YCBT smart ring from a Mac.
 
 Options:
   --name <text>     match rings whose advertised name contains <text> (default "R99")
-  --save <dir>      required with history: write the raw bytes to <dir>/<kind>-<timestamp>.hex.
+  --save <dir>      required with history: write each transfer (raw bytes as hex,
+                    plus header, fetch time and time zone) to <dir>/<kind>-<timestamp>.json.
                     The bytes are written before the transfer is acknowledged to the ring.
   --show            print health data (decoded records, reply payloads). Off by default so that
                     health data stays out of terminal logs and agent transcripts.
@@ -25,22 +26,6 @@ Options:
 The history-delete commands (0x0540-0x0552) are always refused. `raw` sends only known
 read-only commands, with their documented payloads, unless --allow-unknown is given.
 """
-
-func hex(_ bytes: [UInt8]) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
-
-func parseHex(_ text: String) -> [UInt8]? {
-    // UInt8(_:radix:) accepts a leading sign, so check the characters first.
-    guard text.count % 2 == 0, text.allSatisfy(\.isHexDigit) else { return nil }
-    var bytes: [UInt8] = []
-    var index = text.startIndex
-    while index < text.endIndex {
-        let next = text.index(index, offsetBy: 2)
-        guard let byte = UInt8(text[index..<next], radix: 16) else { return nil }
-        bytes.append(byte)
-        index = next
-    }
-    return bytes
-}
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data((message + "\n").utf8))
@@ -90,12 +75,11 @@ let timestamps: DateFormatter = {
     return formatter
 }()
 
-@Sendable func saveCapture(_ kind: HistoryKind, _ bytes: [UInt8], directory: String, stamp: String) throws {
-    let url = URL(fileURLWithPath: directory).appendingPathComponent("\(kind.name)-\(stamp).hex")
-    let text = bytes.map { String(format: "%02x", $0) }.joined() + "\n"
-    try text.write(to: url, atomically: true, encoding: .utf8)
-    // Health data: readable by the owner only.
-    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+@Sendable func saveCapture(_ transfer: HistoryTransfer, directory: String, stamp: String) throws {
+    let url = URL(fileURLWithPath: directory).appendingPathComponent("\(transfer.kind.name)-\(stamp).json")
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try PrivateFile.write(try encoder.encode(transfer), to: url.path)
     print("  saved \(url.path)")
 }
 
@@ -140,13 +124,18 @@ do {
         let seconds = operands.first.flatMap(Double.init) ?? 8
         for device in try await connection.scan(for: seconds) {
             let services = device.serviceUUIDs.isEmpty ? "" : "  services: \(device.serviceUUIDs.joined(separator: ","))"
-            print("\(String(format: "%4d", device.rssi)) dBm  \(device.name ?? "(unnamed)")\(services)")
+            // Advertised names identify devices (the ring's suffix, other people's gadgets), so
+            // they are shown only with --show.
+            let matches = (device.name ?? "").localizedCaseInsensitiveContains(ringName)
+            let label = show ? (device.name ?? "(unnamed)") : (matches ? "\(ringName) (matching ring)" : "(other device)")
+            print("\(String(format: "%4d", device.rssi)) dBm  \(label)\(services)")
         }
 
     case "info":
         let session = try await connect()
         if let info = try await session.deviceInfo() {
-            print("device id \(info.deviceID), firmware \(info.firmwareVersion), battery \(info.batteryPercent)% (state \(info.batteryState))")
+            // The device id may identify the ring, so it is health-adjacent data: --show only.
+            print("\(show ? "device id \(info.deviceID), " : "")firmware \(info.firmwareVersion), battery \(info.batteryPercent)% (state \(info.batteryState))")
         }
         if show, let activity = try await session.currentActivity() {
             print("today: \(activity.steps) steps, \(activity.distanceMeters) m, \(activity.kilocalories) kcal")
@@ -165,19 +154,25 @@ do {
         // durable to put the bytes before anything is requested.
         guard let directory = saveDirectory else { fail("history needs --save <dir>, so the data is kept before the ring is told it was received") }
         do {
-            try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+            try PrivateFile.createDirectory(directory)
+            if let mode = (try FileManager.default.attributesOfItem(atPath: directory)[.posixPermissions] as? NSNumber)?.intValue,
+               mode & 0o077 != 0 {
+                FileHandle.standardError.write(Data("warning: \(directory) is accessible to other accounts on this Mac (mode \(String(mode, radix: 8))); consider chmod 700\n".utf8))
+            }
             let testFile = URL(fileURLWithPath: directory).appendingPathComponent(".ringprobe-write-test")
-            try Data().write(to: testFile)
+            try? FileManager.default.removeItem(at: testFile)
+            try PrivateFile.write(Data(), to: testFile.path)
             try FileManager.default.removeItem(at: testFile)
         } catch {
-            fail("cannot write to \(directory): \(error.localizedDescription)")
+            fail("cannot write to \(directory): \(error)")
         }
         let stamp = timestamps.string(from: Date()).replacingOccurrences(of: " ", with: "T").replacingOccurrences(of: ":", with: "")
         let session = try await connect()
         for kind in kinds {
-            let bytes = try await session.fetchHistory(kind) { bytes in
-                try saveCapture(kind, bytes, directory: directory, stamp: stamp)
+            let transfer = try await session.fetchHistory(kind) { transfer in
+                try saveCapture(transfer, directory: directory, stamp: stamp)
             }
+            let bytes = transfer.data
             guard !bytes.isEmpty else { print("\(kind.name): empty"); continue }
             print("\(kind.name): \(bytes.count) bytes, \(recordCount(kind, bytes))")
             if show { describe(kind, bytes) }
@@ -188,8 +183,8 @@ do {
         // Validate every frame before connecting, so nothing is sent if any is refused.
         let frames: [Frame] = operands.map { operand in
             let parts = operand.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
-            guard let first = parts.first, let type = parseHex(first), type.count == 2,
-                  let payload = parseHex(parts.count > 1 ? parts[1] : "") else { fail("bad frame '\(operand)'") }
+            guard let first = parts.first, let type = Hex.decode(first), type.count == 2,
+                  let payload = Hex.decode(parts.count > 1 ? parts[1] : "") else { fail("bad frame '\(operand)'") }
             let frame = Frame(group: type[0], key: type[1], payload: payload)
             if frame.erasesRingData {
                 fail("refusing to send \(first): that range deletes history from the ring")
@@ -201,10 +196,10 @@ do {
         }
         _ = try await connect()
         for frame in frames {
-            print(">> \(hex(frame.encoded()))")
+            print(">> \(Hex.encode(frame.encoded()))")
             try await connection.send(frame)
             while let reply = await connection.nextFrame(timeout: 2.5) {
-                let body = show ? hex(reply.payload) : "\(reply.payload.count) bytes\(reply.isErrorReply ? " (rejected)" : "")"
+                let body = show ? Hex.encode(reply.payload) : "\(reply.payload.count) bytes\(reply.isErrorReply ? " (rejected)" : "")"
                 print(String(format: "<< %04X  ", reply.type) + body)
             }
         }
