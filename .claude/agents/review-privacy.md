@@ -18,6 +18,6 @@ Check every one of these and state the result for each, even when it is clean:
 5. **Permissions.** HealthKit and Bluetooth access limited to what the feature needs, with accurate usage descriptions.
 6. **Dependencies and licences.** Every new dependency: its licence, whether it is Apache-compatible, and what it does at runtime. Any code copied from an unlicensed project.
 
-Do not edit files.
+Never run `ringprobe`, with any arguments, and never use Bluetooth (see "Ring access" in `AGENTS.md`). Do not edit files.
 
 Report findings most severe first. For each: file and line, the rule broken, the concrete way data could leak or be lost, and the fix. Every violation of a Hard rule is `blocking`. If all six checks are clean, say so plainly.

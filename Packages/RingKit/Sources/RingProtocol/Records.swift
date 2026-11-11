@@ -13,7 +13,8 @@ public enum RingTime {
     }
 }
 
-/// Reply to `Command.deviceInfo`. Verified on an R99: `A3 00 20 02 00 64 …` is firmware 2.32 at 100%.
+/// Reply to `Command.deviceInfo`. Firmware version verified on an R99 (`… 20 02 …` is 2.32).
+/// The battery byte is unverified: it has read 100% at every check so far.
 public struct DeviceInfo: Equatable, Sendable {
     public var deviceID: UInt16
     public var firmwareVersion: String
@@ -44,7 +45,7 @@ public struct CurrentActivity: Equatable, Sendable {
 }
 
 /// One stored activity interval (history kind `.activity`, 14 bytes each).
-/// From documentation; not yet confirmed on hardware.
+/// Verified against one real night from an R99 (firmware 2.32); test fixtures are synthetic.
 public struct ActivityRecord: Equatable, Sendable {
     public var start: Date
     public var end: Date
@@ -65,7 +66,7 @@ public struct ActivityRecord: Equatable, Sendable {
 }
 
 /// One stored heart-rate reading (history kind `.heartRate`, 6 bytes each).
-/// From documentation; not yet confirmed on hardware.
+/// Verified against one real night from an R99 (firmware 2.32); test fixtures are synthetic.
 public struct HeartRateRecord: Equatable, Sendable {
     public var time: Date
     public var mode: UInt8
@@ -101,7 +102,7 @@ public struct SleepStage: Equatable, Sendable {
 /// Layout: 20-byte header (`AF FA`, record length u16 with header included, start u32,
 /// end u32, 8 bytes of totals), then 8-byte stages (kind u8, start u32, duration seconds u24).
 /// The header totals are ignored; totals are derived from the stages.
-/// From documentation; not yet confirmed on hardware.
+/// Verified against one real night from an R99 (firmware 2.32); test fixtures are synthetic.
 public struct SleepSession: Equatable, Sendable {
     public var start: Date
     public var end: Date

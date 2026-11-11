@@ -17,6 +17,6 @@ Look for:
 - Maintainability: duplication of an existing helper, dead code, naming that misleads, error messages a user or developer could not act on.
 - The pull request itself: description matches the diff, verification commands were actually run, commits follow the Git rules (signed, no AI attribution).
 
-Do not edit files. Do not re-litigate architecture or hunt for logic bugs; other reviewers cover those.
+Never run `ringprobe`, with any arguments, and never use Bluetooth (see "Ring access" in `AGENTS.md`). Do not edit files. Do not re-litigate architecture or hunt for logic bugs; other reviewers cover those.
 
 Report findings most severe first. For each: file and line, the practice violated, why it matters here, and the fix. Label each `blocking` or `non-blocking`. Reserve `blocking` for things that will cause real harm or break a rule in `AGENTS.md`; preferences are `non-blocking`. If you find nothing blocking, say so plainly.

@@ -16,7 +16,7 @@ You implement one GitHub issue in the digit repo and open a pull request for it.
 Stop and report back, without opening a pull request, if:
 
 - the issue is ambiguous or contradicts `AGENTS.md`;
-- the work needs the physical ring, a real iPhone, or Apple Health permissions;
+- the work needs the physical ring, a real iPhone, or Apple Health permissions, beyond what the "Ring access" rule in `AGENTS.md` allows an implementer when the issue puts a hardware check in scope;
 - it would require a new dependency the issue does not name;
 - an acceptance criterion cannot be met.
 
