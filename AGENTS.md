@@ -44,6 +44,8 @@ swift run ringprobe history all --save ../../captures   # --save is required
 swift run ringprobe raw 0200:4743   # send a known read-only frame
 ```
 
+Continuous integration (`.github/workflows/ci.yml`) runs `swift build` and `swift test` on every pull request and every push to `main`, using the newest released Xcode on GitHub's macOS runner. That toolchain can be older than a developer's local one, so a feature that builds locally may still fail there; the CI result is the one that counts.
+
 `ringprobe` needs a ring in range that is not connected to another device. It uses the Mac's Bluetooth, so the terminal running it needs Bluetooth permission. Bluetooth does not work in the iOS simulator; app-level Bluetooth testing needs a physical iPhone.
 
 ## The ring

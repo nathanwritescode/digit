@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A newer commit on a pull request cancels that pull request's older run.
+# Each push to main gets a group of its own, so those runs are never queued or cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ringkit:
+    name: RingKit build and test
+    # The image, and with it the installed Xcodes, moves on GitHub's schedule.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: Packages/RingKit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The build runs code from the pull request; do not leave the token where it can read it.
+          persist-credentials: false
+
+      - name: Select the newest released Xcode
+        run: |
+          set -euo pipefail
+          echo "Xcode installations on this runner:"
+          ls -d /Applications/Xcode*.app
+          # Version-numbered names only, which leaves out betas and release candidates.
+          XCODE=$(ls -d /Applications/Xcode_*.app | grep -E '/Xcode_[0-9.]+\.app$' | sort -V | tail -n 1 || true)
+          if [ -z "$XCODE" ]; then
+            echo "No released Xcode_<version>.app found" >&2
+            exit 1
+          fi
+          echo "Selecting $XCODE"
+          echo "DEVELOPER_DIR=$XCODE/Contents/Developer" >> "$GITHUB_ENV"
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
