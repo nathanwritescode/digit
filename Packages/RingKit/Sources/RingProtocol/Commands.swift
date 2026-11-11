@@ -1,7 +1,7 @@
 import Foundation
 
 /// The kinds of stored history the ring can be asked for (group `0x05`).
-public enum HistoryKind: UInt8, CaseIterable, Sendable {
+public enum HistoryKind: UInt8, CaseIterable, Sendable, Codable {
     case activity = 0x02
     case sleep = 0x04
     case heartRate = 0x06

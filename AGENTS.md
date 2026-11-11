@@ -41,7 +41,7 @@ swift test
 swift run ringprobe                 # usage
 swift run ringprobe scan
 swift run ringprobe info
-swift run ringprobe history all --save ../../captures   # --save is required
+swift run ringprobe history all --save ../../captures   # --save is required; one JSON file per kind (hex bytes, header, fetch time, time zone)
 swift run ringprobe raw 0200:4743   # send a known read-only frame
 ```
 
@@ -82,7 +82,6 @@ Update this table as captures confirm or contradict it. Best external reference:
 Built for the command-line tool; these must be closed before the app relies on it. Each should have an issue.
 
 - Ring-initiated events are acknowledged only while a request is in flight; there is no continuous reader and no way to subscribe to uploads.
-- History is returned as bare bytes, without the header frame, fetch time or time zone needed to re-decode it later.
 - Connecting scans for all devices and matches by name. iOS needs scanning by service, reconnecting by stored identifier, and state restoration for background sync.
 - No task cancellation support. `RingSession` (an actor over the `RingLink` protocol) queues conversations, but `RingConnection` itself still assumes one conversation at a time, so the app must use it only through a session (`ringprobe raw` uses it directly, which is fine for a single-task command-line tool).
 - When a continuous reader is added, `discardPendingFrames` must not drop ring-initiated events (group `0x04`), which still need acknowledging.

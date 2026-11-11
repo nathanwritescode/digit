@@ -14,7 +14,8 @@ ringprobe: talk to a YCBT smart ring from a Mac.
 
 Options:
   --name <text>     match rings whose advertised name contains <text> (default "R99")
-  --save <dir>      required with history: write the raw bytes to <dir>/<kind>-<timestamp>.hex.
+  --save <dir>      required with history: write each transfer (raw bytes as hex,
+                    plus header, fetch time and time zone) to <dir>/<kind>-<timestamp>.json.
                     The bytes are written before the transfer is acknowledged to the ring.
   --show            print health data (decoded records, reply payloads). Off by default so that
                     health data stays out of terminal logs and agent transcripts.
@@ -25,22 +26,6 @@ Options:
 The history-delete commands (0x0540-0x0552) are always refused. `raw` sends only known
 read-only commands, with their documented payloads, unless --allow-unknown is given.
 """
-
-func hex(_ bytes: [UInt8]) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
-
-func parseHex(_ text: String) -> [UInt8]? {
-    // UInt8(_:radix:) accepts a leading sign, so check the characters first.
-    guard text.count % 2 == 0, text.allSatisfy(\.isHexDigit) else { return nil }
-    var bytes: [UInt8] = []
-    var index = text.startIndex
-    while index < text.endIndex {
-        let next = text.index(index, offsetBy: 2)
-        guard let byte = UInt8(text[index..<next], radix: 16) else { return nil }
-        bytes.append(byte)
-        index = next
-    }
-    return bytes
-}
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data((message + "\n").utf8))
@@ -90,11 +75,17 @@ let timestamps: DateFormatter = {
     return formatter
 }()
 
-@Sendable func saveCapture(_ kind: HistoryKind, _ bytes: [UInt8], directory: String, stamp: String) throws {
-    let url = URL(fileURLWithPath: directory).appendingPathComponent("\(kind.name)-\(stamp).hex")
-    let text = bytes.map { String(format: "%02x", $0) }.joined() + "\n"
-    try text.write(to: url, atomically: true, encoding: .utf8)
-    // Health data: readable by the owner only.
+@Sendable func saveCapture(_ transfer: HistoryTransfer, directory: String, stamp: String) throws {
+    let url = URL(fileURLWithPath: directory).appendingPathComponent("\(transfer.kind.name)-\(stamp).json")
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    encoder.dateEncodingStrategy = .iso8601
+    // Health data: create the file owner-only, so it is never readable by others even briefly.
+    guard FileManager.default.createFile(atPath: url.path, contents: try encoder.encode(transfer),
+                                         attributes: [.posixPermissions: 0o600]) else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    // createFile keeps the old mode when it replaces an existing file, so set it again.
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     print("  saved \(url.path)")
 }
@@ -175,9 +166,9 @@ do {
         let stamp = timestamps.string(from: Date()).replacingOccurrences(of: " ", with: "T").replacingOccurrences(of: ":", with: "")
         let session = try await connect()
         for kind in kinds {
-            let bytes = try await session.fetchHistory(kind) { bytes in
-                try saveCapture(kind, bytes, directory: directory, stamp: stamp)
-            }
+            let bytes = try await session.fetchHistory(kind) { transfer in
+                try saveCapture(transfer, directory: directory, stamp: stamp)
+            }.data
             guard !bytes.isEmpty else { print("\(kind.name): empty"); continue }
             print("\(kind.name): \(bytes.count) bytes, \(recordCount(kind, bytes))")
             if show { describe(kind, bytes) }
@@ -188,8 +179,8 @@ do {
         // Validate every frame before connecting, so nothing is sent if any is refused.
         let frames: [Frame] = operands.map { operand in
             let parts = operand.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
-            guard let first = parts.first, let type = parseHex(first), type.count == 2,
-                  let payload = parseHex(parts.count > 1 ? parts[1] : "") else { fail("bad frame '\(operand)'") }
+            guard let first = parts.first, let type = Hex.decode(first), type.count == 2,
+                  let payload = Hex.decode(parts.count > 1 ? parts[1] : "") else { fail("bad frame '\(operand)'") }
             let frame = Frame(group: type[0], key: type[1], payload: payload)
             if frame.erasesRingData {
                 fail("refusing to send \(first): that range deletes history from the ring")
@@ -201,10 +192,10 @@ do {
         }
         _ = try await connect()
         for frame in frames {
-            print(">> \(hex(frame.encoded()))")
+            print(">> \(Hex.encode(frame.encoded()))")
             try await connection.send(frame)
             while let reply = await connection.nextFrame(timeout: 2.5) {
-                let body = show ? hex(reply.payload) : "\(reply.payload.count) bytes\(reply.isErrorReply ? " (rejected)" : "")"
+                let body = show ? Hex.encode(reply.payload) : "\(reply.payload.count) bytes\(reply.isErrorReply ? " (rejected)" : "")"
                 print(String(format: "<< %04X  ", reply.type) + body)
             }
         }

@@ -22,13 +22,24 @@ extension RingConnection: RingLink {}
 public actor RingSession {
     private nonisolated let link: any RingLink
     public nonisolated let replyTimeout: TimeInterval
+    // Injected so tests can pin the fetch time and zone. The zone is read per transfer, not once,
+    // because a long-lived session can outlast a change of time zone.
+    private nonisolated let clock: @Sendable () -> Date
+    private nonisolated let timeZone: @Sendable () -> TimeZone
 
     private var busy = false
     private var turnWaiters: [CheckedContinuation<Void, Never>] = []
 
-    public init(link: any RingLink, replyTimeout: TimeInterval = 5) {
+    public init(
+        link: any RingLink,
+        replyTimeout: TimeInterval = 5,
+        clock: @escaping @Sendable () -> Date = { Date() },
+        timeZone: @escaping @Sendable () -> TimeZone = { TimeZone.current }
+    ) {
         self.link = link
         self.replyTimeout = replyTimeout
+        self.clock = clock
+        self.timeZone = timeZone
     }
 
     /// Runs `body` once every earlier conversation has finished. Turns are granted in call order.
@@ -76,10 +87,12 @@ public actor RingSession {
         _ = try await request(Command.setTime(date))
     }
 
-    /// Fetches the raw bytes of one kind of stored history. Returns an empty array when nothing is stored.
+    /// Fetches one kind of stored history with the context needed to decode it later. When nothing
+    /// is stored the transfer has empty data and `persist` is not called (nothing was received, so
+    /// nothing is acknowledged).
     ///
     /// The ring answers with a header frame, then data frames, then an end frame carrying a
-    /// checksum of the concatenated data. `persist` then runs with the verified bytes, and only
+    /// checksum of the concatenated data. `persist` then runs with the verified transfer, and only
     /// if it succeeds is the transfer acknowledged, so the data is durable before the ring is
     /// told it was received. No delete command is sent.
     ///
@@ -90,18 +103,18 @@ public actor RingSession {
     /// the acknowledgement. Transfers spanning several data frames have not been seen yet.
     public func fetchHistory(
         _ kind: HistoryKind,
-        persist: @Sendable ([UInt8]) async throws -> Void
-    ) async throws -> [UInt8] {
+        persist: @Sendable (HistoryTransfer) async throws -> Void
+    ) async throws -> HistoryTransfer {
         try await exclusively { try await transferHistory(kind, persist: persist) }
     }
 
     private func transferHistory(
         _ kind: HistoryKind,
-        persist: @Sendable ([UInt8]) async throws -> Void
-    ) async throws -> [UInt8] {
+        persist: @Sendable (HistoryTransfer) async throws -> Void
+    ) async throws -> HistoryTransfer {
         let header = try await converse(Command.history(kind))
         // A short header means there are no records of this kind.
-        guard header.payload.count > 9 else { return [] }
+        guard header.payload.count > 9 else { return makeTransfer(kind, header: header, data: []) }
 
         var data: [UInt8] = []
         while let frame = await link.nextFrame(timeout: replyTimeout) {
@@ -116,13 +129,19 @@ public actor RingSession {
                     // Not acknowledged and no resend requested: the caller starts over with a fresh request.
                     throw RingError.checksumMismatch
                 }
-                try await persist(data)
+                let transfer = makeTransfer(kind, header: header, data: data)
+                try await persist(transfer)
                 try await transmit(Command.historyTransferOK)
-                return data
+                return transfer
             }
             data += frame.payload
         }
         throw RingError.timeout("\(kind.name) history transfer")
+    }
+
+    private func makeTransfer(_ kind: HistoryKind, header: Frame, data: [UInt8]) -> HistoryTransfer {
+        HistoryTransfer(kind: kind, header: header.payload, data: data,
+                        fetchedAt: clock(), timeZoneIdentifier: timeZone().identifier)
     }
 
     /// Every write goes through here so the delete-range refusal holds even for a link that forgets it.

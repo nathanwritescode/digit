@@ -97,8 +97,8 @@ private func historyLink(chunks: [[UInt8]], checksum: UInt16? = nil, headerLengt
 }
 
 private actor PersistRecorder {
-    var calls: [[UInt8]] = []
-    func add(_ bytes: [UInt8]) { calls.append(bytes) }
+    var calls: [HistoryTransfer] = []
+    func add(_ transfer: HistoryTransfer) { calls.append(transfer) }
 }
 
 private struct PersistFailure: Error {}
@@ -140,16 +140,18 @@ private struct PersistFailure: Error {}
 @Test func shortHeaderMeansEmptyHistoryAndNoAcknowledgement() async throws {
     let link = historyLink(chunks: [], headerLength: 9)
     let persisted = PersistRecorder()
-    let bytes = try await session(link).fetchHistory(kind) { await persisted.add($0) }
-    #expect(bytes.isEmpty)
+    let transfer = try await session(link).fetchHistory(kind) { await persisted.add($0) }
+    #expect(transfer.data.isEmpty)
+    #expect(transfer.kind == kind)
+    #expect(transfer.header == [UInt8](repeating: 0, count: 9))
     #expect(await persisted.calls.isEmpty)
     #expect(link.sent == [Command.history(kind)])
 }
 
 @Test func multiFrameHistoryReturnsConcatenatedBytesAndAcknowledges() async throws {
     let link = historyLink(chunks: [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10]])
-    let bytes = try await session(link).fetchHistory(kind) { _ in }
-    #expect(bytes == Array(1...10))
+    let transfer = try await session(link).fetchHistory(kind) { _ in }
+    #expect(transfer.data == Array(1...10))
     #expect(link.sent == [Command.history(kind), Command.historyTransferOK])
 }
 
@@ -167,8 +169,8 @@ private struct PersistFailure: Error {}
 
 @Test func persistRunsWithVerifiedBytesBeforeAcknowledgement() async throws {
     let link = historyLink(chunks: [[1, 2], [3]])
-    _ = try await session(link).fetchHistory(kind) { bytes in
-        link.record("persist \(bytes)")
+    _ = try await session(link).fetchHistory(kind) { transfer in
+        link.record("persist \(transfer.data)")
     }
     let events = link.events
     let persist = try #require(events.firstIndex(of: "persist [1, 2, 3]"))
@@ -184,6 +186,40 @@ private struct PersistFailure: Error {}
     } catch is PersistFailure {
     }
     #expect(link.sent == [Command.history(kind)])
+}
+
+@Test func transferCarriesHeaderFetchTimeAndTimeZone() async throws {
+    let link = historyLink(chunks: [[1, 2], [3]], headerLength: 12)
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let zone = try #require(TimeZone(identifier: "Pacific/Auckland"))
+    let s = RingSession(link: link, replyTimeout: 0.05, clock: { now }, timeZone: { zone })
+    let persisted = PersistRecorder()
+    let returned = try await s.fetchHistory(kind) { await persisted.add($0) }
+    let expected = HistoryTransfer(
+        kind: kind, header: [UInt8](repeating: 0, count: 12), data: [1, 2, 3],
+        fetchedAt: now, timeZoneIdentifier: "Pacific/Auckland")
+    #expect(returned == expected)
+    // What is saved before the acknowledgement is the same full transfer that is returned.
+    #expect(await persisted.calls == [expected])
+}
+
+@Test func timeZoneIsReadForEachTransfer() async throws {
+    let link = historyLink(chunks: [[1]])
+    let zones = ZoneBox(["Asia/Tokyo", "America/Denver"])
+    let s = RingSession(link: link, replyTimeout: 0.05, timeZone: { zones.next() })
+    let first = try await s.fetchHistory(kind) { _ in }
+    let second = try await s.fetchHistory(kind) { _ in }
+    #expect(first.timeZoneIdentifier == "Asia/Tokyo")
+    #expect(second.timeZoneIdentifier == "America/Denver")
+}
+
+private final class ZoneBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var identifiers: [String]
+    init(_ identifiers: [String]) { self.identifiers = identifiers }
+    func next() -> TimeZone {
+        TimeZone(identifier: lock.withLock { identifiers.removeFirst() })!
+    }
 }
 
 @Test func staleFramesAreDiscardedBeforeANewRequest() async throws {
