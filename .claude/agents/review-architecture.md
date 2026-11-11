@@ -17,6 +17,6 @@ Look for:
 - Concurrency design: which queue or actor owns each piece of state, ordering guarantees for ring frames, background execution limits on iOS.
 - Scope: work the issue did not ask for, or acceptance criteria quietly skipped.
 
-Do not edit files. Do not comment on style or naming unless it hides an architectural problem.
+Never run `ringprobe`, with any arguments, and never use Bluetooth (see "Ring access" in `AGENTS.md`). Do not edit files. Do not comment on style or naming unless it hides an architectural problem.
 
 Report findings most severe first. For each: file and line, what is wrong, a concrete scenario where it causes harm, and the smallest fix. Label each `blocking` or `non-blocking`. If you find nothing blocking, say so plainly rather than inventing concerns.

@@ -61,7 +61,7 @@ Continuous integration (`.github/workflows/ci.yml`) runs `swift build` and `swif
 - A one-byte payload `0xFB`–`0xFF` is an error reply (`0xFC` = unsupported).
 - Ring-initiated events (group `0x04`) must be acknowledged with the same group and key and payload `[0x00]`.
 - Timestamps are local wall-clock seconds since 2000-01-01, not UTC. The ring's clock must be set (`0x0100`) for history to be meaningful.
-- History transfer: request `0x05xx`, header reply on the same key (payload of 9 bytes or fewer means empty), data frames, then `0x0580` with a CRC of the concatenated data, which the app acknowledges with `[0x00]` (or `[0x04]` to retry).
+- History transfer: request `0x05xx`, header reply on the same key (payload of 9 bytes or fewer means empty), data frames, then `0x0580` with a CRC of the concatenated data, which the app acknowledges with `[0x00]` (or `[0x04]` to retry). Data frames use a different key from the request (`0x0513` for sleep), and each arrived as one whole frame per notification, up to the MTU.
 
 ### Verified on this ring vs. not
 
@@ -69,25 +69,27 @@ Continuous integration (`.github/workflows/ci.yml`) runs `swift build` and `swif
 |---|---|
 | Frame encoding, CRC, device info (`0x0200`), current activity (`0x020C`), set time (`0x0100`) | Verified against the ring |
 | History requests `0x0502`, `0x0504`, `0x0506`, `0x0509` | Verified: all four return data after a night of wear |
-| History transfer sequence (header, data, end frame with checksum, acknowledgement) | Verified, including a transfer spanning three data frames (data frames arrive on key `0x13` for sleep, one whole frame per notification, up to the MTU) |
+| History transfer sequence (header, data, end frame with checksum, acknowledgement) | Verified, including a transfer spanning three data frames |
 | Acknowledging a transfer | Does not discard it: a second fetch right after returned identical bytes |
-| Activity, sleep and heart record decoders | Verified against a real night: the Swift decoders matched an independent decode, and the owner confirmed the times. Test fixtures remain synthetic |
+| Activity, sleep and heart record decoders | Verified against one real night: the Swift decoders matched an independent decode for all three, and the owner confirmed the sleep times matched their night (recorded on #6). Test fixtures remain synthetic |
 | Combined record (`0x0509`, 20 bytes) | Layout matches documentation; no Swift decoder yet. Timestamp, steps, heart rate, SpO2, respiration, HRV and CVRR are plausible and agree with the other records |
-| Heart-rate monitor interval (`0x010C`, payload `[enabled, minutes]`) | Verified at 1, 5 and 10 minutes: ack `00`, and readings arrive at that spacing, aligned to the clock. Factory behaviour is hourly. Off, and reading the setting back, are untested |
+| Heart-rate monitor interval (`0x010C`, payload `[enabled, minutes]`) | Verified at 1, 5 and 10 minutes: ack `00`, and readings arrive at that spacing, aligned to the clock. Before any setting was sent the ring measured hourly, presumably its default. Off, and reading the setting back, are untested |
 | Battery percentage (device info byte 5) | Unverified: it has read 100% at every check so far |
 | `0x0220` live snapshot, `0x0533` body data | Ring replies unsupported |
 | `0x051A` SpO2 history, `0x051E` temperature history | No reply; support unknown |
 
-### Data quirks seen on this ring
-
-- **Sleep stages** are stored in time order, and each starts one second after the previous one ends. Treat a one-second gap as contiguous.
-- **Sleep header** uses the newer layout: `FF FF`, then REM, deep and light totals in seconds, which equal the sums of the stage durations.
-- **No awake stages** were reported in the one night seen. A brief wake-up appeared as a gap of a few minutes between two sessions. One night is not enough to rely on this.
-- **Activity** records are 30-minute buckets; **heart-rate** records carry mode 0 for automatic readings.
-- **Combined record:** the blood-pressure fields are filled in, but a ring cannot measure blood pressure. They are vendor estimates: never store them as measurements or write them to Apple Health. The temperature fields hold the same value in every record and are not a body temperature; treat as absent. Body fat and glucose are always zero. The last two bytes, documented as reserved, vary between records and are not understood.
-- **The ring does not validate settings.** It acknowledges any monitor interval, so the app must only ever send values from a known list.
-
 Update this table as captures confirm or contradict it. Best external reference: `docs/PROTOCOL.md` in `PopShark57/SmartRingWatcher` (no licence: read, don't copy).
+
+### Data quirks seen on this ring (R99, firmware 2.32)
+
+Seen in one night of data unless stated otherwise. Treat them as properties of this device and firmware, not of the protocol, and write code that tolerates them without requiring them.
+
+- **Sleep stages** are stored in time order, and each started one second after the previous one ended. Treat a gap of up to about a second as contiguous; do not require exactly one second.
+- **Sleep header:** the 8 totals bytes at offset 12 of the 20-byte header (after the `AF FA` marker, length, start and end) used the newer layout: `FF FF`, then REM, deep and light totals as u16 seconds. They equalled the sums of the stage durations.
+- **No awake stages** were reported. A brief wake-up appeared as a gap of a few minutes between two sessions.
+- **Activity** records were 30-minute buckets; **heart-rate** records carried mode 0 for automatic readings.
+- **Combined record:** the blood-pressure fields are filled in, but a ring cannot measure blood pressure; they are vendor estimates. The temperature fields held the same value in every record and were not a body temperature; treat as absent. Body fat and glucose were always zero. The last two bytes, documented as reserved, varied between records and are not understood.
+- **Setting validation is untested here.** On this ring only valid heart-rate intervals (1, 5 and 10 minutes) have been sent, and all were honoured. Another ring of the same family is reported to acknowledge any interval byte, including nonsense values, so the app must only ever send values from a known list.
 
 ### Known gaps in RingTransport
 
@@ -124,11 +126,13 @@ Agent definitions live in `.claude/agents/`.
 
 **Issues** use the template in `.github/ISSUE_TEMPLATE/implementation.md`. Each must be self-contained: an implementer with no other context should be able to finish it from the issue and this file. Label issues that need the physical ring, a real iPhone or Apple Health permissions `needs-hardware`; those are not handed to an implementer alone.
 
-**Ring access.** The ring accepts one connection at a time, and an agent cannot obtain the owner's go-ahead, so access is limited by role:
+**Ring access.** The ring accepts one connection at a time, and subagents (implementers and reviewers) cannot obtain the owner's go-ahead, so access is limited by role:
 
-- *Reviewers* never run `ringprobe`, with any arguments. They run in parallel and are asked to try to break things; one has already sent frames to the ring by accident while testing argument validation.
-- *Implementers* may run `ringprobe info` and `ringprobe raw` with known read-only commands, without `--show`, `--trace` or `--allow-unknown`, and only when their issue says a hardware check is in scope. One agent at a time.
-- *The planner, with the owner* does everything else: fetching history (it writes health data to disk), anything using `--show`, `--trace` or `--allow-unknown`, and every command that changes a ring setting.
+- *Reviewers* never run `ringprobe`, with any arguments. They run in parallel and are asked to try to break things, so even argument-validation tests can end up sending frames.
+- *Implementers* may run only `ringprobe info` and `ringprobe raw` with `0200:4743` (device info) or `020C` (today's activity), without `--show`, `--trace` or `--allow-unknown`, and only when their issue says a hardware check is in scope. The history requests (`0x05xx`) are on the read-only list but are not allowed here: `raw` starts a transfer it never saves or acknowledges. Output from these commands must not be copied into commits, issues or pull requests.
+- *The planner, with the owner* does everything else: `scan` (it prints nearby device names, including the ring's name suffix), `settime`, fetching history (it writes health data to disk), anything using `--show`, `--trace` or `--allow-unknown`, and every command that changes a ring setting. Any new `ringprobe` subcommand is planner-only until this list says otherwise.
+
+The planner starts at most one hardware-check implementer at a time, and never while the planner or the owner is using the ring. An issue with a hardware check in scope still carries `needs-hardware`; the planner decides whether the check is small enough to delegate under this rule.
 
 **Review.** Every pull request gets the architecture, bugs and practices reviewers, each started fresh with no context from the implementation. Add the privacy reviewer when the change touches storage, export, Apple Health, logging, networking, dependencies, test fixtures or the commands sent to the ring. The planner checks each finding, sends blocking ones back to an implementer, and re-runs the affected reviewers on the fix. The owner merges once no blocking findings remain.
 
@@ -137,6 +141,7 @@ Agent definitions live in `.claude/agents/`.
 ## Git
 
 - Never commit to or push `main` directly. Check the current branch before committing. Each issue gets a branch named `issue-<number>-<short-slug>`, pushed for its pull request.
+- Owner-requested changes with no issue (documentation, for example) use a branch named `docs-<short-slug>` or `chore-<short-slug>` and say in the pull request that there is no issue. They get the same review.
 - Commits are signed with the owner's configured key (`commit.gpgsign` is on). Never bypass signing or override the author.
 - No AI or assistant attribution anywhere in commits: no co-author trailers, no tool names in messages.
 - Commit messages: imperative subject line, body explaining what and why, and what was and wasn't verified.
@@ -146,6 +151,7 @@ Agent definitions live in `.claude/agents/`.
 - **Database:** SQLite via GRDB (MIT). Raw ring records are the source of truth; anything derived can be rebuilt from them. Do not introduce SwiftData or Core Data.
 - **Minimum iOS version:** iOS 26.
 - **Bundle identifier:** `com.nathantalley.digit`.
+- **Vendor estimates:** raw ring records are stored exactly as received, but values the ring cannot measure (blood pressure, and the temperature field on the R99) are never exposed as measurements in derived tables, the app, exports of typed data, or Apple Health.
 
 ## Open decisions
 

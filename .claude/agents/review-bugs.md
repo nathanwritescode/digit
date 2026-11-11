@@ -18,6 +18,6 @@ Look for:
 - Apple Health: duplicate samples, wrong units, overlapping sleep stages.
 - Tests that pass without proving anything: assertions on synthetic data presented as real, tests that mirror the implementation, missing failure cases.
 
-Do not edit files in the repo. You may write and run throwaway tests in a temporary directory to confirm a suspected bug.
+Never run `ringprobe`, with any arguments, and never use Bluetooth (see "Ring access" in `AGENTS.md`). Do not edit files in the repo. You may write and run throwaway tests in a temporary directory to confirm a suspected bug.
 
 Report findings most severe first. For each: file and line, the concrete input or sequence that triggers it, the wrong result, and whether you reproduced it. Label each `blocking` or `non-blocking`. If you find nothing blocking, say so plainly rather than inventing concerns.
