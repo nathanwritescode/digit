@@ -209,12 +209,12 @@ private let sampleTransfer = HistoryTransfer(
 private let combinedA = "3c000000 e803 48 70 46 61 10 25 1e 2a05 0000 00 aabb"
 private let combinedB = "100e0000 0a00 50 00 00 62 11 26 1f 2a05 0000 00 ccdd"
 
-@Test func decodesCombinedRecord() {
+@Test func decodesCombinedRecord() throws {
     let bytes = hex(combinedA)
     #expect(bytes.count == CombinedRecord.size)
     let records = CombinedRecord.decode(bytes, timeZone: utc)
     #expect(records.count == 1)
-    let r = records[0]
+    let r = try #require(records.first)
     #expect(r.time == RingTime.date(fromRingSeconds: 60, timeZone: utc))
     #expect(r.steps == 1000)
     #expect(r.heartRate == 72)
@@ -225,9 +225,9 @@ private let combinedB = "100e0000 0a00 50 00 00 62 11 26 1f 2a05 0000 00 ccdd"
     #expect(r.raw == bytes)
 }
 
-@Test func combinedZeroFieldsAreNoReading() {
-    // An on-demand HRV-only record: every other field is zero.
-    let r = CombinedRecord.decode(hex("3c000000 0000 00 00 00 00 00 25 00 0000 0000 00 0000"), timeZone: utc)[0]
+@Test func combinedZeroFieldsAreNoReading() throws {
+    // A record with only HRV set (reported for other rings of the family; unverified on the R99).
+    let r = try #require(CombinedRecord.decode(hex("3c000000 0000 00 00 00 00 00 25 00 0000 0000 00 0000"), timeZone: utc).first)
     #expect(r.steps == 0)
     #expect(r.heartRate == nil)
     #expect(r.spo2 == nil)
@@ -236,25 +236,29 @@ private let combinedB = "100e0000 0a00 50 00 00 62 11 26 1f 2a05 0000 00 ccdd"
     #expect(r.cvrr == nil)
 }
 
-@Test func combinedSpO2AboveOneHundredIsNotAReading() {
-    let r = CombinedRecord.decode(hex("3c000000 0000 48 00 00 65 10 25 1e 0000 0000 00 0000"), timeZone: utc)[0]
-    #expect(r.spo2 == nil)
-    #expect(r.heartRate == 72)
+@Test func combinedSpO2OutsideOneToOneHundredIsNotAReading() throws {
+    let over = try #require(CombinedRecord.decode(hex("3c000000 0000 48 00 00 65 10 25 1e 0000 0000 00 0000"), timeZone: utc).first)
+    #expect(over.spo2 == nil)
+    #expect(over.heartRate == 72)
+    let exactly100 = try #require(CombinedRecord.decode(hex("3c000000 0000 48 00 00 64 10 25 1e 0000 0000 00 0000"), timeZone: utc).first)
+    #expect(exactly100.spo2 == 100)
 }
 
-@Test func decodesSeveralCombinedRecordsAndIgnoresTruncation() {
+@Test func decodesSeveralCombinedRecordsAndIgnoresTruncation() throws {
     let records = CombinedRecord.decode(hex(combinedA + combinedB + "01020304050607"), timeZone: utc)
     #expect(records.count == 2)
     #expect(records.map(\.steps) == [1000, 10])
-    #expect(records[1].heartRate == 80)
-    #expect(records[1].raw == hex(combinedB))
+    let second = try #require(records.last)
+    #expect(second.heartRate == 80)
+    #expect(second.raw == hex(combinedB))
     #expect(CombinedRecord.decode(Array(hex(combinedA).dropLast()), timeZone: utc).isEmpty)
     #expect(CombinedRecord.decode([], timeZone: utc).isEmpty)
 }
 
-@Test func combinedEstimatesAreKeptRawButNotExposed() {
-    let r = CombinedRecord.decode(hex(combinedA), timeZone: utc)[0]
-    // Blood pressure, temperature, body fat, glucose and the unexplained last two bytes live only in raw.
+// Exists to stop anyone adding blood-pressure, temperature, body-fat or glucose properties:
+// those are vendor estimates or absent on the R99 and must stay out of the typed value.
+@Test func combinedEstimatesAreKeptRawButNotExposed() throws {
+    let r = try #require(CombinedRecord.decode(hex(combinedA), timeZone: utc).first)
     let exposed = Set(Mirror(reflecting: r).children.compactMap(\.label))
     #expect(exposed == ["time", "steps", "heartRate", "spo2", "respirationRate", "hrv", "cvrr", "raw"])
     #expect(r.raw[7] == 0x70 && r.raw[8] == 0x46)
@@ -262,47 +266,63 @@ private let combinedB = "100e0000 0a00 50 00 00 62 11 26 1f 2a05 0000 00 ccdd"
     #expect(Array(r.raw[18...19]) == [0xaa, 0xbb])
 }
 
-@Test func sleepStagesOneSecondApartAreContiguousAndNotRewritten() {
-    // Light 600 s from t=0, deep 900 s from t=601, REM 300 s from t=1502: each starts one
-    // second after the previous ends, as seen on an R99. Header: FF FF, REM 300, deep 900, light 600.
-    let bytes = hex("affa 2c00 00000000 0a070000 ffff 2c01 8403 5802"
-        + "f2 00000000 580200" + "f1 59020000 840300" + "f3 de050000 2c0100")
-    let stages = SleepSession.decode(bytes, timeZone: utc)[0].stages
+// Light 600 s from t=0, deep 900 s from t=601, REM 300 s from t=1502: each stage starts one
+// second after the previous ends, as seen on an R99. The header uses the newer layout:
+// FF FF, then REM 300, deep 900, light 600 (u16 seconds), equal to the stage sums.
+private let sleepOneSecondGaps = "affa 2c00 00000000 0a070000 ffff 2c01 8403 5802"
+    + "f2 00000000 580200" + "f1 59020000 840300" + "f3 de050000 2c0100"
+
+@Test func sleepStagesOneSecondApartAreContiguousAndNotRewritten() throws {
+    let stages = try #require(SleepSession.decode(hex(sleepOneSecondGaps), timeZone: utc).first).stages
     #expect(stages.map(\.kind) == [.light, .deep, .rem])
     #expect(stages.map(\.duration) == [600, 900, 300])
     for (a, b) in zip(stages, stages.dropFirst()) {
         #expect(b.start.timeIntervalSince(a.end) == 1)
-        #expect(a.isContiguous(with: b))
+        #expect(a.isContiguous(with: b, tolerance: 1))
         #expect(!a.isContiguous(with: b, tolerance: 0))
     }
-    // Touching stages and a different tolerance also work; a real gap does not.
-    let first = stages[0]
-    #expect(first.isContiguous(with: SleepStage(kind: .deep, start: first.end, duration: 5)))
-    #expect(first.isContiguous(with: SleepStage(kind: .deep, start: first.end.addingTimeInterval(2), duration: 5), tolerance: 2))
-    #expect(!first.isContiguous(with: SleepStage(kind: .deep, start: first.end.addingTimeInterval(300), duration: 5)))
 }
 
-@Test func sleepHeaderTotalsInNewerLayoutEqualStageSums() {
-    let bytes = hex("affa 2c00 00000000 0a070000 ffff 2c01 8403 5802"
-        + "f2 00000000 580200" + "f1 59020000 840300" + "f3 de050000 2c0100")
+@Test func sleepContiguityToleranceEdges() throws {
+    let a = SleepStage(kind: .light, start: Date(timeIntervalSince1970: 1000), duration: 600)
+    func stage(startingAt offset: TimeInterval) -> SleepStage {
+        SleepStage(kind: .deep, start: a.end.addingTimeInterval(offset), duration: 5)
+    }
+    #expect(a.isContiguous(with: stage(startingAt: 0), tolerance: 1))
+    #expect(a.isContiguous(with: stage(startingAt: -1), tolerance: 1))     // overlap of one second
+    #expect(!a.isContiguous(with: stage(startingAt: 1.5), tolerance: 1))   // just over the tolerance
+    #expect(a.isContiguous(with: stage(startingAt: 2), tolerance: 2))
+    #expect(!a.isContiguous(with: stage(startingAt: 300), tolerance: 1))
+    // Reversed order: the earlier stage is not contiguous after the later one.
+    let later = stage(startingAt: 1)
+    #expect(!later.isContiguous(with: a, tolerance: 1))
+}
+
+@Test func sleepDecoderIgnoresNewerHeaderTotalsAndStillDecodesStages() throws {
+    let bytes = hex(sleepOneSecondGaps)
     #expect(Array(bytes[12...13]) == [0xff, 0xff])
-    let session = SleepSession.decode(bytes, timeZone: utc)[0]
+    let session = try #require(SleepSession.decode(bytes, timeZone: utc).first)
+    // Totals come from the stages; on the ring they equalled the header's, which the fixture mirrors.
     #expect(Int(bytes.u16(14)) == Int(session.total(.rem)))
     #expect(Int(bytes.u16(16)) == Int(session.total(.deep)))
     #expect(Int(bytes.u16(18)) == Int(session.total(.light)))
+    #expect(session.stages.count == 3)
     // A session with no awake stages is normal on this ring.
-    #expect(session.total(.awake) == 0)
     #expect(!session.stages.contains { $0.kind == .awake })
 }
 
-@Test func sleepNightSplitIntoTwoSessionsKeepsTheGapBetweenThem() {
+@Test func sleepNightSplitIntoTwoSessionsKeepsTheGapBetweenThem() throws {
     // Session one: light 600 s from t=0. Session two: deep 600 s from t=900, five minutes later.
     let one = "affa 1c00 00000000 58020000 ffff 0000 0000 5802" + "f2 00000000 580200"
     let two = "affa 1c00 84030000 dc050000 ffff 0000 5802 0000" + "f1 84030000 580200"
     let sessions = SleepSession.decode(hex(one + two), timeZone: utc)
     #expect(sessions.count == 2)
-    #expect(sessions[1].start.timeIntervalSince(sessions[0].end) == 300)
-    #expect(!sessions[0].stages.last!.isContiguous(with: sessions[1].stages[0]))
+    let firstEnd = try #require(sessions.first).end
+    let second = try #require(sessions.last)
+    #expect(second.start.timeIntervalSince(firstEnd) == 300)
+    let lastOfFirst = try #require(sessions.first?.stages.last)
+    let firstOfSecond = try #require(second.stages.first)
+    #expect(!lastOfFirst.isContiguous(with: firstOfSecond, tolerance: 1))
     #expect(sessions.allSatisfy { $0.total(.awake) == 0 })
 }
 

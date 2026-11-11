@@ -67,7 +67,7 @@ public struct ActivityRecord: Equatable, Sendable {
 }
 
 /// One stored heart-rate reading (history kind `.heartRate`, 6 bytes each).
-/// On an R99 (firmware 2.32) the readings were one per hour on the hour with mode 0 (automatic),
+/// On an R99 (firmware 2.32) the readings were one per hour on the hour with mode 0 (documented as automatic),
 /// and the values agreed with the combined record. `mode` is kept raw; the meaning of other
 /// values is not verified. Verified against one real night; test fixtures are synthetic.
 public struct HeartRateRecord: Equatable, Sendable {
@@ -101,9 +101,11 @@ public struct SleepStage: Equatable, Sendable {
 
     /// Whether `next` follows this stage without a real gap. On an R99 (firmware 2.32) each stage
     /// started one second after the previous one ended, so a timeline builder should treat that as
-    /// contiguous. The tolerance is a parameter because other firmware may differ; callers must not
-    /// require exactly one second. The decoder never merges or rewrites stages itself.
-    public func isContiguous(with next: SleepStage, tolerance: TimeInterval = 1) -> Bool {
+    /// contiguous. The tolerance has no default because it is a per-device observation, not protocol
+    /// behaviour; callers must not require exactly one second. A small overlap (`next` starting up to
+    /// `tolerance` before this stage ends) also counts as contiguous; `next` earlier than that, or
+    /// later than `tolerance` after the end, does not. The decoder never merges or rewrites stages.
+    public func isContiguous(with next: SleepStage, tolerance: TimeInterval) -> Bool {
         abs(next.start.timeIntervalSince(end)) <= tolerance
     }
 }
@@ -166,13 +168,15 @@ public struct SleepSession: Equatable, Sendable {
 /// respiration, HRV, CVRR (one byte each), temperature integer and fraction, body-fat integer and
 /// fraction, glucose, then 2 more bytes. Confirmed on an R99 (firmware 2.32) for time, steps,
 /// heart rate, SpO2, respiration, HRV and CVRR (plausible, and consistent with the activity and
-/// heart-rate records). The Swift decoder has not yet been checked against a real capture.
+/// heart-rate records). The Swift decoder matched an independent decode of a real R99 capture.
 ///
 /// Only values the ring can measure are exposed. A zero in a measured field means "no reading"
-/// and becomes nil (an on-demand HRV record has every other field zero); steps is a count, so
-/// zero stays zero. SpO2 above 100 is not a reading and also becomes nil.
+/// and becomes nil (an on-demand HRV record is reported to have every other field zero; that comes
+/// from another ring of the same family and is unverified on the R99). SpO2 outside 1...100 is
+/// not a reading and also becomes nil.
 ///
-/// Deliberately not decoded into properties, but kept in `raw`:
+/// Deliberately not decoded into properties. They stay only in the module-internal `raw`, so
+/// later layers cannot read them; the stored `HistoryTransfer` is the source of truth:
 /// - blood pressure (bytes 7-8): filled in by the ring, but a ring cannot measure it; these are
 ///   vendor estimates and must never be stored or shown as measurements;
 /// - temperature (bytes 13-14): identical in every record and not a body temperature on this ring;
@@ -183,14 +187,16 @@ public struct CombinedRecord: Equatable, Sendable {
     public static let size = 20
 
     public var time: Date
+    /// Cross-check only: activity records are the source of steps. A zero here does not mean a
+    /// measured zero.
     public var steps: Int
     public var heartRate: Int?
     public var spo2: Int?
     public var respirationRate: Int?
     public var hrv: Int?
     public var cvrr: Int?
-    /// The whole 20-byte record exactly as received.
-    public var raw: [UInt8]
+    /// The whole 20-byte record exactly as received. Internal on purpose (see above).
+    var raw: [UInt8]
 
     /// Decodes consecutive records; a trailing partial record is ignored.
     public static func decode(_ b: [UInt8], timeZone: TimeZone) -> [CombinedRecord] {
@@ -201,7 +207,7 @@ public struct CombinedRecord: Equatable, Sendable {
                 time: RingTime.date(fromRingSeconds: b.u32(i), timeZone: timeZone),
                 steps: Int(b.u16(i + 4)),
                 heartRate: reading(b[i + 6]),
-                spo2: spo2.flatMap { $0 <= 100 ? $0 : nil },
+                spo2: spo2.flatMap { (1...100).contains($0) ? $0 : nil },
                 respirationRate: reading(b[i + 10]),
                 hrv: reading(b[i + 11]),
                 cvrr: reading(b[i + 12]),
