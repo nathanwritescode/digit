@@ -32,3 +32,10 @@ import Testing
     try PrivateFile.createDirectory(directory)
     #expect(try FileManager.default.attributesOfItem(atPath: directory)[.posixPermissions] as? Int == 0o755)
 }
+
+@Test func failedWriteLeavesNoFileBehind() throws {
+    // Writing into a missing directory fails at creation; nothing may be left at the path.
+    let missing = NSTemporaryDirectory() + "ringkit-missing-\(UUID().uuidString)/capture.json"
+    #expect(throws: PrivateFile.Failure.self) { try PrivateFile.write(Data([1, 2, 3]), to: missing) }
+    #expect(!FileManager.default.fileExists(atPath: missing))
+}

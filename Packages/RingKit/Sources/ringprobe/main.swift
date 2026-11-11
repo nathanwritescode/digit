@@ -124,7 +124,11 @@ do {
         let seconds = operands.first.flatMap(Double.init) ?? 8
         for device in try await connection.scan(for: seconds) {
             let services = device.serviceUUIDs.isEmpty ? "" : "  services: \(device.serviceUUIDs.joined(separator: ","))"
-            print("\(String(format: "%4d", device.rssi)) dBm  \(device.name ?? "(unnamed)")\(services)")
+            // Advertised names identify devices (the ring's suffix, other people's gadgets), so
+            // they are shown only with --show.
+            let matches = (device.name ?? "").localizedCaseInsensitiveContains(ringName)
+            let label = show ? (device.name ?? "(unnamed)") : (matches ? "\(ringName) (matching ring)" : "(other device)")
+            print("\(String(format: "%4d", device.rssi)) dBm  \(label)\(services)")
         }
 
     case "info":
@@ -151,6 +155,10 @@ do {
         guard let directory = saveDirectory else { fail("history needs --save <dir>, so the data is kept before the ring is told it was received") }
         do {
             try PrivateFile.createDirectory(directory)
+            if let mode = (try FileManager.default.attributesOfItem(atPath: directory)[.posixPermissions] as? NSNumber)?.intValue,
+               mode & 0o077 != 0 {
+                FileHandle.standardError.write(Data("warning: \(directory) is accessible to other accounts on this Mac (mode \(String(mode, radix: 8))); consider chmod 700\n".utf8))
+            }
             let testFile = URL(fileURLWithPath: directory).appendingPathComponent(".ringprobe-write-test")
             try? FileManager.default.removeItem(at: testFile)
             try PrivateFile.write(Data(), to: testFile.path)

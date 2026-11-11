@@ -24,7 +24,7 @@ public enum PrivateFile {
 
     /// Creates a new file at `path` with mode 0600 (open's mode is subject to the umask, which can
     /// only remove permissions), writes `data` and syncs it. Fails if the file already exists;
-    /// an existing file is never overwritten.
+    /// an existing file is never overwritten. A file whose write fails part-way is removed.
     public static func write(_ data: Data, to path: String) throws {
         let fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
         guard fd >= 0 else { throw failure("create", path) }
@@ -43,6 +43,10 @@ public enum PrivateFile {
         }
         if failed == nil, fsync(fd) != 0 { failed = failure("sync", path) }
         if close(fd) != 0, failed == nil { failed = failure("close", path) }
-        if let failed { throw failed }
+        if let failed {
+            // Do not leave a truncated file under a valid name for later readers to trip over.
+            unlink(path)
+            throw failed
+        }
     }
 }
