@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Digit connects to your ring over Bluetooth to sync your health data. Nothing leaves your iPhone.</string>
+	<key>NSHealthUpdateUsageDescription</key>
+	<string>Digit writes your sleep and activity data from the ring to Apple Health. Nothing leaves your iPhone.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
+</dict>
+</plist>

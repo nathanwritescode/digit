@@ -8,6 +8,16 @@ Digit, the local first ring tracking app
   - `RingTransport`: CoreBluetooth connection and request/response sessions.
   - `ringprobe`: macOS command-line tool for probing a ring and capturing raw history.
 
+- `App`: the iOS app (`Digit.xcodeproj`), SwiftUI, iPhone only, iOS 26.
+
+## Building the app
+
+```
+xcodebuild -project App/Digit.xcodeproj -scheme Digit -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+```
+
+Or open `App/Digit.xcodeproj` in Xcode. Running on a device needs a signing team selected in Xcode.
+
 ## Probing a ring from a Mac
 
 ```
