@@ -35,7 +35,7 @@ jobs:
           echo "Xcode installations on this runner:"
           ls -d /Applications/Xcode*.app
           # Version-numbered names only, which leaves out betas and release candidates.
-          XCODE=$(ls -d /Applications/Xcode_*.app | grep -E '/Xcode_[0-9.]+\.app$' | sort -V | tail -n 1)
+          XCODE=$(ls -d /Applications/Xcode_*.app | grep -E '/Xcode_[0-9.]+\.app$' | sort -V | tail -n 1 || true)
           if [ -z "$XCODE" ]; then
             echo "No released Xcode_<version>.app found" >&2
             exit 1
