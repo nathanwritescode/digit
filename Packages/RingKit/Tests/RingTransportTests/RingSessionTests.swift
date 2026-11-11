@@ -195,7 +195,8 @@ private struct PersistFailure: Error {}
     #expect(link.events.first == "discard")
 }
 
-@Test func overlappingConversationsRunOneAtATime() async throws {
+// The time limit turns a future regression that never reaches the gate into a failure, not a hung CI job.
+@Test(.timeLimit(.minutes(1))) func overlappingConversationsRunOneAtATime() async throws {
     let link = FakeLink { frame in [Frame(group: frame.group, key: frame.key, payload: [frame.key])] }
     link.armGate()
     let s = session(link)
