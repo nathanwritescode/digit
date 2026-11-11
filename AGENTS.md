@@ -25,6 +25,7 @@ Packages/RingKit/
   Sources/RingTransport/   CoreBluetooth connection and request/response sessions
   Sources/ringprobe/       macOS command-line tool for probing a ring
   Tests/RingProtocolTests/ Swift Testing tests
+  Tests/RingTransportTests/ session tests against a scripted fake RingLink (no Bluetooth)
 captures/                  raw ring captures (git-ignored, private)
 ```
 
@@ -80,11 +81,10 @@ Update this table as captures confirm or contradict it. Best external reference:
 
 Built for the command-line tool; these must be closed before the app relies on it. Each should have an issue.
 
-- One conversation at a time, by convention only. Overlapping requests on one connection are not supported.
 - Ring-initiated events are acknowledged only while a request is in flight; there is no continuous reader and no way to subscribe to uploads.
 - History is returned as bare bytes, without the header frame, fetch time or time zone needed to re-decode it later.
 - Connecting scans for all devices and matches by name. iOS needs scanning by service, reconnecting by stored identifier, and state restoration for background sync.
-- Swift 5 language mode, no task cancellation support, and no automated tests.
+- No task cancellation support. `RingSession` (an actor over the `RingLink` protocol) queues conversations, but `RingConnection` itself still assumes one at a time, so use it only through a session.
 - Time: the ring's clock does not follow daylight saving or travel, so it must be set on every sync; records from a ring whose clock was never set decode as dates in 2000 and must be rejected downstream.
 - History is stored before it is acknowledged (`RingSession.fetchHistory` takes a `persist` step). The ring kept its history after acknowledgement in the one case tested; keep the ordering anyway, since that is one observation on one firmware.
 

@@ -1,4 +1,4 @@
-import CoreBluetooth
+@preconcurrency import CoreBluetooth
 import Foundation
 import RingProtocol
 
@@ -45,7 +45,7 @@ public enum YCBT {
 
 /// A Bluetooth link to one YCBT ring. Received frames queue up in order and are read with `nextFrame`.
 ///
-/// Supports one conversation at a time: callers must not overlap `send` or `nextFrame` calls.
+/// Supports one conversation at a time; `RingSession` enforces that by queueing callers.
 /// `@unchecked Sendable` because all mutable state is confined to `queue`; the compiler cannot see that.
 public final class RingConnection: NSObject, @unchecked Sendable {
     /// Called on the Bluetooth queue with every raw notification and write, for capture logs.
@@ -59,7 +59,7 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     private var commandCharacteristic: CBCharacteristic?
     private var stateWaiters: [CheckedContinuation<Void, Error>] = []
     private var scanResults: [UUID: DiscoveredDevice] = [:]
-    private var scanMatch: ((DiscoveredDevice) -> Bool)?
+    private var scanMatch: (@Sendable (DiscoveredDevice) -> Bool)?
     private var connectWaiter: CheckedContinuation<Void, Error>?
     private var connectAttempt = 0
     private var writeWaiter: CheckedContinuation<Void, Error>?
@@ -94,7 +94,7 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     // MARK: Connecting
 
     /// Scans for the first device accepted by `matching`, connects, and subscribes to the YCBT channels.
-    public func connect(timeout: TimeInterval = 20, matching: @escaping (DiscoveredDevice) -> Bool) async throws {
+    public func connect(timeout: TimeInterval = 20, matching: @escaping @Sendable (DiscoveredDevice) -> Bool) async throws {
         try await waitUntilPoweredOn()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async {
