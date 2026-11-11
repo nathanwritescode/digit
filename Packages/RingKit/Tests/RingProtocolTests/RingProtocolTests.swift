@@ -163,26 +163,42 @@ private let utc = TimeZone(identifier: "UTC")!
     #expect(Hex.decode("00 ff") == nil)
 }
 
-// Synthetic bytes.
-@Test func historyTransferRoundTripsThroughJSON() throws {
-    let transfer = HistoryTransfer(
-        kind: .sleep, header: [0x01, 0x02, 0x03], data: [0xDE, 0xAD, 0xBE, 0xEF],
-        fetchedAt: Date(timeIntervalSince1970: 1_800_000_000), timeZoneIdentifier: "Europe/London")
-    let encoder = JSONEncoder()
-    encoder.dateEncodingStrategy = .iso8601
-    let json = try encoder.encode(transfer)
-    let decoder = JSONDecoder()
-    decoder.dateDecodingStrategy = .iso8601
-    #expect(try decoder.decode(HistoryTransfer.self, from: json) == transfer)
+// Synthetic bytes. The date has a fractional part to prove the format keeps milliseconds.
+private let sampleTransfer = HistoryTransfer(
+    kind: .sleep, header: [0x01, 0x02, 0x03], data: [0xDE, 0xAD, 0xBE, 0xEF],
+    fetchedAt: Date(timeIntervalSince1970: 1_800_000_000.123), timeZoneIdentifier: "Europe/London")
 
-    // Byte fields are hex strings, and the file holds exactly the five documented fields.
+@Test func historyTransferRoundTripsThroughJSON() throws {
+    // Default encoder and decoder: the transfer owns its date format.
+    let json = try JSONEncoder().encode(sampleTransfer)
+    #expect(try JSONDecoder().decode(HistoryTransfer.self, from: json) == sampleTransfer)
+
+    // A real clock reading, truncated the way the session does, round-trips too.
+    var now = sampleTransfer
+    now.fetchedAt = HistoryTransfer.truncatedToMilliseconds(Date())
+    #expect(try JSONDecoder().decode(HistoryTransfer.self, from: JSONEncoder().encode(now)) == now)
+
+    // Byte fields are hex strings, kind is a name, and the file holds exactly the five documented fields.
     let object = try #require(try JSONSerialization.jsonObject(with: json) as? [String: Any])
     #expect(Set(object.keys) == ["kind", "header", "data", "fetchedAt", "timeZoneIdentifier"])
     #expect(object["header"] as? String == "010203")
     #expect(object["data"] as? String == "deadbeef")
+    #expect(object["kind"] as? String == "sleep")
+    #expect(object["fetchedAt"] as? String == "2027-01-15T08:00:00.123Z")
+}
+
+@Test func historyKindsAreEncodedByNameAndUnknownNamesRejected() throws {
+    for kind in HistoryKind.allCases {
+        var t = sampleTransfer
+        t.kind = kind
+        let object = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(t)) as? [String: Any])
+        #expect(object["kind"] as? String == kind.name)
+    }
+    let json = Data(#"{"kind":"steps","header":"","data":"","fetchedAt":"2027-01-15T08:00:00.123Z","timeZoneIdentifier":"UTC"}"#.utf8)
+    #expect(throws: DecodingError.self) { try JSONDecoder().decode(HistoryTransfer.self, from: json) }
 }
 
 @Test func historyTransferRejectsNonHexBytes() {
-    let json = Data(#"{"kind":2,"header":"xyz","data":"","fetchedAt":0,"timeZoneIdentifier":"UTC"}"#.utf8)
+    let json = Data(#"{"kind":"sleep","header":"xyz","data":"","fetchedAt":"2027-01-15T08:00:00.123Z","timeZoneIdentifier":"UTC"}"#.utf8)
     #expect(throws: DecodingError.self) { try JSONDecoder().decode(HistoryTransfer.self, from: json) }
 }

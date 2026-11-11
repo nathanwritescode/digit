@@ -76,8 +76,10 @@ private func session(_ link: FakeLink) -> RingSession { RingSession(link: link, 
 
 private let kind = HistoryKind.heartRate
 
+// Non-zero bytes, so a test can tell the header payload was really captured.
+private func headerBytes(_ length: Int) -> [UInt8] { (0..<length).map { UInt8($0 + 1) } }
 private func header(_ length: Int) -> Frame {
-    Frame(group: Command.healthGroup, key: kind.rawValue, payload: [UInt8](repeating: 0, count: length))
+    Frame(group: Command.healthGroup, key: kind.rawValue, payload: headerBytes(length))
 }
 private func dataFrame(_ bytes: [UInt8]) -> Frame {
     Frame(group: Command.healthGroup, key: kind.rawValue, payload: bytes)
@@ -143,7 +145,7 @@ private struct PersistFailure: Error {}
     let transfer = try await session(link).fetchHistory(kind) { await persisted.add($0) }
     #expect(transfer.data.isEmpty)
     #expect(transfer.kind == kind)
-    #expect(transfer.header == [UInt8](repeating: 0, count: 9))
+    #expect(transfer.header == headerBytes(9))
     #expect(await persisted.calls.isEmpty)
     #expect(link.sent == [Command.history(kind)])
 }
@@ -190,15 +192,18 @@ private struct PersistFailure: Error {}
 
 @Test func transferCarriesHeaderFetchTimeAndTimeZone() async throws {
     let link = historyLink(chunks: [[1, 2], [3]], headerLength: 12)
-    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    // The clock reads finer than a millisecond; the transfer keeps whole milliseconds.
+    let now = Date(timeIntervalSince1970: 1_800_000_000.1234567)
     let zone = try #require(TimeZone(identifier: "Pacific/Auckland"))
     let s = RingSession(link: link, replyTimeout: 0.05, clock: { now }, timeZone: { zone })
     let persisted = PersistRecorder()
     let returned = try await s.fetchHistory(kind) { await persisted.add($0) }
     let expected = HistoryTransfer(
-        kind: kind, header: [UInt8](repeating: 0, count: 12), data: [1, 2, 3],
-        fetchedAt: now, timeZoneIdentifier: "Pacific/Auckland")
+        kind: kind, header: headerBytes(12), data: [1, 2, 3],
+        fetchedAt: Date(timeIntervalSince1970: 1_800_000_000.123), timeZoneIdentifier: "Pacific/Auckland")
     #expect(returned == expected)
+    // And it survives the file format unchanged.
+    #expect(try JSONDecoder().decode(HistoryTransfer.self, from: JSONEncoder().encode(returned)) == returned)
     // What is saved before the acknowledgement is the same full transfer that is returned.
     #expect(await persisted.calls == [expected])
 }
@@ -213,6 +218,7 @@ private struct PersistFailure: Error {}
     #expect(second.timeZoneIdentifier == "America/Denver")
 }
 
+// @unchecked Sendable: all mutable state is guarded by `lock`.
 private final class ZoneBox: @unchecked Sendable {
     private let lock = NSLock()
     private var identifiers: [String]
@@ -220,6 +226,17 @@ private final class ZoneBox: @unchecked Sendable {
     func next() -> TimeZone {
         TimeZone(identifier: lock.withLock { identifiers.removeFirst() })!
     }
+}
+
+@Test func setTimeUsesTheSessionsClockAndZone() async throws {
+    let link = FakeLink { $0.type == 0x0100 ? [Frame(group: 0x01, key: 0x00, payload: [0])] : [] }
+    // 2027-01-15 08:00:00 UTC is 21:00 on the same day in Auckland (UTC+13 in January).
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let zone = try #require(TimeZone(identifier: "Pacific/Auckland"))
+    let s = RingSession(link: link, replyTimeout: 0.05, clock: { now }, timeZone: { zone })
+    try await s.setTime()
+    #expect(link.sent == [Command.setTime(now, timeZone: zone)])
+    #expect(link.sent.first?.payload[4] == 21)
 }
 
 @Test func staleFramesAreDiscardedBeforeANewRequest() async throws {

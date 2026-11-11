@@ -22,8 +22,9 @@ extension RingConnection: RingLink {}
 public actor RingSession {
     private nonisolated let link: any RingLink
     public nonisolated let replyTimeout: TimeInterval
-    // Injected so tests can pin the fetch time and zone. The zone is read per transfer, not once,
-    // because a long-lived session can outlast a change of time zone.
+    // Injected so tests can pin the time and zone. The zone is read on each use, not once, because
+    // a long-lived session can outlast a change of time zone. The autoupdating zone is meant to
+    // follow system changes; not verified on a device.
     private nonisolated let clock: @Sendable () -> Date
     private nonisolated let timeZone: @Sendable () -> TimeZone
 
@@ -34,7 +35,7 @@ public actor RingSession {
         link: any RingLink,
         replyTimeout: TimeInterval = 5,
         clock: @escaping @Sendable () -> Date = { Date() },
-        timeZone: @escaping @Sendable () -> TimeZone = { TimeZone.current }
+        timeZone: @escaping @Sendable () -> TimeZone = { TimeZone.autoupdatingCurrent }
     ) {
         self.link = link
         self.replyTimeout = replyTimeout
@@ -83,8 +84,9 @@ public actor RingSession {
         CurrentActivity(payload: try await request(Command.currentActivity).payload)
     }
 
-    public func setTime(_ date: Date = Date()) async throws {
-        _ = try await request(Command.setTime(date))
+    /// Sets the ring's clock to `date` (default: now by the session's clock) in the session's current time zone.
+    public func setTime(_ date: Date? = nil) async throws {
+        _ = try await request(Command.setTime(date ?? clock(), timeZone: timeZone()))
     }
 
     /// Fetches one kind of stored history with the context needed to decode it later. When nothing
@@ -141,7 +143,7 @@ public actor RingSession {
 
     private func makeTransfer(_ kind: HistoryKind, header: Frame, data: [UInt8]) -> HistoryTransfer {
         HistoryTransfer(kind: kind, header: header.payload, data: data,
-                        fetchedAt: clock(), timeZoneIdentifier: timeZone().identifier)
+                        fetchedAt: HistoryTransfer.truncatedToMilliseconds(clock()), timeZoneIdentifier: timeZone().identifier)
     }
 
     /// Every write goes through here so the delete-range refusal holds even for a link that forgets it.

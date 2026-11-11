@@ -6,7 +6,7 @@ let usage = """
 ringprobe: talk to a YCBT smart ring from a Mac.
 
   ringprobe scan [seconds]              list nearby Bluetooth devices
-  ringprobe info                        firmware and battery (today's activity with --show)
+  ringprobe info                        firmware and battery (device id and today's activity with --show)
   ringprobe settime                     set the ring's clock to this Mac's local time
   ringprobe history <kind>|all --save <dir>
                                         fetch stored history: \(HistoryKind.allCases.map(\.name).joined(separator: ", "))
@@ -79,14 +79,7 @@ let timestamps: DateFormatter = {
     let url = URL(fileURLWithPath: directory).appendingPathComponent("\(transfer.kind.name)-\(stamp).json")
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    encoder.dateEncodingStrategy = .iso8601
-    // Health data: create the file owner-only, so it is never readable by others even briefly.
-    guard FileManager.default.createFile(atPath: url.path, contents: try encoder.encode(transfer),
-                                         attributes: [.posixPermissions: 0o600]) else {
-        throw CocoaError(.fileWriteUnknown)
-    }
-    // createFile keeps the old mode when it replaces an existing file, so set it again.
-    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    try PrivateFile.write(try encoder.encode(transfer), to: url.path)
     print("  saved \(url.path)")
 }
 
@@ -137,7 +130,8 @@ do {
     case "info":
         let session = try await connect()
         if let info = try await session.deviceInfo() {
-            print("device id \(info.deviceID), firmware \(info.firmwareVersion), battery \(info.batteryPercent)% (state \(info.batteryState))")
+            // The device id may identify the ring, so it is health-adjacent data: --show only.
+            print("\(show ? "device id \(info.deviceID), " : "")firmware \(info.firmwareVersion), battery \(info.batteryPercent)% (state \(info.batteryState))")
         }
         if show, let activity = try await session.currentActivity() {
             print("today: \(activity.steps) steps, \(activity.distanceMeters) m, \(activity.kilocalories) kcal")
@@ -156,19 +150,21 @@ do {
         // durable to put the bytes before anything is requested.
         guard let directory = saveDirectory else { fail("history needs --save <dir>, so the data is kept before the ring is told it was received") }
         do {
-            try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+            try PrivateFile.createDirectory(directory)
             let testFile = URL(fileURLWithPath: directory).appendingPathComponent(".ringprobe-write-test")
-            try Data().write(to: testFile)
+            try? FileManager.default.removeItem(at: testFile)
+            try PrivateFile.write(Data(), to: testFile.path)
             try FileManager.default.removeItem(at: testFile)
         } catch {
-            fail("cannot write to \(directory): \(error.localizedDescription)")
+            fail("cannot write to \(directory): \(error)")
         }
         let stamp = timestamps.string(from: Date()).replacingOccurrences(of: " ", with: "T").replacingOccurrences(of: ":", with: "")
         let session = try await connect()
         for kind in kinds {
-            let bytes = try await session.fetchHistory(kind) { transfer in
+            let transfer = try await session.fetchHistory(kind) { transfer in
                 try saveCapture(transfer, directory: directory, stamp: stamp)
-            }.data
+            }
+            let bytes = transfer.data
             guard !bytes.isEmpty else { print("\(kind.name): empty"); continue }
             print("\(kind.name): \(bytes.count) bytes, \(recordCount(kind, bytes))")
             if show { describe(kind, bytes) }
