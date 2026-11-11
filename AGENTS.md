@@ -26,10 +26,14 @@ Packages/RingKit/
   Sources/ringprobe/       macOS command-line tool for probing a ring
   Tests/RingProtocolTests/ Swift Testing tests
   Tests/RingTransportTests/ session tests against a scripted fake RingLink (no Bluetooth)
+App/
+  Digit.xcodeproj          iOS app project (SwiftUI, iOS 26, Swift 6, iPhone only); depends on RingKit
+  Digit/                   app sources (file-system-synchronised: new files are picked up automatically)
+  Config/                  Info.plist (usage strings, background mode) and Digit.entitlements (HealthKit)
 captures/                  raw ring captures (git-ignored, private)
 ```
 
-Planned but not yet built: a ring abstraction with per-device capabilities, the on-device store (GRDB) with export, the Apple Health writer (write-only for now, behind an interface that can add reading later), and the SwiftUI app.
+Planned but not yet built: a ring abstraction with per-device capabilities, the on-device store (GRDB) with export, and the Apple Health writer (write-only for now, behind an interface that can add reading later). The SwiftUI app exists as an empty skeleton with a placeholder screen.
 
 ## Commands
 
@@ -45,7 +49,13 @@ swift run ringprobe history all --save ../../captures   # --save is required; on
 swift run ringprobe raw 0200:4743   # send a known read-only frame
 ```
 
-Continuous integration (`.github/workflows/ci.yml`) runs `swift build` and `swift test` on every pull request and every push to `main`, using the newest released Xcode on GitHub's macOS runner. That toolchain can be older than a developer's local one, so a feature that builds locally may still fail there; the CI result is the one that counts.
+Build the app for the simulator from the repository root (needs Xcode, no signing):
+
+```
+xcodebuild -project App/Digit.xcodeproj -scheme Digit -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+```
+
+Continuous integration (`.github/workflows/ci.yml`) runs `swift build` and `swift test` for RingKit, and the `xcodebuild` command above for the app, on every pull request and every push to `main`, using the newest released Xcode on GitHub's macOS runner. That toolchain can be older than a developer's local one, so a feature that builds locally may still fail there; the CI result is the one that counts.
 
 `ringprobe` needs a ring in range that is not connected to another device. It uses the Mac's Bluetooth, so the terminal running it needs Bluetooth permission. Bluetooth does not work in the iOS simulator; app-level Bluetooth testing needs a physical iPhone.
 
@@ -126,6 +136,7 @@ Agent definitions live in `.claude/agents/`.
 
 - **Database:** SQLite via GRDB (MIT). Raw ring records are the source of truth; anything derived can be rebuilt from them. Do not introduce SwiftData or Core Data.
 - **Minimum iOS version:** iOS 26.
+- **Concurrency defaults:** the app target defaults to main-actor isolation (`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`); the RingKit package does not.
 - **Bundle identifier:** `com.nathantalley.digit`.
 
 ## Open decisions
