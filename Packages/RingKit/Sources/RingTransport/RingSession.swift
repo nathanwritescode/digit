@@ -4,6 +4,7 @@ import RingProtocol
 /// What `RingSession` needs from a connection to a ring. `RingConnection` is the Bluetooth
 /// implementation; tests supply a scripted one.
 public protocol RingLink: Sendable {
+    /// Conformers must also refuse frames where `erasesRingData` is true, by throwing `RingError.refusedDestructive`.
     func send(_ frame: Frame) async throws
     /// The next frame from the ring, in arrival order, or `nil` if none arrives within `timeout`.
     func nextFrame(timeout: TimeInterval) async -> Frame?
@@ -19,7 +20,7 @@ extension RingConnection: RingLink {}
 /// waits its turn, so conversations cannot steal each other's frames. Actor methods can
 /// interleave at every `await`, so the actor alone is not enough; `exclusively` is the queue.
 public actor RingSession {
-    public nonisolated let link: any RingLink
+    private nonisolated let link: any RingLink
     public nonisolated let replyTimeout: TimeInterval
 
     private var busy = false
@@ -52,7 +53,7 @@ public actor RingSession {
     private func converse(_ command: Frame) async throws -> Frame {
         // Anything still queued belongs to an earlier conversation that failed or timed out.
         await link.discardPendingFrames()
-        try await link.send(command)
+        try await transmit(command)
         while let frame = await link.nextFrame(timeout: replyTimeout) {
             if frame.type == command.type {
                 if frame.isErrorReply { throw RingError.rejected(frame) }
@@ -81,6 +82,9 @@ public actor RingSession {
     /// checksum of the concatenated data. `persist` then runs with the verified bytes, and only
     /// if it succeeds is the transfer acknowledged, so the data is durable before the ring is
     /// told it was received. No delete command is sent.
+    ///
+    /// `persist` runs while this session's turn is held, so it must not call back into the
+    /// session (any method), or the session deadlocks.
     ///
     /// Verified on an R99 with single-record transfers, where the ring kept its history after
     /// the acknowledgement. Transfers spanning several data frames have not been seen yet.
@@ -113,7 +117,7 @@ public actor RingSession {
                     throw RingError.checksumMismatch
                 }
                 try await persist(data)
-                try await link.send(Command.historyTransferOK)
+                try await transmit(Command.historyTransferOK)
                 return data
             }
             data += frame.payload
@@ -121,9 +125,15 @@ public actor RingSession {
         throw RingError.timeout("\(kind.name) history transfer")
     }
 
+    /// Every write goes through here so the delete-range refusal holds even for a link that forgets it.
+    private func transmit(_ frame: Frame) async throws {
+        guard !frame.erasesRingData else { throw RingError.refusedDestructive(frame) }
+        try await link.send(frame)
+    }
+
     /// Events the ring starts on its own (group `0x04`) must be echoed back with payload `[0x00]`.
     private func acknowledgeIfEvent(_ frame: Frame) async throws {
         guard frame.group == 0x04 else { return }
-        try await link.send(Frame(group: frame.group, key: frame.key, payload: [0x00]))
+        try await transmit(Frame(group: frame.group, key: frame.key, payload: [0x00]))
     }
 }

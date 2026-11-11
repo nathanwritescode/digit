@@ -84,7 +84,8 @@ Built for the command-line tool; these must be closed before the app relies on i
 - Ring-initiated events are acknowledged only while a request is in flight; there is no continuous reader and no way to subscribe to uploads.
 - History is returned as bare bytes, without the header frame, fetch time or time zone needed to re-decode it later.
 - Connecting scans for all devices and matches by name. iOS needs scanning by service, reconnecting by stored identifier, and state restoration for background sync.
-- No task cancellation support. `RingSession` (an actor over the `RingLink` protocol) queues conversations, but `RingConnection` itself still assumes one at a time, so use it only through a session.
+- No task cancellation support. `RingSession` (an actor over the `RingLink` protocol) queues conversations, but `RingConnection` itself still assumes one conversation at a time, so the app must use it only through a session (`ringprobe raw` uses it directly, which is fine for a single-task command-line tool).
+- When a continuous reader is added, `discardPendingFrames` must not drop ring-initiated events (group `0x04`), which still need acknowledging.
 - Time: the ring's clock does not follow daylight saving or travel, so it must be set on every sync; records from a ring whose clock was never set decode as dates in 2000 and must be rejected downstream.
 - History is stored before it is acknowledged (`RingSession.fetchHistory` takes a `persist` step). The ring kept its history after acknowledgement in the one case tested; keep the ordering anyway, since that is one observation on one firmware.
 

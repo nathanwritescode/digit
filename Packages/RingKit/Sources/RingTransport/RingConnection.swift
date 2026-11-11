@@ -1,3 +1,4 @@
+// @preconcurrency because the CBUUID statics in YCBT are not Sendable; all CoreBluetooth objects stay on the connection's queue.
 @preconcurrency import CoreBluetooth
 import Foundation
 import RingProtocol

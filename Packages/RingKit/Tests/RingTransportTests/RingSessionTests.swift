@@ -13,6 +13,11 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     private var log: [String] = []
     private var sentFrames: [Frame] = []
     private let onSend: @Sendable (Frame) -> [Frame]
+    // Gate: when armed, the first nextFrame call suspends until `releaseGate()`, so a test can
+    // hold one conversation open and check what a second one does meanwhile.
+    private var gateArmed = false
+    private var gateReached = false
+    private var gateContinuation: CheckedContinuation<Void, Never>?
 
     init(stale: [Frame] = [], onSend: @escaping @Sendable (Frame) -> [Frame] = { _ in [] }) {
         inbox = stale
@@ -34,7 +39,28 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     }
 
     func nextFrame(timeout: TimeInterval) async -> Frame? {
-        lock.withLock { inbox.isEmpty ? nil : inbox.removeFirst() }
+        let hold = lock.withLock { () -> Bool in
+            defer { gateArmed = false }
+            if gateArmed { gateReached = true }
+            return gateArmed
+        }
+        if hold {
+            await withCheckedContinuation { continuation in
+                // Runs synchronously, before suspension, so releaseGate cannot miss it.
+                lock.withLock { gateContinuation = continuation }
+            }
+        }
+        return lock.withLock { inbox.isEmpty ? nil : inbox.removeFirst() }
+    }
+
+    func armGate() { lock.withLock { gateArmed = true } }
+    var isHeldAtGate: Bool { lock.withLock { gateReached && gateContinuation != nil } }
+    func releaseGate() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            defer { gateContinuation = nil }
+            return gateContinuation
+        }
+        continuation?.resume()
     }
 
     func discardPendingFrames() async {
@@ -170,18 +196,34 @@ private struct PersistFailure: Error {}
 }
 
 @Test func overlappingConversationsRunOneAtATime() async throws {
-    // A reply is only queued once its own request is sent. If conversations interleaved, the
-    // second discard would wipe the first reply and one request would time out.
     let link = FakeLink { frame in [Frame(group: frame.group, key: frame.key, payload: [frame.key])] }
+    link.armGate()
     let s = session(link)
-    async let a = s.request(Frame(group: 0x02, key: 0x00))
-    async let b = s.request(Frame(group: 0x02, key: 0x0C))
-    let (ra, rb) = try await (a, b)
+    let first = Task { try await s.request(Frame(group: 0x02, key: 0x00)) }
+    // Hold the first conversation mid-flight, inside nextFrame.
+    while !link.isHeldAtGate { await Task.yield() }
+    let second = Task { try await s.request(Frame(group: 0x02, key: 0x0C)) }
+    // Give the second request ample time to (wrongly) start. If conversations could interleave
+    // it would discard and send now.
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(link.events == ["discard", "send 0200"])
+    link.releaseGate()
+    let (ra, rb) = try await (first.value, second.value)
     #expect(ra.payload == [0x00])
     #expect(rb.payload == [0x0C])
-    #expect(link.events.map { $0 == "discard" } == [true, false, true, false])
+    #expect(link.events == ["discard", "send 0200", "discard", "send 020C"])
 }
 
-// RingConnection.send's refusal of the delete range cannot be reached without constructing a
-// CBCentralManager, which needs Bluetooth permission. The check it makes is Frame.erasesRingData,
-// which RingProtocolTests already covers.
+@Test func sessionRefusesDeleteRangeFramesEvenIfTheLinkWouldSendThem() async throws {
+    let link = FakeLink()
+    do {
+        _ = try await session(link).request(Frame(group: 0x05, key: 0x40))
+        Issue.record("expected a refusal")
+    } catch RingError.refusedDestructive {
+    }
+    #expect(link.sent.isEmpty)
+}
+
+// RingConnection.send repeats the delete-range refusal, but reaching it needs a CBCentralManager
+// (Bluetooth permission). The session-level refusal above and Frame.erasesRingData's own test
+// in RingProtocolTests cover the check.
