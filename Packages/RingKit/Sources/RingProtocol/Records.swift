@@ -45,7 +45,8 @@ public struct CurrentActivity: Equatable, Sendable {
 }
 
 /// One stored activity interval (history kind `.activity`, 14 bytes each).
-/// Verified against one real night from an R99 (firmware 2.32); test fixtures are synthetic.
+/// On an R99 (firmware 2.32) the records were 30-minute buckets, and their step counts agreed with
+/// the combined record for the same hour. Verified against one real night; test fixtures are synthetic.
 public struct ActivityRecord: Equatable, Sendable {
     public var start: Date
     public var end: Date
@@ -66,7 +67,9 @@ public struct ActivityRecord: Equatable, Sendable {
 }
 
 /// One stored heart-rate reading (history kind `.heartRate`, 6 bytes each).
-/// Verified against one real night from an R99 (firmware 2.32); test fixtures are synthetic.
+/// On an R99 (firmware 2.32) the readings were one per hour on the hour with mode 0 (documented as automatic),
+/// and the values agreed with the combined record. `mode` is kept raw; the meaning of other
+/// values is not verified. Verified against one real night; test fixtures are synthetic.
 public struct HeartRateRecord: Equatable, Sendable {
     public var time: Date
     public var mode: UInt8
@@ -95,14 +98,30 @@ public struct SleepStage: Equatable, Sendable {
     public var start: Date
     public var duration: TimeInterval
     public var end: Date { start.addingTimeInterval(duration) }
+
+    /// Whether `next` follows this stage without a real gap. On an R99 (firmware 2.32) each stage
+    /// started one second after the previous one ended, so a timeline builder should treat that as
+    /// contiguous. The tolerance has no default because it is a per-device observation, not protocol
+    /// behaviour; callers must not require exactly one second. A small overlap (`next` starting up to
+    /// `tolerance` before this stage ends) also counts as contiguous; `next` earlier than that, or
+    /// later than `tolerance` after the end, does not. The decoder never merges or rewrites stages.
+    public func isContiguous(with next: SleepStage, tolerance: TimeInterval) -> Bool {
+        abs(next.start.timeIntervalSince(end)) <= tolerance
+    }
 }
 
 /// One night (or nap) of sleep (history kind `.sleep`, variable length).
 ///
 /// Layout: 20-byte header (`AF FA`, record length u16 with header included, start u32,
 /// end u32, 8 bytes of totals), then 8-byte stages (kind u8, start u32, duration seconds u24).
-/// The header totals are ignored; totals are derived from the stages.
-/// Verified against one real night from an R99 (firmware 2.32); test fixtures are synthetic.
+/// The header totals are ignored; totals are derived from the stages. On an R99 (firmware 2.32)
+/// the header used the newer layout (`FF FF`, then REM, deep and light totals as u16 seconds at
+/// offset 12) and the totals equalled the stage sums exactly.
+///
+/// Quirks seen on that ring, all passed through unchanged: stages start one second after the
+/// previous one ends (see `SleepStage.isContiguous`); no awake stages were reported; one night
+/// arrived as two sessions a few minutes apart, so a brief wake-up can be a gap between sessions.
+/// Verified against one real night; test fixtures are synthetic.
 public struct SleepSession: Equatable, Sendable {
     public var start: Date
     public var end: Date
@@ -140,6 +159,60 @@ public struct SleepSession: Equatable, Sendable {
             i += recordLength
         }
         return sessions
+    }
+}
+
+/// One stored combined record (history kind `.combined`, 20 bytes each).
+///
+/// Documented layout (little-endian): time u32, steps u16, heart rate, systolic, diastolic, SpO2,
+/// respiration, HRV, CVRR (one byte each), temperature integer and fraction, body-fat integer and
+/// fraction, glucose, then 2 more bytes. Confirmed on an R99 (firmware 2.32) for time, steps,
+/// heart rate, SpO2, respiration, HRV and CVRR (plausible, and consistent with the activity and
+/// heart-rate records). The Swift decoder matched an independent decode of a real R99 capture.
+///
+/// Only values the ring can measure are exposed. A zero in a measured field means "no reading"
+/// and becomes nil (an on-demand HRV record is reported to have every other field zero; that comes
+/// from another ring of the same family and is unverified on the R99). SpO2 outside 1...100 is
+/// not a reading and also becomes nil.
+///
+/// Deliberately not decoded into properties. They stay only in the module-internal `raw`, so
+/// later layers cannot read them; the stored `HistoryTransfer` is the source of truth:
+/// - blood pressure (bytes 7-8): filled in by the ring, but a ring cannot measure it; these are
+///   vendor estimates and must never be stored or shown as measurements;
+/// - temperature (bytes 13-14): identical in every record and not a body temperature on this ring;
+/// - body fat and glucose (bytes 15-17): always zero on this ring;
+/// - bytes 18-19: documented as reserved, but they varied between records with no visible
+///   pattern. They are not understood, so they are not called padding and are left undecoded.
+public struct CombinedRecord: Equatable, Sendable {
+    public static let size = 20
+
+    public var time: Date
+    /// Cross-check only: activity records are the source of steps. A zero here does not mean a
+    /// measured zero.
+    public var steps: Int
+    public var heartRate: Int?
+    public var spo2: Int?
+    public var respirationRate: Int?
+    public var hrv: Int?
+    public var cvrr: Int?
+    /// The whole 20-byte record exactly as received. Internal on purpose (see above).
+    var raw: [UInt8]
+
+    /// Decodes consecutive records; a trailing partial record is ignored.
+    public static func decode(_ b: [UInt8], timeZone: TimeZone) -> [CombinedRecord] {
+        func reading(_ value: UInt8) -> Int? { value == 0 ? nil : Int(value) }
+        return stride(from: 0, to: b.count - (size - 1), by: size).map { i in
+            let spo2 = reading(b[i + 9])
+            return CombinedRecord(
+                time: RingTime.date(fromRingSeconds: b.u32(i), timeZone: timeZone),
+                steps: Int(b.u16(i + 4)),
+                heartRate: reading(b[i + 6]),
+                spo2: spo2.flatMap { (1...100).contains($0) ? $0 : nil },
+                respirationRate: reading(b[i + 10]),
+                hrv: reading(b[i + 11]),
+                cvrr: reading(b[i + 12]),
+                raw: Array(b[i..<i + size]))
+        }
     }
 }
 
