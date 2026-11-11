@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Digit connects to your ring over Bluetooth to sync your health data. Nothing leaves your iPhone.</string>
+	<string>Digit connects to your ring over Bluetooth to copy its health history to this iPhone. Digit doesn't send your data over the internet.</string>
 	<key>NSHealthUpdateUsageDescription</key>
-	<string>Digit writes your sleep and activity data from the ring to Apple Health. Nothing leaves your iPhone.</string>
+	<string>Digit saves sleep and activity data from your ring to Apple Health. Digit doesn't send your data over the internet.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>

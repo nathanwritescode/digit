@@ -1,0 +1,19 @@
+name: Select the newest released Xcode
+description: Points DEVELOPER_DIR at the newest non-beta Xcode installed on the runner.
+runs:
+  using: composite
+  steps:
+    - name: Select the newest released Xcode
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "Xcode installations on this runner:"
+        ls -d /Applications/Xcode*.app
+        # Version-numbered names only, which leaves out betas and release candidates.
+        XCODE=$(ls -d /Applications/Xcode_*.app | grep -E '/Xcode_[0-9.]+\.app$' | sort -V | tail -n 1 || true)
+        if [ -z "$XCODE" ]; then
+          echo "No released Xcode_<version>.app found" >&2
+          exit 1
+        fi
+        echo "Selecting $XCODE"
+        echo "DEVELOPER_DIR=$XCODE/Contents/Developer" >> "$GITHUB_ENV"

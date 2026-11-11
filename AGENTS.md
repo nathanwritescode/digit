@@ -137,6 +137,7 @@ Agent definitions live in `.claude/agents/`.
 
 - **Database:** SQLite via GRDB (MIT). Raw ring records are the source of truth; anything derived can be rebuilt from them. Do not introduce SwiftData or Core Data.
 - **Minimum iOS version:** iOS 26.
+- **Concurrency defaults:** the app target defaults to main-actor isolation (`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`); the RingKit package does not.
 - **Bundle identifier:** `com.nathantalley.digit`.
 
 ## Open decisions
