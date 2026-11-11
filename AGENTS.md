@@ -68,12 +68,24 @@ Continuous integration (`.github/workflows/ci.yml`) runs `swift build` and `swif
 | Area | Status |
 |---|---|
 | Frame encoding, CRC, device info (`0x0200`), current activity (`0x020C`), set time (`0x0100`) | Verified against the ring |
-| History requests `0x0502`, `0x0504`, `0x0506`, `0x0509` | Ring answers. Heart-rate and combined history have returned one record each; activity and sleep only empty so far |
-| History transfer sequence (header, data, end frame with checksum, acknowledgement) | Verified with single-record transfers; a transfer spanning several data frames has not been seen |
+| History requests `0x0502`, `0x0504`, `0x0506`, `0x0509` | Verified: all four return data after a night of wear |
+| History transfer sequence (header, data, end frame with checksum, acknowledgement) | Verified, including a transfer spanning three data frames (data frames arrive on key `0x13` for sleep, one whole frame per notification, up to the MTU) |
 | Acknowledging a transfer | Does not discard it: a second fetch right after returned identical bytes |
-| Activity, sleep and heart record decoders | Written from documentation, tested with synthetic data only. The one real heart-rate transfer is 6 bytes, matching the documented record size; its contents have not been checked |
+| Activity, sleep and heart record decoders | Verified against a real night: the Swift decoders matched an independent decode, and the owner confirmed the times. Test fixtures remain synthetic |
+| Combined record (`0x0509`, 20 bytes) | Layout matches documentation; no Swift decoder yet. Timestamp, steps, heart rate, SpO2, respiration, HRV and CVRR are plausible and agree with the other records |
+| Heart-rate monitor interval (`0x010C`, payload `[enabled, minutes]`) | Verified at 1, 5 and 10 minutes: ack `00`, and readings arrive at that spacing, aligned to the clock. Factory behaviour is hourly. Off, and reading the setting back, are untested |
+| Battery percentage (device info byte 5) | Unverified: it has read 100% at every check so far |
 | `0x0220` live snapshot, `0x0533` body data | Ring replies unsupported |
 | `0x051A` SpO2 history, `0x051E` temperature history | No reply; support unknown |
+
+### Data quirks seen on this ring
+
+- **Sleep stages** are stored in time order, and each starts one second after the previous one ends. Treat a one-second gap as contiguous.
+- **Sleep header** uses the newer layout: `FF FF`, then REM, deep and light totals in seconds, which equal the sums of the stage durations.
+- **No awake stages** were reported in the one night seen. A brief wake-up appeared as a gap of a few minutes between two sessions. One night is not enough to rely on this.
+- **Activity** records are 30-minute buckets; **heart-rate** records carry mode 0 for automatic readings.
+- **Combined record:** the blood-pressure fields are filled in, but a ring cannot measure blood pressure. They are vendor estimates: never store them as measurements or write them to Apple Health. The temperature fields hold the same value in every record and are not a body temperature; treat as absent. Body fat and glucose are always zero. The last two bytes, documented as reserved, vary between records and are not understood.
+- **The ring does not validate settings.** It acknowledges any monitor interval, so the app must only ever send values from a known list.
 
 Update this table as captures confirm or contradict it. Best external reference: `docs/PROTOCOL.md` in `PopShark57/SmartRingWatcher` (no licence: read, don't copy).
 
@@ -111,6 +123,12 @@ Work is organised as GitHub issues, one pull request per issue.
 Agent definitions live in `.claude/agents/`.
 
 **Issues** use the template in `.github/ISSUE_TEMPLATE/implementation.md`. Each must be self-contained: an implementer with no other context should be able to finish it from the issue and this file. Label issues that need the physical ring, a real iPhone or Apple Health permissions `needs-hardware`; those are not handed to an implementer alone.
+
+**Ring access.** The ring accepts one connection at a time, and an agent cannot obtain the owner's go-ahead, so access is limited by role:
+
+- *Reviewers* never run `ringprobe`, with any arguments. They run in parallel and are asked to try to break things; one has already sent frames to the ring by accident while testing argument validation.
+- *Implementers* may run `ringprobe info` and `ringprobe raw` with known read-only commands, without `--show`, `--trace` or `--allow-unknown`, and only when their issue says a hardware check is in scope. One agent at a time.
+- *The planner, with the owner* does everything else: fetching history (it writes health data to disk), anything using `--show`, `--trace` or `--allow-unknown`, and every command that changes a ring setting.
 
 **Review.** Every pull request gets the architecture, bugs and practices reviewers, each started fresh with no context from the implementation. Add the privacy reviewer when the change touches storage, export, Apple Health, logging, networking, dependencies, test fixtures or the commands sent to the ring. The planner checks each finding, sends blocking ones back to an implementer, and re-runs the affected reviewers on the fix. The owner merges once no blocking findings remain.
 
