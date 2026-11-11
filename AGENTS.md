@@ -83,10 +83,14 @@ Continuous integration (`.github/workflows/ci.yml`) runs `swift build` and `swif
 | Acknowledging a transfer | Does not discard it: a second fetch right after returned identical bytes |
 | Activity, sleep and heart record decoders | Verified against one real night: the Swift decoders matched an independent decode for all three, and the owner confirmed the sleep times matched their night (recorded on #6). Test fixtures remain synthetic |
 | Combined record (`0x0509`, 20 bytes) | Layout matches documentation. `CombinedRecord` decodes it; the Swift decoder was run against a real R99 capture (36 records) and every exposed field matched an independent decode (test fixtures remain synthetic). Timestamp, steps, heart rate, SpO2, respiration, HRV and CVRR are plausible and agree with the other records |
-| Heart-rate monitor interval (`0x010C`, payload `[enabled, minutes]`) | Verified at 1, 5 and 10 minutes: ack `00`, and readings arrive at that spacing, aligned to the clock. Before any setting was sent the ring measured hourly, presumably its default. Off, and reading the setting back, are untested |
-| Battery percentage (device info byte 5) | Unverified: it has read 100% at every check so far |
+| Monitoring interval (`0x010C`, payload `[enabled, minutes]`) | Verified at 1, 5 and 10 minutes and off: ack `00`; readings arrive at that spacing, aligned to the clock, and stop when off. Each scheduled reading produces a heart-rate record and a combined record, so this one setting drives heart rate, SpO2, respiration, HRV and CVRR. Before any setting was sent the ring measured hourly, presumably its default. Readings resuming after re-enabling was accepted by the ring but not yet confirmed from history |
+| Battery percentage (device info byte 5) | Unverified: it has read 100% at every check so far (#25). Do not show it in the app until settled |
 | `0x0220` live snapshot, `0x0533` body data | Ring replies unsupported |
-| `0x051A` SpO2 history, `0x051E` temperature history | No reply; support unknown |
+| `0x051A` SpO2 history, `0x051E` temperature history | No reply at all, before or after a night of wear: treat as unsupported. SpO2 is available only in the combined record |
+| SpO2 monitor (`0x0126`, payload `[enabled, minutes]`) | Acknowledged with `00` but no visible effect: with monitoring off, no SpO2 reading was logged at the next boundary. Not implemented |
+| Read settings back (`0x0207`, payload `43 46`) | Rejected as unsupported. The app must remember settings and re-send them |
+| On-demand measurement (`0x032F`, payload `[start 1/0, kind]`) | Verified for heart rate (kind 0) and SpO2 (kind 2): ack `00`, live values on `0x0601` or `0x0602`, then event `0x040E [kind, 01]` when done (about 27 s for heart rate, about 67 s for SpO2, with SpO2 values only arriving in the last few seconds). The result is also logged to history: heart rate as a heart-rate record with mode 0, SpO2 as a combined record with only SpO2 filled. No builder or tool command exists yet |
+| Standard Heart Rate service (`180D`, characteristic `2A37`) | Verified: about one notification a second while subscribed, with no RR intervals, so it cannot supply HRV. Not used by the code yet |
 
 Update this table as captures confirm or contradict it. Best external reference: `docs/PROTOCOL.md` in `PopShark57/SmartRingWatcher` (no licence: read, don't copy).
 
@@ -97,7 +101,7 @@ Seen in one night of data unless stated otherwise. Treat them as properties of t
 - **Sleep stages** are stored in time order, and each started one second after the previous one ended. Treat a gap of up to about a second as contiguous; do not require exactly one second.
 - **Sleep header:** the 8 totals bytes at offset 12 of the 20-byte header (after the `AF FA` marker, length, start and end) used the newer layout: `FF FF`, then REM, deep and light totals as u16 seconds. They equalled the sums of the stage durations.
 - **No awake stages** were reported. A brief wake-up appeared as a gap of a few minutes between two sessions.
-- **Activity** records were 30-minute buckets; **heart-rate** records carried mode 0 for automatic readings.
+- **Activity** records were 30-minute buckets; **heart-rate** records carried mode 0 for both scheduled and on-demand readings, so the mode byte does not tell them apart.
 - **Combined record:** the blood-pressure fields are filled in, but a ring cannot measure blood pressure; they are vendor estimates. The temperature fields held the same value in every record and were not a body temperature; treat as absent. Body fat and glucose were always zero. The last two bytes, documented as reserved, varied between records and are not understood.
 - **Setting validation is untested here.** On this ring only valid heart-rate intervals (1, 5 and 10 minutes) have been sent, and all were honoured. Another ring of the same family is reported to acknowledge any interval byte, including nonsense values, so the app must only ever send values from a known list.
 
@@ -162,7 +166,9 @@ The planner starts at most one hardware-check implementer at a time, and never w
 - **Concurrency defaults:** the app target defaults to main-actor isolation (`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`); the RingKit package does not.
 - **Bundle identifier:** `com.nathantalley.digit`.
 - **Vendor estimates:** raw ring records are stored exactly as received, but values the ring cannot measure (blood pressure, and the temperature field on the R99) are never exposed as measurements in derived tables, the app, exports of typed data, or Apple Health.
+- **One monitoring interval:** the app offers a single setting (off, 1, 5, 10, 15, 20, 30 or 60 minutes; default 10) that controls heart rate, SpO2, respiration and HRV together, because that is how the ring behaves. There is no separate SpO2 setting. The ring cannot report its settings, so the app stores the choice and re-sends it on every sync.
 
 ## Open decisions
 
-- **Apple Developer account:** free account for now; a paid one is needed for TestFlight and for builds that last longer than 7 days.
+- **Apple Developer account:** the owner enrolled in the paid Apple Developer Program on 2026-11-11; activation was pending. Until the paid team appears in Xcode, do not run the app on a device with the free Personal Team, so the bundle identifier is not registered to the wrong team. No signing team is committed to the project.
+- **Repository visibility:** private since 2026-11-11 while GitHub Support removes a closed pull request; the intent is to make it public again. GitHub Actions minutes are metered while it is private.
