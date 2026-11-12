@@ -91,8 +91,6 @@ public final class RingStore: Sendable {
 
     // MARK: Transfers
 
-    /// Stores `transfer` for `ringID`. Identical bytes (same ring, kind and data) that are already
-    /// stored are a no-op that keeps the first row; the header, fetch time and zone do not count.
     /// The insert statement, kept as a constant so a test can run exactly this SQL. `ON CONFLICT`
     /// names the hash on purpose: `INSERT OR IGNORE` would also swallow NOT NULL and CHECK failures.
     static let insertTransferSQL = """
@@ -102,23 +100,74 @@ public final class RingStore: Sendable {
         ON CONFLICT(content_hash) DO NOTHING
         """
 
+    /// Finds a stored transfer for the same ring and kind that is longer than the new data and
+    /// starts with it. Compared in SQL so blobs are not loaded; `substr` on a blob works in bytes
+    /// and the comparison is a byte comparison, so zero bytes are fine. An empty new transfer
+    /// (`length(data) > 0`, empty prefix) matches any non-empty row.
+    private static let findSupersederSQL = """
+        SELECT id FROM history_transfer
+        WHERE ring_id = ? AND kind = ? AND length(data) > ? AND substr(data, 1, ?) = ?
+        ORDER BY id LIMIT 1
+        """
+
+    /// Removes the transfers the new one supersedes: same ring and kind, strictly shorter, and a
+    /// prefix of the new data. The new row is longer than all of them, so it never matches itself.
+    /// An existing empty transfer is a prefix of everything and goes when any non-empty one arrives.
+    private static let pruneSupersededSQL = """
+        DELETE FROM history_transfer
+        WHERE ring_id = ? AND kind = ? AND length(data) < ? AND substr(?, 1, length(data)) = data
+        """
+
+    /// Stores `transfer` for `ringID`, in one write transaction with any pruning.
+    ///
+    /// - Identical bytes (same ring, kind and data) already stored are a no-op that keeps the first
+    ///   row (`.duplicate`); the header, fetch time and zone do not count.
+    /// - If an existing transfer for that ring and kind is longer and starts with the new data,
+    ///   the new one adds nothing (an older capture imported late, or a truncated fetch) and is
+    ///   not stored (`.supersededByExisting`).
+    /// - Otherwise it is stored, and every earlier transfer for that ring and kind whose data is a
+    ///   strict prefix of it is deleted, since every record in it is in the new one. The count is
+    ///   in `.inserted(pruned:)`. A transfer that is not a prefix (the ring's buffer rolled over or
+    ///   was reset) is kept alongside.
+    ///
+    /// Empty data is a prefix of everything: it is never stored when any transfer for that ring and
+    /// kind exists (it is a `.duplicate` of an existing empty one, else superseded by a non-empty
+    /// one), and an existing empty transfer is pruned when a non-empty one arrives.
+    ///
+    /// A pruned row loses its fetch time, header and time zone. That is acceptable because
+    /// ingestion decodes timestamps from the clock-set log, not from a transfer's zone. Anything
+    /// that references a transfer by row id must survive its deletion.
+    ///
     /// Only a clash on the content hash counts as a duplicate; any other constraint failure throws.
     @discardableResult
     public func insert(_ transfer: HistoryTransfer, ringID: UUID) throws -> InsertOutcome {
         let hash = Self.contentHash(ringID: ringID, kind: transfer.kind, data: transfer.data)
+        let kindCode = KindCode.code(for: transfer.kind)
+        let data = Data(transfer.data)
         return try writer.write { db in
             try Self.requireRing(db, ringID)
+            if let existing = try Int64.fetchOne(
+                db, sql: "SELECT id FROM history_transfer WHERE content_hash = ?", arguments: [Data(hash)])
+            {
+                return .duplicate(existingID: existing)
+            }
+            if let superseder = try Int64.fetchOne(
+                db, sql: Self.findSupersederSQL,
+                arguments: [ringID.uuidString, kindCode, data.count, data.count, data])
+            {
+                return .supersededByExisting(existingID: superseder)
+            }
             try db.execute(
                 sql: Self.insertTransferSQL,
                 arguments: [
-                    ringID.uuidString, KindCode.code(for: transfer.kind), Data(transfer.header), Data(transfer.data),
+                    ringID.uuidString, kindCode, Data(transfer.header), data,
                     HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),
                 ])
-            if db.changesCount > 0 { return .inserted(id: db.lastInsertedRowID) }
-            let existing = try Int64.fetchOne(
-                db, sql: "SELECT id FROM history_transfer WHERE content_hash = ?", arguments: [Data(hash)])
-            guard let existing else { throw RingStoreError.corruptRow("duplicate without an existing row") }
-            return .duplicate(existingID: existing)
+            guard db.changesCount > 0 else { throw RingStoreError.corruptRow("duplicate without an existing row") }
+            let id = db.lastInsertedRowID
+            try db.execute(
+                sql: Self.pruneSupersededSQL, arguments: [ringID.uuidString, kindCode, data.count, data])
+            return .inserted(id: id, pruned: db.changesCount)
         }
     }
 

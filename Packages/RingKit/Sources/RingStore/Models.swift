@@ -28,10 +28,14 @@ public struct TransferListing: Equatable, Sendable {
 }
 
 public enum InsertOutcome: Equatable, Sendable {
-    /// A new row was written.
-    case inserted(id: Int64)
+    /// A new row was written. `pruned` earlier rows (same ring and kind, data a strict prefix of
+    /// this one's) were deleted in the same transaction; 0 when none were superseded.
+    case inserted(id: Int64, pruned: Int)
     /// The same ring, kind and data bytes were already stored; the first row was kept.
     case duplicate(existingID: Int64)
+    /// Nothing was stored: the data is a strict prefix of a longer stored transfer (`existingID`)
+    /// for the same ring and kind, so it holds no record that one lacks.
+    case supersededByExisting(existingID: Int64)
 }
 
 /// One time the app set the ring's clock. The ring stamps records with whatever clock was last

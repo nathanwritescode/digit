@@ -181,7 +181,7 @@ The planner starts at most one hardware-check implementer at a time, and never w
 - **Store (`RingStore`):** raw transfers are de-duplicated by a SHA-256 of ring, kind and data (header, fetch time and zone excluded; the first row wins). Kinds are stored under frozen codes that never change, not `HistoryKind.name`. The caller supplies the database location, which must be a dedicated directory (the app will use an App Group container). File protection is `completeUntilFirstUserAuthentication`. It is a WAL-mode `DatabasePool`. Known follow-ups:
   - The public API is synchronous; it needs async variants before any UI uses it (#10, #11).
   - App Group sharing configuration (suspension notifications, a read-only opener for a widget) is needed before the app links the store (#13).
-  - Transfers are whole buffers, so near-duplicate copies accumulate until superseded transfers are pruned (to be tracked in its own issue).
+  - Transfers are whole buffers, so inserting one deletes every earlier transfer for the same ring and kind whose data is a strict prefix of it (and skips one that is a prefix of a stored transfer), in one transaction; typed rows (#10) must reference transfers in a way that survives that deletion.
 - **Minimum iOS version:** iOS 26.
 - **Concurrency defaults:** the app target defaults to main-actor isolation (`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`); the RingKit package does not.
 - **Bundle identifier:** `com.nathantalley.digit`.
@@ -191,4 +191,3 @@ The planner starts at most one hardware-check implementer at a time, and never w
 ## Open decisions
 
 - **Apple Developer account:** the owner is moving to a paid developer team. Until that team is available in Xcode, do not run the app on a device signed with the free Personal Team, so the bundle identifier is not registered to the wrong team. No signing team is committed to the project.
-- **CI cost:** GitHub Actions minutes are metered while the repository is private; avoid unnecessary CI runs.
