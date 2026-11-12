@@ -120,6 +120,11 @@ Seen in one night and the following day of data unless stated otherwise. Treat t
 
 Built for the command-line tool; these must be closed before the app relies on it. Each should have an issue.
 
+- Deadlines are in place (connect covers scan through subscribe, writes, Bluetooth readiness, and each conversation as a whole), but the CoreBluetooth paths are covered by reasoning only, not tests, and have not been exercised at the edge of range. Reproducing the original hang on hardware is still open. The link owns the write deadline (`RingLink.send` contract); `RingSession` keeps a backstop that is always later than the link's `writeTimeout`.
+- `persist` is deliberately outside the conversation deadline: abandoning it would make "durable before acknowledged" unknowable. It is therefore still an unbounded wait that holds the session's turn.
+- The 60 s conversation cap has not been tested against a large backlog and is longer than an iOS background window; the sync engine needs its own budget.
+- A conversation can overrun its deadline by up to about `writeTimeout + replyTimeout` for a final write (the write backstop, derived from the link's own `writeTimeout`).
+- A late reply to a timed-out request can be accepted by a retry of the same kind of request; for history it fails safe through the checksum.
 - Ring-initiated events are acknowledged only while a request is in flight; there is no continuous reader and no way to subscribe to uploads.
 - Connecting scans for all devices and matches by name. iOS needs scanning by service, reconnecting by stored identifier, and state restoration for background sync.
 - No task cancellation support. `RingSession` (an actor over the `RingLink` protocol) queues conversations, but `RingConnection` itself still assumes one conversation at a time, so the app must use it only through a session (`ringprobe raw` uses it directly, which is fine for a single-task command-line tool).
