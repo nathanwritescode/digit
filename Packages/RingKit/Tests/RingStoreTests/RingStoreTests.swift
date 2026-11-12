@@ -49,7 +49,7 @@ struct RingStoreTests {
         try onEachStore { store in
             let ring = try store.registerRing(protocolFamily: "ycbt")
             let t = transfer(data: [])
-            guard case .inserted(let id) = try store.insert(t, ringID: ring.id) else { Issue.record("expected insert"); return }
+            guard case .inserted(let id, _) = try store.insert(t, ringID: ring.id) else { Issue.record("expected insert"); return }
             let rows = try store.transfers(ringID: ring.id).transfers
             #expect(rows.count == 1)
             #expect(rows[0].transfer == t)
@@ -65,7 +65,7 @@ struct RingStoreTests {
             let first = try store.insert(transfer(), ringID: ring.id)
             let second = try store.insert(
                 transfer(header: [7, 7], at: t0.addingTimeInterval(3600), zone: "Asia/Tokyo"), ringID: ring.id)
-            guard case .inserted(let id) = first else { Issue.record("expected insert"); return }
+            guard case .inserted(let id, _) = first else { Issue.record("expected insert"); return }
             #expect(second == .duplicate(existingID: id))
             let rows = try store.transfers(ringID: ring.id).transfers
             #expect(rows.count == 1)
@@ -78,7 +78,7 @@ struct RingStoreTests {
             let ring = try store.registerRing(protocolFamily: "ycbt")
             try store.insert(transfer(.heartRate, data: [1]), ringID: ring.id)
             try store.insert(transfer(.sleep, data: [1]), ringID: ring.id)
-            try store.insert(transfer(.heartRate, data: [1, 0]), ringID: ring.id)
+            try store.insert(transfer(.heartRate, data: [0, 1]), ringID: ring.id)
             #expect(try store.transfers(ringID: ring.id).transfers.count == 3)
         }
     }
@@ -257,7 +257,7 @@ struct RingStoreTests {
         do {
             let store = try RingStore(url: url)
             ringID = try store.registerRing(protocolFamily: "ycbt").id
-            guard case .inserted(let id) = try store.insert(transfer(), ringID: ringID) else {
+            guard case .inserted(let id, _) = try store.insert(transfer(), ringID: ringID) else {
                 Issue.record("expected insert"); return
             }
             firstID = id

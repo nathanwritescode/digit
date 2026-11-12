@@ -20,6 +20,23 @@ public struct StoredTransfer: Equatable, Sendable {
     public var transfer: HistoryTransfer
 }
 
+/// A record of one fetch: when, how long its data was, under which zone, and the content hash of
+/// that data. It stays whether or not the transfer row still exists (pruning deletes the row, a
+/// duplicate never had one of its own). The data itself is in a surviving transfer that starts
+/// with it.
+public struct TransferObservation: Equatable, Sendable {
+    public var id: Int64
+    public var ringID: UUID
+    public var kind: HistoryKind
+    public var dataLength: Int
+    public var header: [UInt8]
+    /// `RingStore.contentHash` of the observed data, the same value a stored transfer carries.
+    public var contentHash: [UInt8]
+    /// Whole milliseconds.
+    public var fetchedAt: Date
+    public var timeZoneIdentifier: String
+}
+
 /// The result of listing transfers.
 public struct TransferListing: Equatable, Sendable {
     public var transfers: [StoredTransfer]
@@ -28,10 +45,14 @@ public struct TransferListing: Equatable, Sendable {
 }
 
 public enum InsertOutcome: Equatable, Sendable {
-    /// A new row was written.
-    case inserted(id: Int64)
+    /// A new row was written. `pruned` earlier rows (same ring and kind, data a strict prefix of
+    /// this one's) were deleted in the same transaction; 0 when none were superseded.
+    case inserted(id: Int64, pruned: Int)
     /// The same ring, kind and data bytes were already stored; the first row was kept.
     case duplicate(existingID: Int64)
+    /// Nothing was stored: the data is a strict prefix of a longer stored transfer (`existingID`)
+    /// for the same ring and kind, so it holds no record that one lacks.
+    case supersededByExisting(existingID: Int64)
 }
 
 /// One time the app set the ring's clock. The ring stamps records with whatever clock was last
