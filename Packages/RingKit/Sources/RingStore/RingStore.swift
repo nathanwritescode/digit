@@ -93,6 +93,15 @@ public final class RingStore: Sendable {
 
     /// Stores `transfer` for `ringID`. Identical bytes (same ring, kind and data) that are already
     /// stored are a no-op that keeps the first row; the header, fetch time and zone do not count.
+    /// The insert statement, kept as a constant so a test can run exactly this SQL. `ON CONFLICT`
+    /// names the hash on purpose: `INSERT OR IGNORE` would also swallow NOT NULL and CHECK failures.
+    static let insertTransferSQL = """
+        INSERT INTO history_transfer
+        (ring_id, kind, header, data, fetched_at, time_zone_identifier, content_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(content_hash) DO NOTHING
+        """
+
     /// Only a clash on the content hash counts as a duplicate; any other constraint failure throws.
     @discardableResult
     public func insert(_ transfer: HistoryTransfer, ringID: UUID) throws -> InsertOutcome {
@@ -100,12 +109,7 @@ public final class RingStore: Sendable {
         return try writer.write { db in
             try Self.requireRing(db, ringID)
             try db.execute(
-                sql: """
-                    INSERT INTO history_transfer
-                    (ring_id, kind, header, data, fetched_at, time_zone_identifier, content_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(content_hash) DO NOTHING
-                    """,
+                sql: Self.insertTransferSQL,
                 arguments: [
                     ringID.uuidString, KindCode.code(for: transfer.kind), Data(transfer.header), Data(transfer.data),
                     HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),

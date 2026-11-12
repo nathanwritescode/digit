@@ -69,7 +69,13 @@ public struct HistoryTransfer: Equatable, Sendable, Codable {
     /// (not just `floor(t * 1000)`, which floating point can leave one off, and `Date` itself
     /// stores an offset from 2001), so converting back and forth always returns the same integer.
     public static func millisecondsSince1970(_ date: Date) -> Int64 {
-        var ms = Int64((date.timeIntervalSince1970 * 1000).rounded(.down))
+        let scaled = (date.timeIntervalSince1970 * 1000).rounded(.down)
+        // Dates no real clock produces (non-finite, or hundreds of thousands of years away) are
+        // clamped instead of trapping in the integer conversion below.
+        let limit = 8.64e15  // 100 million days either side of 1970, in milliseconds
+        guard scaled.isFinite else { return scaled.isNaN ? 0 : (scaled < 0 ? Int64(-limit) : Int64(limit)) }
+        guard abs(scaled) < limit else { return scaled < 0 ? Int64(-limit) : Int64(limit) }
+        var ms = Int64(scaled)
         while self.date(millisecondsSince1970: ms + 1) <= date { ms += 1 }
         while self.date(millisecondsSince1970: ms) > date { ms -= 1 }
         return ms

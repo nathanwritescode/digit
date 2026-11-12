@@ -123,6 +123,30 @@ struct RingStoreTests {
         }
     }
 
+    @Test func theStoresOwnInsertStatementRejectsOtherConstraintFailures() throws {
+        try onEachStore { store in
+            let ring = try store.registerRing(protocolFamily: "ycbt")
+            // A NULL header breaks NOT NULL. `INSERT OR IGNORE` would skip it silently; the store's
+            // statement must throw. This runs the store's own SQL, so widening its conflict clause fails here.
+            #expect(throws: (any Error).self) {
+                try store.writer.write { db in
+                    try db.execute(
+                        sql: RingStore.insertTransferSQL,
+                        arguments: [ring.id.uuidString, "heartRate", nil, Data([1]), 0, "UTC", Data([0x01])])
+                }
+            }
+            #expect(try store.transfers(ringID: ring.id).transfers.isEmpty)
+        }
+    }
+
+    @Test func contentHashIsPinned() throws {
+        // Computed independently: SHA-256 of the 16 raw UUID bytes, 0x09, "heartRate", then 01 02 03.
+        // If this changes, duplicate detection against existing databases silently breaks.
+        let ring = try #require(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+        let hash = RingStore.contentHash(ringID: ring, kind: .heartRate, data: [1, 2, 3])
+        #expect(Hex.encode(hash) == "979e2662281a7573c5b0b1b708f2f3f8aad7fdd4fcdeeaa0710a4dc56cb0941a")
+    }
+
     @Test func listsByKindAndRangeInFetchOrder() throws {
         try onEachStore { store in
             let ring = try store.registerRing(protocolFamily: "ycbt")

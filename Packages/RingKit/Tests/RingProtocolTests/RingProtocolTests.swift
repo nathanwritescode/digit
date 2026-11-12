@@ -359,3 +359,12 @@ private let sleepOneSecondGaps = "affa 2c00 00000000 0a070000 ffff 2c01 8403 580
     #expect(records.map(\.bpm) == [72, 74])
     #expect(records[1].time.timeIntervalSince(records[0].time) == 3600)
 }
+
+@Test func millisecondConversionClampsUnrepresentableDates() {
+    #expect(HistoryTransfer.millisecondsSince1970(Date(timeIntervalSince1970: .infinity)) == 8_640_000_000_000_000)
+    #expect(HistoryTransfer.millisecondsSince1970(Date(timeIntervalSince1970: -.infinity)) == -8_640_000_000_000_000)
+    #expect(HistoryTransfer.millisecondsSince1970(Date(timeIntervalSince1970: .nan)) == 0)
+    #expect(HistoryTransfer.millisecondsSince1970(Date(timeIntervalSince1970: 1e300)) == 8_640_000_000_000_000)
+    #expect(HistoryTransfer.millisecondsSince1970(.distantFuture) > 0)
+}
+
