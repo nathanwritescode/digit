@@ -23,8 +23,10 @@ Priorities for v1, in order: sleep tracking, then steps, then everything else th
 Packages/RingKit/
   Sources/RingProtocol/    pure Swift: frames, CRC, commands, record decoders (no Bluetooth)
   Sources/RingTransport/   CoreBluetooth connection and request/response sessions
+  Sources/RingStore/       GRDB-backed on-device store: rings, raw history transfers, clock-set log (no Bluetooth; the app does not link it yet)
   Sources/ringprobe/       macOS command-line tool for probing a ring
   Tests/RingProtocolTests/ Swift Testing tests
+  Tests/RingStoreTests/    store tests on in-memory and temporary-file databases
   Tests/RingTransportTests/ session tests against a scripted fake RingLink (no Bluetooth)
 App/
   Digit.xcodeproj          iOS app project (SwiftUI, iOS 26, Swift 6, iPhone only); depends on RingKit
@@ -33,7 +35,7 @@ App/
 captures/                  raw ring captures (git-ignored, private)
 ```
 
-Planned but not yet built: a ring abstraction with per-device capabilities, the on-device store (GRDB) with export, and the Apple Health writer (write-only for now, behind an interface that can add reading later). The SwiftUI app exists as an empty skeleton with a placeholder screen.
+Planned but not yet built: a ring abstraction with per-device capabilities, export from the on-device store (the store exists with raw tables only; typed tables are planned), and the Apple Health writer (write-only for now, behind an interface that can add reading later). The SwiftUI app exists as an empty skeleton with a placeholder screen.
 
 ## Commands
 
@@ -171,6 +173,10 @@ The planner starts at most one hardware-check implementer at a time, and never w
 ## Decisions
 
 - **Database:** SQLite via GRDB (MIT). Raw ring records are the source of truth; anything derived can be rebuilt from them. Do not introduce SwiftData or Core Data.
+- **Store (`RingStore`):** raw transfers are de-duplicated by a SHA-256 of ring, kind and data (header, fetch time and zone excluded; the first row wins). Kinds are stored under frozen codes that never change, not `HistoryKind.name`. The caller supplies the database location, which must be a dedicated directory (the app will use an App Group container). File protection is `completeUntilFirstUserAuthentication`. It is a WAL-mode `DatabasePool`. Known follow-ups:
+  - The public API is synchronous; it needs async variants before any UI uses it (#10, #11).
+  - App Group sharing configuration (suspension notifications, a read-only opener for a widget) is needed before the app links the store (#13).
+  - Transfers are whole buffers, so near-duplicate copies accumulate until superseded transfers are pruned (to be tracked in its own issue).
 - **Minimum iOS version:** iOS 26.
 - **Concurrency defaults:** the app target defaults to main-actor isolation (`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`); the RingKit package does not.
 - **Bundle identifier:** `com.nathantalley.digit`.

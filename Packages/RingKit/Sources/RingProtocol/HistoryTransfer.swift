@@ -59,8 +59,30 @@ public struct HistoryTransfer: Equatable, Sendable, Codable {
     }
 
     /// Whole milliseconds, which `fetchedAt` is truncated to so that the encoded text decodes to an equal value.
+    /// Idempotent: it goes through the same integer conversion the store uses.
     public static func truncatedToMilliseconds(_ date: Date) -> Date {
-        Date(timeIntervalSince1970: (date.timeIntervalSince1970 * 1000).rounded(.down) / 1000)
+        self.date(millisecondsSince1970: millisecondsSince1970(date))
+    }
+
+    /// The date's whole milliseconds since 1970, rounding toward negative infinity: the largest
+    /// `ms` with `date(millisecondsSince1970: ms) <= date`. Defined by comparing real `Date`s
+    /// (not just `floor(t * 1000)`, which floating point can leave one off, and `Date` itself
+    /// stores an offset from 2001), so converting back and forth always returns the same integer.
+    public static func millisecondsSince1970(_ date: Date) -> Int64 {
+        let scaled = (date.timeIntervalSince1970 * 1000).rounded(.down)
+        // Dates no real clock produces (non-finite, or hundreds of thousands of years away) are
+        // clamped instead of trapping in the integer conversion below.
+        let limit = 8.64e15  // 100 million days either side of 1970, in milliseconds
+        guard scaled.isFinite else { return scaled.isNaN ? 0 : (scaled < 0 ? Int64(-limit) : Int64(limit)) }
+        guard abs(scaled) < limit else { return scaled < 0 ? Int64(-limit) : Int64(limit) }
+        var ms = Int64(scaled)
+        while self.date(millisecondsSince1970: ms + 1) <= date { ms += 1 }
+        while self.date(millisecondsSince1970: ms) > date { ms -= 1 }
+        return ms
+    }
+
+    public static func date(millisecondsSince1970 ms: Int64) -> Date {
+        Date(timeIntervalSince1970: Double(ms) / 1000)
     }
 
     // A fresh formatter each time: ISO8601DateFormatter is not Sendable.
