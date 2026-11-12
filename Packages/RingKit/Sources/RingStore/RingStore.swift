@@ -10,25 +10,41 @@ import RingProtocol
 /// No health data is ever logged from here. Errors thrown by SQLite itself surface as GRDB's
 /// `DatabaseError`; the store's own failures are `RingStoreError`.
 public final class RingStore: Sendable {
-    private let writer: any DatabaseWriter
+    // Internal, not private, so tests can inspect the schema and issue raw SQL.
+    let writer: any DatabaseWriter
 
-    /// Opens (creating if needed) the database at `url` and migrates it.
+    /// Opens (creating if needed) the database at `url` and migrates it. The database runs in WAL
+    /// mode, so SQLite also creates and recreates `-wal` and `-shm` files beside it.
+    ///
+    /// `url` must be inside a directory dedicated to this database (for the app, a subdirectory
+    /// of the App Group container). On iOS the directory itself is given file protection
+    /// `completeUntilFirstUserAuthentication`, because SQLite recreates the `-wal` and `-shm`
+    /// files and only a protected directory covers the new ones.
     public init(url: URL) throws {
         try Self.prepareFile(at: url)
-        var configuration = Configuration()
-        configuration.foreignKeysEnabled = true
-        let pool = try DatabasePool(path: url.path, configuration: configuration)
+        let pool = try DatabasePool(path: url.path, configuration: Self.configuration())
         try Self.migrator.migrate(pool)
-        // After migrating, so the -wal and -shm files exist too.
+        // After migrating, so the -wal and -shm files exist and get the same treatment.
         try Self.protectFiles(at: url)
         writer = pool
     }
 
-    /// An empty in-memory database, for tests.
+    /// An empty in-memory database, for tests and previews.
     public init() throws {
-        let queue = try DatabaseQueue()
+        let queue = try DatabaseQueue(configuration: Self.configuration())
         try Self.migrator.migrate(queue)
         writer = queue
+    }
+
+    private static func configuration() -> Configuration {
+        var configuration = Configuration()
+        // Foreign keys are on by default in GRDB; the schema relies on them, so not set again.
+        // Keep SQLite's temporary files (sorts, indexes) in memory so health data is never
+        // written outside the database's own directory.
+        configuration.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA temp_store = MEMORY")
+        }
+        return configuration
     }
 
     // MARK: Rings
@@ -38,13 +54,14 @@ public final class RingStore: Sendable {
     public func registerRing(
         protocolFamily: String, model: String? = nil, firmware: String? = nil, now: Date = Date()
     ) throws -> StoredRing {
+        let firstSeen = HistoryTransfer.millisecondsSince1970(now)
         let ring = StoredRing(
             id: UUID(), protocolFamily: protocolFamily, model: model, firmware: firmware,
-            firstSeenAt: HistoryTransfer.truncatedToMilliseconds(now))
+            firstSeenAt: HistoryTransfer.date(millisecondsSince1970: firstSeen))
         try writer.write { db in
             try db.execute(
                 sql: "INSERT INTO ring (id, protocol_family, model, firmware, first_seen_at) VALUES (?, ?, ?, ?, ?)",
-                arguments: [ring.id.uuidString, ring.protocolFamily, ring.model, ring.firmware, Self.millis(ring.firstSeenAt)])
+                arguments: [ring.id.uuidString, ring.protocolFamily, ring.model, ring.firmware, firstSeen])
         }
         return ring
     }
@@ -76,6 +93,7 @@ public final class RingStore: Sendable {
 
     /// Stores `transfer` for `ringID`. Identical bytes (same ring, kind and data) that are already
     /// stored are a no-op that keeps the first row; the header, fetch time and zone do not count.
+    /// Only a clash on the content hash counts as a duplicate; any other constraint failure throws.
     @discardableResult
     public func insert(_ transfer: HistoryTransfer, ringID: UUID) throws -> InsertOutcome {
         let hash = Self.contentHash(ringID: ringID, kind: transfer.kind, data: transfer.data)
@@ -83,13 +101,14 @@ public final class RingStore: Sendable {
             try Self.requireRing(db, ringID)
             try db.execute(
                 sql: """
-                    INSERT OR IGNORE INTO history_transfer
+                    INSERT INTO history_transfer
                     (ring_id, kind, header, data, fetched_at, time_zone_identifier, content_hash)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(content_hash) DO NOTHING
                     """,
                 arguments: [
-                    ringID.uuidString, transfer.kind.name, Data(transfer.header), Data(transfer.data),
-                    Self.millis(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),
+                    ringID.uuidString, KindCode.code(for: transfer.kind), Data(transfer.header), Data(transfer.data),
+                    HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),
                 ])
             if db.changesCount > 0 { return .inserted(id: db.lastInsertedRowID) }
             let existing = try Int64.fetchOne(
@@ -99,25 +118,48 @@ public final class RingStore: Sendable {
         }
     }
 
-    /// Transfers for a ring, optionally of one kind and within a fetched-at range (inclusive),
-    /// oldest first.
+    /// One transfer by row id. Throws `corruptRow` if the row's kind code is not one this version
+    /// knows (for example written by a newer version).
+    public func transfer(id: Int64) throws -> StoredTransfer? {
+        try writer.read { db in
+            guard let row = try Row.fetchOne(db, sql: "SELECT * FROM history_transfer WHERE id = ?", arguments: [id])
+            else { return nil }
+            guard let stored = try Self.storedTransfer(row) else { throw RingStoreError.corruptRow("unknown history kind") }
+            return stored
+        }
+    }
+
+    /// Transfers for a ring, optionally of one kind and within a fetched-at range, oldest first
+    /// (ties by row id). The range is inclusive at both ends and compared in whole milliseconds,
+    /// each bound rounded down the same way stored times are.
+    ///
+    /// A row whose kind code this version does not know is skipped and counted in
+    /// `TransferListing.skippedUnknownKind` instead of failing the whole listing.
     public func transfers(
         ringID: UUID, kind: HistoryKind? = nil, fetchedWithin range: ClosedRange<Date>? = nil
-    ) throws -> [StoredTransfer] {
+    ) throws -> TransferListing {
         var clauses = ["ring_id = ?"]
         var arguments: [any DatabaseValueConvertible] = [ringID.uuidString]
         if let kind {
             clauses.append("kind = ?")
-            arguments.append(kind.name)
+            arguments.append(KindCode.code(for: kind))
         }
         if let range {
             clauses.append("fetched_at >= ? AND fetched_at <= ?")
-            arguments.append(Self.millis(range.lowerBound))
-            arguments.append(Self.millis(range.upperBound))
+            arguments.append(HistoryTransfer.millisecondsSince1970(range.lowerBound))
+            arguments.append(HistoryTransfer.millisecondsSince1970(range.upperBound))
         }
         let sql = "SELECT * FROM history_transfer WHERE \(clauses.joined(separator: " AND ")) ORDER BY fetched_at, id"
         return try writer.read { db in
-            try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments)).map(Self.storedTransfer)
+            var listing = TransferListing(transfers: [], skippedUnknownKind: 0)
+            for row in try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments)) {
+                if let stored = try Self.storedTransfer(row) {
+                    listing.transfers.append(stored)
+                } else {
+                    listing.skippedUnknownKind += 1
+                }
+            }
+            return listing
         }
     }
 
@@ -128,7 +170,10 @@ public final class RingStore: Sendable {
             try Self.requireRing(db, event.ringID)
             try db.execute(
                 sql: "INSERT INTO clock_set (ring_id, instant, time_zone_identifier, utc_offset_seconds) VALUES (?, ?, ?, ?)",
-                arguments: [event.ringID.uuidString, Self.millis(event.instant), event.timeZoneIdentifier, event.utcOffsetSeconds])
+                arguments: [
+                    event.ringID.uuidString, HistoryTransfer.millisecondsSince1970(event.instant),
+                    event.timeZoneIdentifier, event.utcOffsetSeconds,
+                ])
         }
     }
 
@@ -139,28 +184,51 @@ public final class RingStore: Sendable {
                 db, sql: "SELECT * FROM clock_set WHERE ring_id = ? ORDER BY instant, id", arguments: [ringID.uuidString]
             ).map { row in
                 ClockSetEvent(
-                    ringID: try Self.uuid(row["ring_id"]), instant: Self.date(row["instant"]),
-                    timeZoneIdentifier: row["time_zone_identifier"], utcOffsetSeconds: row["utc_offset_seconds"])
+                    ringID: try Self.uuid(try Self.column(row, "ring_id")),
+                    instant: HistoryTransfer.date(millisecondsSince1970: try Self.column(row, "instant")),
+                    timeZoneIdentifier: try Self.column(row, "time_zone_identifier"),
+                    utcOffsetSeconds: try Self.column(row, "utc_offset_seconds"))
             }
         }
     }
 
-    // MARK: Hash
+    // MARK: Kind codes and hash
 
-    /// SHA-256 over ring id (16 bytes), kind name (one length byte, then UTF-8) and data. Not the
+    /// The strings stored in `history_transfer.kind` and fed to the content hash. They are
+    /// deliberately not `HistoryKind.name`: that may be renamed, and changing these would orphan
+    /// existing rows and break duplicate detection. NEVER CHANGE an existing code. The switch has
+    /// no default, so adding a `HistoryKind` case fails to compile until it gets a new code here.
+    enum KindCode {
+        static func code(for kind: HistoryKind) -> String {
+            switch kind {
+            case .activity: "activity"
+            case .sleep: "sleep"
+            case .heartRate: "heartRate"
+            case .combined: "combined"
+            }
+        }
+
+        static func kind(forCode code: String) -> HistoryKind? {
+            HistoryKind.allCases.first { self.code(for: $0) == code }
+        }
+    }
+
+    /// SHA-256 over ring id (16 bytes), kind code (one length byte, then UTF-8) and data. Not the
     /// header (its stability between identical fetches is unverified), fetch time or zone.
     static func contentHash(ringID: UUID, kind: HistoryKind, data: [UInt8]) -> [UInt8] {
         var hasher = SHA256()
         withUnsafeBytes(of: ringID.uuid) { hasher.update(bufferPointer: $0) }
-        let name = Array(kind.name.utf8)
-        hasher.update(data: [UInt8(name.count)])
-        hasher.update(data: name)
+        let code = Array(KindCode.code(for: kind).utf8)
+        hasher.update(data: [UInt8(code.count)])
+        hasher.update(data: code)
         hasher.update(data: data)
         return Array(hasher.finalize())
     }
 
     // MARK: Schema
 
+    /// This database is the owner's source-of-truth history. `eraseDatabaseOnSchemaChange` must
+    /// never be enabled here, not even in debug builds: it would silently delete everything.
     static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
         migrator.registerMigration("v1") { db in
@@ -201,41 +269,49 @@ public final class RingStore: Sendable {
 
     // MARK: File protection
 
-    /// The file holds health data. iOS: `completeUntilFirstUserAuthentication`, so background sync
-    /// can write while the phone is locked after the first unlock (the stricter `complete` would
-    /// make that fail) while the file stays encrypted before first unlock. macOS has no such
-    /// class, so the file is created owner-only (0600); SQLite gives the -wal and -shm files the
-    /// same mode. Created up front so it is never briefly world-readable under the umask.
+    /// Creates the file owner-only if missing and forces mode 0600 on every open, so a file that
+    /// was ever looser is tightened. `O_CREAT` without `O_EXCL` covers both cases in one call and
+    /// is created with 0600 from the start, so it is never briefly readable by others.
     private static func prepareFile(at url: URL) throws {
-        if !FileManager.default.fileExists(atPath: url.path) {
-            let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
-            if fd >= 0 { close(fd) } else if errno != EEXIST {
-                throw CocoaError(.fileWriteUnknown)
-            }
-        }
+        let fd = open(url.path, O_WRONLY | O_CREAT, 0o600)
+        guard fd >= 0 else { throw RingStoreError.fileAccess(path: url.path, errno: errno) }
+        defer { close(fd) }
+        guard fchmod(fd, 0o600) == 0 else { throw RingStoreError.fileAccess(path: url.path, errno: errno) }
     }
 
+    /// Owner-only on the database's `-wal` and `-shm` files too (SQLite normally gives them the
+    /// main file's mode; this makes it explicit for files that already exist). On iOS, also
+    /// `completeUntilFirstUserAuthentication` on the files and their directory: background sync
+    /// can then write while the phone is locked after the first unlock (the stricter `complete`
+    /// would make that fail), and the data stays encrypted before first unlock. The directory
+    /// setting is what covers `-wal`/`-shm` files SQLite creates later. Not verified on a device;
+    /// the simulator does not enforce data protection.
     private static func protectFiles(at url: URL) throws {
-        #if os(iOS)
-        // Not verified on a device: the iOS simulator does not enforce data protection.
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["-wal", "-shm"] {
             let path = url.path + suffix
-            if FileManager.default.fileExists(atPath: path) {
-                try FileManager.default.setAttributes(
-                    [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: path)
+            if chmod(path, 0o600) != 0, errno != ENOENT {
+                throw RingStoreError.fileAccess(path: path, errno: errno)
             }
+        }
+        #if os(iOS)
+        let protection: [FileAttributeKey: Any] = [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+        var paths = [url.deletingLastPathComponent().path]
+        for suffix in ["", "-wal", "-shm"] { paths.append(url.path + suffix) }
+        for path in paths where FileManager.default.fileExists(atPath: path) {
+            try FileManager.default.setAttributes(protection, ofItemAtPath: path)
         }
         #endif
     }
 
     // MARK: Row conversion
 
-    private static func millis(_ date: Date) -> Int64 {
-        Int64((HistoryTransfer.truncatedToMilliseconds(date).timeIntervalSince1970 * 1000).rounded())
-    }
-
-    private static func date(_ millis: Int64) -> Date {
-        Date(timeIntervalSince1970: Double(millis) / 1000)
+    /// Decodes a column, turning any failure into `corruptRow` (GRDB's subscript would trap).
+    private static func column<T: DatabaseValueConvertible>(_ row: Row, _ name: String) throws -> T {
+        do {
+            return try row.decode(T.self, forColumn: name)
+        } catch {
+            throw RingStoreError.corruptRow(name)
+        }
     }
 
     private static func uuid(_ text: String) throws -> UUID {
@@ -250,26 +326,21 @@ public final class RingStore: Sendable {
 
     private static func ring(_ row: Row) throws -> StoredRing {
         StoredRing(
-            id: try uuid(row["id"]), protocolFamily: row["protocol_family"], model: row["model"],
-            firmware: row["firmware"], firstSeenAt: date(row["first_seen_at"]))
+            id: try uuid(try column(row, "id")), protocolFamily: try column(row, "protocol_family"),
+            model: try column(row, "model"), firmware: try column(row, "firmware"),
+            firstSeenAt: HistoryTransfer.date(millisecondsSince1970: try column(row, "first_seen_at")))
     }
 
-    private static func storedTransfer(_ row: Row) throws -> StoredTransfer {
-        let name: String = row["kind"]
-        guard let kind = HistoryKind.allCases.first(where: { $0.name == name }) else {
-            throw RingStoreError.corruptRow("unknown history kind")
-        }
-        let header: Data = row["header"]
-        let data: Data = row["data"]
+    /// Nil when the row's kind code is not known to this version.
+    private static func storedTransfer(_ row: Row) throws -> StoredTransfer? {
+        guard let kind = KindCode.kind(forCode: try column(row, "kind")) else { return nil }
+        let header: Data = try column(row, "header")
+        let data: Data = try column(row, "data")
         return StoredTransfer(
-            id: row["id"], ringID: try uuid(row["ring_id"]),
+            id: try column(row, "id"), ringID: try uuid(try column(row, "ring_id")),
             transfer: HistoryTransfer(
                 kind: kind, header: [UInt8](header), data: [UInt8](data),
-                fetchedAt: date(row["fetched_at"]), timeZoneIdentifier: row["time_zone_identifier"]))
-    }
-
-    /// Column names of the `ring` table, so a test can assert no identifier columns creep in.
-    func ringColumnNames() throws -> [String] {
-        try writer.read { db in try db.columns(in: "ring").map(\.name) }
+                fetchedAt: HistoryTransfer.date(millisecondsSince1970: try column(row, "fetched_at")),
+                timeZoneIdentifier: try column(row, "time_zone_identifier")))
     }
 }

@@ -173,6 +173,10 @@ The planner starts at most one hardware-check implementer at a time, and never w
 ## Decisions
 
 - **Database:** SQLite via GRDB (MIT). Raw ring records are the source of truth; anything derived can be rebuilt from them. Do not introduce SwiftData or Core Data.
+- **Store (`RingStore`):** raw transfers are de-duplicated by a SHA-256 of ring, kind and data (header, fetch time and zone excluded; the first row wins). Kinds are stored under frozen codes that never change, not `HistoryKind.name`. The caller supplies the database location, which must be a dedicated directory (the app will use an App Group container). File protection is `completeUntilFirstUserAuthentication`. It is a WAL-mode `DatabasePool`. Known follow-ups:
+  - The public API is synchronous; it needs async variants before any UI uses it (#10, #11).
+  - App Group sharing configuration (suspension notifications, a read-only opener for a widget) is needed before the app links the store (#13).
+  - Transfers are whole buffers, so near-duplicate copies accumulate until superseded transfers are pruned (to be tracked in its own issue).
 - **Minimum iOS version:** iOS 26.
 - **Concurrency defaults:** the app target defaults to main-actor isolation (`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`); the RingKit package does not.
 - **Bundle identifier:** `com.nathantalley.digit`.

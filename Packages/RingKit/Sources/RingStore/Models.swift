@@ -20,6 +20,13 @@ public struct StoredTransfer: Equatable, Sendable {
     public var transfer: HistoryTransfer
 }
 
+/// The result of listing transfers.
+public struct TransferListing: Equatable, Sendable {
+    public var transfers: [StoredTransfer]
+    /// Rows left out because their kind code is unknown to this version of the app.
+    public var skippedUnknownKind: Int
+}
+
 public enum InsertOutcome: Equatable, Sendable {
     /// A new row was written.
     case inserted(id: Int64)
@@ -48,6 +55,8 @@ public struct ClockSetEvent: Equatable, Sendable {
 
 public enum RingStoreError: Error, Equatable, Sendable {
     case unknownRing(UUID)
+    /// The database file (or its -wal/-shm companion) could not be created or its mode set.
+    case fileAccess(path: String, errno: Int32)
     /// A stored value could not be read back (for example an unknown history kind name).
     case corruptRow(String)
 }

@@ -36,7 +36,10 @@ let package = Package(
             dependencies: ["RingProtocol", "RingTransport"]
         ),
         .testTarget(name: "RingProtocolTests", dependencies: ["RingProtocol"]),
-        .testTarget(name: "RingStoreTests", dependencies: ["RingProtocol", "RingStore"]),
+        .testTarget(
+            name: "RingStoreTests",
+            dependencies: ["RingProtocol", "RingStore", .product(name: "GRDB", package: "GRDB.swift")]
+        ),
         .testTarget(name: "RingTransportTests", dependencies: ["RingProtocol", "RingTransport"]),
     ]
 )

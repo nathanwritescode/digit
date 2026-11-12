@@ -187,6 +187,23 @@ private let sampleTransfer = HistoryTransfer(
     #expect(object["fetchedAt"] as? String == "2027-01-15T08:00:00.123Z")
 }
 
+@Test func millisecondTruncationIsIdempotentAndFloors() {
+    var rng = SystemRandomNumberGenerator()
+    for _ in 0..<20_000 {
+        // About -2000 to +2100, covering pre-1970 values.
+        let date = Date(timeIntervalSince1970: Double.random(in: -2_000_000_000_000_000_000...4_000_000_000_000_000_000, using: &rng) / 1e9)
+        let ms = HistoryTransfer.millisecondsSince1970(date)
+        let once = HistoryTransfer.truncatedToMilliseconds(date)
+        #expect(HistoryTransfer.truncatedToMilliseconds(once) == once)
+        #expect(HistoryTransfer.millisecondsSince1970(once) == ms)
+        #expect(once <= date)
+        #expect(date.timeIntervalSince(once) < 0.0011)
+    }
+    // Exact examples, including a negative one that must round toward negative infinity.
+    #expect(HistoryTransfer.millisecondsSince1970(Date(timeIntervalSince1970: 1.0009)) == 1000)
+    #expect(HistoryTransfer.millisecondsSince1970(Date(timeIntervalSince1970: -0.0005)) == -1)
+}
+
 @Test func historyKindsAreEncodedByNameAndUnknownNamesRejected() throws {
     for kind in HistoryKind.allCases {
         var t = sampleTransfer
