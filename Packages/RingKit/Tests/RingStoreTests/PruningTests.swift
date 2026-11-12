@@ -116,11 +116,100 @@ struct PruningTests {
             }
             #expect(throws: DatabaseError.self) { try store.insert(transfer(data: [1, 2, 3]), ringID: ring.id) }
             #expect(try rows(store, ring.id) == [[1, 2]])
+            // The observation copy ran before the failing delete; it must have rolled back too.
+            #expect(try store.observations(ringID: ring.id).isEmpty)
             try store.writer.write { db in try db.execute(sql: "DROP TRIGGER block_delete") }
             guard case .inserted(_, 1) = try store.insert(transfer(data: [1, 2, 3]), ringID: ring.id)
             else { Issue.record("expected insert pruning one"); return }
             #expect(try rows(store, ring.id) == [[1, 2, 3]])
+            #expect(try store.observations(ringID: ring.id).count == 1)
         }
+    }
+
+    @Test func prunedTransfersLeaveObservations() throws {
+        try onEachStore { store in
+            let ring = try store.registerRing(protocolFamily: "ycbt")
+            try store.insert(transfer(data: [1], header: [0xA], at: t0, zone: "Europe/London"), ringID: ring.id)
+            try store.insert(
+                transfer(data: [1, 2], header: [0xB], at: t0.addingTimeInterval(10), zone: "Asia/Tokyo"), ringID: ring.id)
+            try store.insert(
+                transfer(data: [1, 2, 3], header: [0xC], at: t0.addingTimeInterval(20), zone: "UTC"), ringID: ring.id)
+            #expect(try rows(store, ring.id) == [[1, 2, 3]])
+            let obs = try store.observations(ringID: ring.id)
+            #expect(obs.map(\.dataLength) == [1, 2])
+            #expect(obs.map(\.header) == [[0xA], [0xB]])
+            #expect(obs.map(\.fetchedAt) == [t0, t0.addingTimeInterval(10)])
+            #expect(obs.map(\.timeZoneIdentifier) == ["Europe/London", "Asia/Tokyo"])
+            #expect(obs.allSatisfy { $0.ringID == ring.id && $0.kind == .heartRate })
+        }
+    }
+
+    @Test func supersededByExistingRecordsAnObservationAndStoresNothing() throws {
+        try onEachStore { store in
+            let ring = try store.registerRing(protocolFamily: "ycbt")
+            try store.insert(transfer(data: [1, 2, 3, 4]), ringID: ring.id)
+            let later = t0.addingTimeInterval(99)
+            try store.insert(transfer(data: [1, 2], header: [5], at: later, zone: "Asia/Tokyo"), ringID: ring.id)
+            #expect(try rows(store, ring.id) == [[1, 2, 3, 4]])
+            let obs = try store.observations(ringID: ring.id)
+            #expect(obs.count == 1)
+            #expect(obs.first?.dataLength == 2)
+            #expect(obs.first?.header == [5])
+            #expect(obs.first?.fetchedAt == later)
+            #expect(obs.first?.timeZoneIdentifier == "Asia/Tokyo")
+            // A duplicate records nothing.
+            try store.insert(transfer(data: [1, 2, 3, 4]), ringID: ring.id)
+            #expect(try store.observations(ringID: ring.id).count == 1)
+        }
+    }
+
+    @Test func emptyAfterNonEmptyRecordsAZeroLengthObservation() throws {
+        try onEachStore { store in
+            let ring = try store.registerRing(protocolFamily: "ycbt")
+            try store.insert(transfer(data: [1]), ringID: ring.id)
+            try store.insert(transfer(data: [], at: t0.addingTimeInterval(5)), ringID: ring.id)
+            #expect(try store.observations(ringID: ring.id).map(\.dataLength) == [0])
+            #expect(try rows(store, ring.id) == [[1]])
+        }
+    }
+
+    @Test func observationsDoNotCrossRingsOrKinds() throws {
+        try onEachStore { store in
+            let a = try store.registerRing(protocolFamily: "ycbt")
+            let b = try store.registerRing(protocolFamily: "ycbt")
+            try store.insert(transfer(.heartRate, data: [1]), ringID: a.id)
+            try store.insert(transfer(.heartRate, data: [1, 2]), ringID: a.id)  // prunes one on a/heartRate
+            try store.insert(transfer(.sleep, data: [1]), ringID: a.id)
+            try store.insert(transfer(.heartRate, data: [1]), ringID: b.id)
+            #expect(try store.observations(ringID: a.id).count == 1)
+            #expect(try store.observations(ringID: a.id, kind: .heartRate).count == 1)
+            #expect(try store.observations(ringID: a.id, kind: .sleep).isEmpty)
+            #expect(try store.observations(ringID: b.id).isEmpty)
+        }
+    }
+
+    @Test func v1DatabaseMigratesToV2WithRowsIntact() throws {
+        let queue = try DatabaseQueue()
+        let ringID = UUID().uuidString
+        try RingStore.migrator.migrate(queue, upTo: "v1")
+        try queue.write { db in
+            try db.execute(
+                sql: "INSERT INTO ring (id, protocol_family, first_seen_at) VALUES (?, 'ycbt', 0)", arguments: [ringID])
+            try db.execute(
+                sql: RingStore.insertTransferSQL,
+                arguments: [ringID, "heartRate", Data([1]), Data([1, 2]), 5, "UTC", Data([9])])
+        }
+        try RingStore.migrator.migrate(queue)
+        let (count, data, observed) = try queue.read { db in
+            (
+                try Int.fetchOne(db, sql: "SELECT count(*) FROM history_transfer"),
+                try Data.fetchOne(db, sql: "SELECT data FROM history_transfer"),
+                try Int.fetchOne(db, sql: "SELECT count(*) FROM transfer_observation")
+            )
+        }
+        #expect(count == 1)
+        #expect(data == Data([1, 2]))
+        #expect(observed == 0)
     }
 
     @Test func concurrentGrowingInsertsEndWithTheLongest() async throws {
@@ -143,8 +232,9 @@ struct PruningTests {
 
     @Test func everyInsertedSequenceIsAPrefixOfSomeStoredTransfer() throws {
         func isPrefix(_ a: [UInt8], of b: [UInt8]) -> Bool { a.count <= b.count && Array(b.prefix(a.count)) == a }
-        var rng = SystemRandomNumberGenerator()
+        let seed: UInt64 = 0x5EED_0030
         try onEachStore { store in
+            var rng = SplitMix64(seed: seed)  // same sequence for each store kind
             let rings = [try store.registerRing(protocolFamily: "ycbt").id, try store.registerRing(protocolFamily: "ycbt").id]
             let kinds: [HistoryKind] = [.heartRate, .sleep]
             var inserted: [String: [[UInt8]]] = [:]
@@ -160,11 +250,11 @@ struct PruningTests {
                 for kind in kinds {
                     let stored = try rows(store, ring, kind)
                     for data in inserted["\(ring)\(kind)"] ?? [] {
-                        #expect(stored.contains { isPrefix(data, of: $0) })
+                        #expect(stored.contains { isPrefix(data, of: $0) }, "seed \(seed)")
                     }
                     // No stored row is redundant: none is a prefix of another.
                     for (i, a) in stored.enumerated() {
-                        for (j, b) in stored.enumerated() where i != j { #expect(!isPrefix(a, of: b)) }
+                        for (j, b) in stored.enumerated() where i != j { #expect(!isPrefix(a, of: b), "seed \(seed)") }
                     }
                 }
             }

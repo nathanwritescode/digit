@@ -20,6 +20,20 @@ public struct StoredTransfer: Equatable, Sendable {
     public var transfer: HistoryTransfer
 }
 
+/// A record that a transfer was fetched, kept after pruning removed it or skipped it as
+/// superseded: when, how long its data was, and under which zone. The data itself is in the
+/// superseding transfer.
+public struct TransferObservation: Equatable, Sendable {
+    public var id: Int64
+    public var ringID: UUID
+    public var kind: HistoryKind
+    public var dataLength: Int
+    public var header: [UInt8]
+    /// Whole milliseconds.
+    public var fetchedAt: Date
+    public var timeZoneIdentifier: String
+}
+
 /// The result of listing transfers.
 public struct TransferListing: Equatable, Sendable {
     public var transfers: [StoredTransfer]
