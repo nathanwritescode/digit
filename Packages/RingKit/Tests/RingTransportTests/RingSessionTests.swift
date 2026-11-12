@@ -29,7 +29,22 @@ private final class FakeLink: RingLink, @unchecked Sendable {
 
     func record(_ event: String) { lock.withLock { log.append(event) } }
 
+    // Scripted faults. `hangNextSend` makes the next write wait (cancellably) as if the ring never
+    // confirmed it; `trickle` is returned by `nextFrame` whenever nothing else is queued, so frames
+    // keep arriving without end.
+    private var hangSends = 0
+    private var trickleFrame: Frame?
+    func hangNextSend() { lock.withLock { hangSends += 1 } }
+    func setTrickle(_ frame: Frame?) { lock.withLock { trickleFrame = frame } }
+
     func send(_ frame: Frame) async throws {
+        let hang = lock.withLock { () -> Bool in
+            guard hangSends > 0 else { return false }
+            hangSends -= 1
+            return true
+        }
+        // The session abandons the write at its deadline and cancels it, which ends this sleep.
+        if hang { try await Task.sleep(for: .seconds(3600)) }
         let replies = onSend(frame)
         lock.withLock {
             sentFrames.append(frame)
@@ -50,7 +65,7 @@ private final class FakeLink: RingLink, @unchecked Sendable {
                 lock.withLock { gateContinuation = continuation }
             }
         }
-        return lock.withLock { inbox.isEmpty ? nil : inbox.removeFirst() }
+        return lock.withLock { inbox.isEmpty ? trickleFrame : inbox.removeFirst() }
     }
 
     func armGate() { lock.withLock { gateArmed = true } }
@@ -281,3 +296,82 @@ private final class ZoneBox: @unchecked Sendable {
 // RingConnection.send repeats the delete-range refusal, but reaching it needs a CBCentralManager
 // (Bluetooth permission). The session-level refusal above and Frame.erasesRingData's own test
 // in RingProtocolTests cover the check.
+
+// MARK: Deadlines
+
+/// A monotonic clock that advances one second every time it is read, so a test crosses a
+/// conversation deadline after a fixed number of reads instead of after real time.
+private final class SteppingClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reads = 0
+    private let start = ContinuousClock.now
+    func now() -> ContinuousClock.Instant {
+        lock.withLock {
+            reads += 1
+            return start + .seconds(reads)
+        }
+    }
+}
+
+private final class CallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func next() -> Int { lock.withLock { count += 1; return count } }
+}
+
+private func expectTimeout(_ body: () async throws -> Void) async {
+    do {
+        try await body()
+        Issue.record("expected a timeout")
+    } catch RingError.timeout {
+    } catch {
+        Issue.record("expected a timeout, got \(error)")
+    }
+}
+
+private let deviceReply = Frame(group: 0x02, key: 0x00, payload: [7])
+
+@Test(.timeLimit(.minutes(1))) func writeThatNeverCompletesTimesOutAndTheNextRequestWorks() async throws {
+    let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
+    let s = session(link)
+    link.hangNextSend()
+    await expectTimeout { _ = try await s.request(Command.deviceInfo) }
+    #expect(try await s.request(Command.deviceInfo) == deviceReply)
+}
+
+@Test(.timeLimit(.minutes(1))) func linkGoingSilentMidTransferTimesOutAndTheNextRequestWorks() async throws {
+    let calls = CallCounter()
+    let link = FakeLink { frame in
+        if frame.type == Command.history(kind).type {
+            // First attempt: header and one data frame, then silence (no end frame).
+            return calls.next() == 1 ? [header(12), dataFrame([1, 2])] : [header(12), dataFrame([1, 2]), endFrame(checksum: CRC16.ccittFalse([1, 2]))]
+        }
+        return frame.type == 0x0200 ? [deviceReply] : []
+    }
+    let s = session(link)
+    await expectTimeout { _ = try await s.fetchHistory(kind) { _ in } }
+    #expect(try await s.request(Command.deviceInfo) == deviceReply)
+    let transfer = try await s.fetchHistory(kind) { _ in }
+    #expect(transfer.data == [1, 2])
+}
+
+@Test(.timeLimit(.minutes(1))) func transferThatKeepsTricklingPastTheOverallDeadlineTimesOut() async throws {
+    let link = FakeLink { frame in
+        frame.type == 0x0200 ? [deviceReply] : [header(12)]
+    }
+    // Every wait is satisfied, so only the overall deadline can end this transfer.
+    link.setTrickle(dataFrame([1]))
+    let clock = SteppingClock()
+    let s = RingSession(link: link, replyTimeout: 0.05, conversationTimeout: 5, monotonicNow: { clock.now() })
+    await expectTimeout { _ = try await s.fetchHistory(kind) { _ in } }
+    link.setTrickle(nil)
+    #expect(try await s.request(Command.deviceInfo) == deviceReply)
+}
+
+@Test(.timeLimit(.minutes(1))) func unrelatedFramesCannotKeepARequestWaitingPastTheDeadline() async throws {
+    let link = FakeLink()
+    link.setTrickle(Frame(group: 0x02, key: 0x0C, payload: [1]))
+    let clock = SteppingClock()
+    let s = RingSession(link: link, replyTimeout: 0.05, conversationTimeout: 5, monotonicNow: { clock.now() })
+    await expectTimeout { _ = try await s.request(Command.deviceInfo) }
+}

@@ -118,6 +118,7 @@ Seen in one night and the following day of data unless stated otherwise. Treat t
 
 Built for the command-line tool; these must be closed before the app relies on it. Each should have an issue.
 
+- Deadlines are in place (connect covers scan through subscribe, writes, Bluetooth readiness, and each conversation as a whole), but the CoreBluetooth paths are covered by reasoning only, not tests, and have not been exercised at the edge of range. Reproducing the original hang on hardware is still open.
 - Ring-initiated events are acknowledged only while a request is in flight; there is no continuous reader and no way to subscribe to uploads.
 - Connecting scans for all devices and matches by name. iOS needs scanning by service, reconnecting by stored identifier, and state restoration for background sync.
 - No task cancellation support. `RingSession` (an actor over the `RingLink` protocol) queues conversations, but `RingConnection` itself still assumes one conversation at a time, so the app must use it only through a session (`ringprobe raw` uses it directly, which is fine for a single-task command-line tool).
