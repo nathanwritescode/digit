@@ -13,6 +13,8 @@ public enum RingError: Error, CustomStringConvertible {
     case rejected(Frame)
     case checksumMismatch
     case refusedDestructive(Frame)
+    /// A second connect or write was started while one was still in progress.
+    case busy(String)
 
     public var description: String {
         switch self {
@@ -24,6 +26,7 @@ public enum RingError: Error, CustomStringConvertible {
         case .timeout(let what): "timed out waiting for \(what)"
         case .rejected(let frame): String(format: "ring rejected command %04X (code %02X)", frame.type, frame.payload.first ?? 0)
         case .checksumMismatch: "history transfer failed its checksum"
+        case .busy(let what): "busy: \(what)"
         case .refusedDestructive(let frame): String(format: "refused to send %04X: it erases history from the ring", frame.type)
         }
     }
@@ -71,8 +74,10 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     private var connectAttempt = 0
     private var writeWaiter: CheckedContinuation<Void, Error>?
     private var writeAttempt = 0
-    // Writes that timed out but whose confirmation may still arrive. Confirmations come back in
-    // order, so a late one must be swallowed instead of completing the next write early.
+    // Writes that timed out but whose confirmation may still arrive. Assumes with-response writes
+    // are confirmed in order, and that a confirmation that never comes ends in an ATT timeout that
+    // drops the link (which resets this counter). If a confirmation were lost on a link that
+    // stayed up, every later one would be attributed to the previous write. Unverified on the ring.
     private var abandonedWrites = 0
     private var pendingNotifications = 0
     private var assemblers: [CBUUID: FrameAssembler] = [:]
@@ -121,11 +126,11 @@ public final class RingConnection: NSObject, @unchecked Sendable {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async {
                 guard self.connectWaiter == nil else {
-                    continuation.resume(throwing: RingError.connectionFailed("another connection attempt is in progress"))
+                    continuation.resume(throwing: RingError.busy("another connection attempt is in progress"))
                     return
                 }
                 // Drop whatever an earlier attempt left behind so this one starts clean.
-                self.dropPeripheral()
+                self.resetLink(cancelling: true)
                 self.connectWaiter = continuation
                 self.connectAttempt += 1
                 let attempt = self.connectAttempt
@@ -137,7 +142,7 @@ public final class RingConnection: NSObject, @unchecked Sendable {
                     guard self.connectWaiter != nil, self.connectAttempt == attempt else { return }
                     self.central.stopScan()
                     let found = self.peripheral != nil
-                    self.dropPeripheral()
+                    self.resetLink(cancelling: true)
                     self.finishConnect(.failure(found ? RingError.timeout("connection setup") : RingError.notFound))
                 }
             }
@@ -148,8 +153,8 @@ public final class RingConnection: NSObject, @unchecked Sendable {
         queue.async {
             // A cancelled pending connection gets no delegate callback, so fail the waiters here.
             self.central.stopScan()
-            self.dropPeripheral()
-            self.failPending(RingError.notConnected)
+            self.resetLink(cancelling: true)
+            self.failPending(connect: RingError.notConnected, write: RingError.notConnected)
         }
     }
 
@@ -164,12 +169,12 @@ public final class RingConnection: NSObject, @unchecked Sendable {
                     continuation.resume(throwing: RingError.notConnected)
                     return
                 }
-                let bytes = frame.encoded()
-                self.onRawBytes?(true, bytes)
                 guard self.writeWaiter == nil else {
-                    continuation.resume(throwing: RingError.connectionFailed("another write is in progress"))
+                    continuation.resume(throwing: RingError.busy("another write is in progress"))
                     return
                 }
+                let bytes = frame.encoded()
+                self.onRawBytes?(true, bytes)
                 self.writeWaiter = continuation
                 self.writeAttempt += 1
                 let attempt = self.writeAttempt
@@ -229,17 +234,29 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     }
 
     /// Fails the connect and write waiters, if any. Safe to call when there are none.
-    private func failPending(_ error: Error) {
-        finishConnect(.failure(error))
+    private func failPending(connect: Error, write: Error) {
+        finishConnect(.failure(connect))
         if let waiter = writeWaiter {
             writeWaiter = nil
-            waiter.resume(throwing: error)
+            waiter.resume(throwing: write)
         }
     }
 
-    /// Cancels and forgets the current peripheral and everything learned from it.
-    private func dropPeripheral() {
-        if let peripheral { central.cancelPeripheralConnection(peripheral) }
+    /// Fails the connect after a setup step went wrong and gives up on the link.
+    private func failSetup(_ peripheral: CBPeripheral, _ error: RingError) {
+        central.cancelPeripheralConnection(peripheral)
+        finishConnect(.failure(error))
+    }
+
+    /// The one place the link's state is reset: used when dropping a peripheral, when it
+    /// disconnects and when Bluetooth leaves powered-on, so the rules cannot drift apart.
+    /// `cancelling` is false when the link is already gone (no point cancelling it).
+    /// Clears the old peripheral's delegate so its later callbacks are not applied to a newer attempt.
+    private func resetLink(cancelling: Bool) {
+        if let peripheral {
+            peripheral.delegate = nil
+            if cancelling { central.cancelPeripheralConnection(peripheral) }
+        }
         peripheral = nil
         commandCharacteristic = nil
         pendingNotifications = 0
@@ -251,6 +268,13 @@ public final class RingConnection: NSObject, @unchecked Sendable {
 
 extension RingConnection: CBCentralManagerDelegate {
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        if central.state != .poweredOn {
+            // Bluetooth went away (or is resetting) under a connection: no disconnect callback is
+            // guaranteed to follow, so reset here and fail whatever is pending.
+            resetLink(cancelling: false)
+            let error = RingError.bluetoothUnavailable(central.state)
+            failPending(connect: error, write: error)
+        }
         guard central.state != .unknown, central.state != .resetting else { return }
         let waiters = stateWaiters.values
         stateWaiters = [:]
@@ -260,10 +284,6 @@ extension RingConnection: CBCentralManagerDelegate {
             } else {
                 waiter.resume(throwing: RingError.bluetoothUnavailable(central.state))
             }
-        }
-        if central.state != .poweredOn {
-            // Bluetooth went away under a connection: no delegate callback is guaranteed to follow.
-            failPending(RingError.bluetoothUnavailable(central.state))
         }
     }
 
@@ -285,52 +305,48 @@ extension RingConnection: CBCentralManagerDelegate {
     }
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        // Callbacks for a peripheral an earlier attempt dropped must not touch the current one.
+        guard peripheral === self.peripheral else { return }
         peripheral.discoverServices([YCBT.service])
     }
 
     public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        self.peripheral = nil
+        guard peripheral === self.peripheral else { return }
+        resetLink(cancelling: false)
         finishConnect(.failure(RingError.connectionFailed(error?.localizedDescription ?? "unknown")))
     }
 
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        self.peripheral = nil
-        commandCharacteristic = nil
-        pendingNotifications = 0
-        abandonedWrites = 0
-        assemblers = [:]
-        inbox.clear()
-        finishConnect(.failure(RingError.connectionFailed(error?.localizedDescription ?? "disconnected")))
-        if let waiter = writeWaiter {
-            writeWaiter = nil
-            waiter.resume(throwing: RingError.notConnected)
-        }
+        guard peripheral === self.peripheral else { return }
+        resetLink(cancelling: false)
+        failPending(connect: RingError.connectionFailed(error?.localizedDescription ?? "disconnected"),
+                    write: RingError.notConnected)
     }
 }
 
 extension RingConnection: CBPeripheralDelegate {
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard peripheral === self.peripheral else { return }
         if let error {
             failSetup(peripheral, RingError.connectionFailed(error.localizedDescription))
             return
         }
         guard let service = peripheral.services?.first(where: { $0.uuid == YCBT.service }) else {
-            central.cancelPeripheralConnection(peripheral)
-            finishConnect(.failure(RingError.missingService))
+            failSetup(peripheral, .missingService)
             return
         }
         peripheral.discoverCharacteristics([YCBT.command, YCBT.upload], for: service)
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        guard peripheral === self.peripheral else { return }
         if let error {
             failSetup(peripheral, RingError.connectionFailed(error.localizedDescription))
             return
         }
         let characteristics = service.characteristics ?? []
         guard let command = characteristics.first(where: { $0.uuid == YCBT.command }) else {
-            central.cancelPeripheralConnection(peripheral)
-            finishConnect(.failure(RingError.missingService))
+            failSetup(peripheral, .missingService)
             return
         }
         commandCharacteristic = command
@@ -342,9 +358,9 @@ extension RingConnection: CBPeripheralDelegate {
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        guard peripheral === self.peripheral else { return }
         if let error {
-            central.cancelPeripheralConnection(peripheral)
-            finishConnect(.failure(RingError.connectionFailed(error.localizedDescription)))
+            failSetup(peripheral, .connectionFailed(error.localizedDescription))
             return
         }
         pendingNotifications -= 1
@@ -352,6 +368,7 @@ extension RingConnection: CBPeripheralDelegate {
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard peripheral === self.peripheral else { return }
         if abandonedWrites > 0 {
             abandonedWrites -= 1
             return
@@ -361,12 +378,8 @@ extension RingConnection: CBPeripheralDelegate {
         if let error { waiter.resume(throwing: error) } else { waiter.resume() }
     }
 
-    private func failSetup(_ peripheral: CBPeripheral, _ error: RingError) {
-        central.cancelPeripheralConnection(peripheral)
-        finishConnect(.failure(error))
-    }
-
     public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard peripheral === self.peripheral else { return }
         guard let value = characteristic.value, !value.isEmpty else { return }
         let bytes = [UInt8](value)
         onRawBytes?(false, bytes)

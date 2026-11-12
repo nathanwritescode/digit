@@ -5,6 +5,11 @@ import RingProtocol
 /// implementation; tests supply a scripted one.
 public protocol RingLink: Sendable {
     /// Conformers must also refuse frames where `erasesRingData` is true, by throwing `RingError.refusedDestructive`.
+    ///
+    /// Deadline contract: `send` must return or throw within a bounded time of the link's own
+    /// choosing, and after it throws the link must accept the next `send`. The link owns the write
+    /// deadline because only it can clear its own in-flight state. `RingSession` keeps a longer
+    /// backstop for a link that breaks this, but a link relying on it may be left unusable.
     func send(_ frame: Frame) async throws
     /// The next frame from the ring, in arrival order, or `nil` if none arrives within `timeout`.
     func nextFrame(timeout: TimeInterval) async -> Frame?
@@ -41,7 +46,19 @@ public actor RingSession {
         link: any RingLink,
         replyTimeout: TimeInterval = 5,
         conversationTimeout: TimeInterval = 60,
-        monotonicNow: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock.now },
+        clock: @escaping @Sendable () -> Date = { Date() },
+        timeZone: @escaping @Sendable () -> TimeZone = { TimeZone.autoupdatingCurrent }
+    ) {
+        self.init(link: link, replyTimeout: replyTimeout, conversationTimeout: conversationTimeout,
+                  monotonicNow: { ContinuousClock.now }, clock: clock, timeZone: timeZone)
+    }
+
+    /// Test hook: also injects the monotonic clock that the conversation deadline is measured on.
+    init(
+        link: any RingLink,
+        replyTimeout: TimeInterval,
+        conversationTimeout: TimeInterval,
+        monotonicNow: @escaping @Sendable () -> ContinuousClock.Instant,
         clock: @escaping @Sendable () -> Date = { Date() },
         timeZone: @escaping @Sendable () -> TimeZone = { TimeZone.autoupdatingCurrent }
     ) {
@@ -80,22 +97,21 @@ public actor RingSession {
     private func waitSlice(until deadline: ContinuousClock.Instant, _ what: String) throws -> TimeInterval {
         let left = deadline - now()
         guard left > .zero else { throw RingError.timeout(what) }
-        let seconds = Double(left.components.seconds) + Double(left.components.attoseconds) / 1e18
-        return min(replyTimeout, seconds)
+        return min(replyTimeout, left / .seconds(1))
     }
 
     private func converse(_ command: Frame, deadline: ContinuousClock.Instant) async throws -> Frame {
         let what = String(format: "reply to %04X", command.type)
         // Anything still queued belongs to an earlier conversation that failed or timed out.
         await link.discardPendingFrames()
-        try await transmit(command)
+        try await transmit(command, deadline: deadline)
         while true {
             guard let frame = await link.nextFrame(timeout: try waitSlice(until: deadline, what)) else { break }
             if frame.type == command.type {
                 if frame.isErrorReply { throw RingError.rejected(frame) }
                 return frame
             }
-            try await acknowledgeIfEvent(frame)
+            try await acknowledgeIfEvent(frame, deadline: deadline)
         }
         throw RingError.timeout(what)
     }
@@ -148,7 +164,7 @@ public actor RingSession {
         while true {
             guard let frame = await link.nextFrame(timeout: try waitSlice(until: deadline, what)) else { break }
             guard frame.group == Command.healthGroup else {
-                try await acknowledgeIfEvent(frame)
+                try await acknowledgeIfEvent(frame, deadline: deadline)
                 continue
             }
             if frame.key == Command.historyEndKey {
@@ -160,7 +176,7 @@ public actor RingSession {
                 }
                 let transfer = makeTransfer(kind, header: header, data: data)
                 try await persist(transfer)
-                try await transmit(Command.historyTransferOK)
+                try await transmit(Command.historyTransferOK, deadline: deadline)
                 return transfer
             }
             data += frame.payload
@@ -174,16 +190,21 @@ public actor RingSession {
     }
 
     /// Every write goes through here so the delete-range refusal holds even for a link that forgets it.
-    private func transmit(_ frame: Frame) async throws {
+    private func transmit(_ frame: Frame, deadline: ContinuousClock.Instant) async throws {
         guard !frame.erasesRingData else { throw RingError.refusedDestructive(frame) }
-        // A link whose write never completes must not hold the conversation, and so the turn, forever.
+        // Backstop only. A compliant link times out its own write (RingConnection: 5 s) and is
+        // expected to fire first; this one is for a link that breaks the `RingLink.send` contract,
+        // so it must not fire before a compliant link's own deadline. Hence at least twice
+        // `replyTimeout`, or the time left in the conversation if that is longer. It can overrun the
+        // conversation deadline by up to that floor for a final write.
         let link = self.link
-        try await withDeadline(replyTimeout, "write confirmation") { try await link.send(frame) }
+        let remaining = max(deadline - now(), .seconds(2 * replyTimeout))
+        try await withDeadline(remaining / .seconds(1), "write confirmation") { try await link.send(frame) }
     }
 
     /// Events the ring starts on its own (group `0x04`) must be echoed back with payload `[0x00]`.
-    private func acknowledgeIfEvent(_ frame: Frame) async throws {
+    private func acknowledgeIfEvent(_ frame: Frame, deadline: ContinuousClock.Instant) async throws {
         guard frame.group == 0x04 else { return }
-        try await transmit(Frame(group: frame.group, key: frame.key, payload: [0x00]))
+        try await transmit(Frame(group: frame.group, key: frame.key, payload: [0x00]), deadline: deadline)
     }
 }

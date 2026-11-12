@@ -14,13 +14,15 @@ func withDeadline<T: Sendable>(
     let once = Once<T>()
     return try await withCheckedThrowingContinuation { continuation in
         once.arm(continuation)
+        let sleeper = SleeperBox()
         let work = Task {
             do { once.finish(.success(try await operation())) } catch { once.finish(.failure(error)) }
+            sleeper.cancel()
         }
-        Task {
+        sleeper.set(Task {
             try? await Task.sleep(for: .seconds(seconds))
             if once.finish(.failure(RingError.timeout(what))) { work.cancel() }
-        }
+        })
     }
 }
 
@@ -44,5 +46,29 @@ private final class Once<T: Sendable>: @unchecked Sendable {
         guard let taken else { return false }
         taken.resume(with: result)
         return true
+    }
+}
+
+/// Lets the operation's task cancel the timer task, which is created after it.
+/// `@unchecked Sendable` because all state is guarded by `lock`.
+private final class SleeperBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+    private var cancelled = false
+
+    func set(_ task: Task<Void, Never>) {
+        let cancelNow = lock.withLock { () -> Bool in
+            self.task = task
+            return cancelled
+        }
+        if cancelNow { task.cancel() }
+    }
+
+    func cancel() {
+        let task = lock.withLock { () -> Task<Void, Never>? in
+            cancelled = true
+            return self.task
+        }
+        task?.cancel()
     }
 }

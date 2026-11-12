@@ -19,8 +19,9 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     private var gateReached = false
     private var gateContinuation: CheckedContinuation<Void, Never>?
 
-    init(stale: [Frame] = [], onSend: @escaping @Sendable (Frame) -> [Frame] = { _ in [] }) {
+    init(stale: [Frame] = [], guardWrites: Bool = false, onSend: @escaping @Sendable (Frame) -> [Frame] = { _ in [] }) {
         inbox = stale
+        self.guardWrites = guardWrites
         self.onSend = onSend
     }
 
@@ -29,22 +30,44 @@ private final class FakeLink: RingLink, @unchecked Sendable {
 
     func record(_ event: String) { lock.withLock { log.append(event) } }
 
-    // Scripted faults. `hangNextSend` makes the next write wait (cancellably) as if the ring never
-    // confirmed it; `trickle` is returned by `nextFrame` whenever nothing else is queued, so frames
-    // keep arriving without end.
-    private var hangSends = 0
+    // Scripted faults for `send`. `parkNextSend` models a link that ignores cancellation and
+    // never returns (the real CheckedContinuation behaviour): the test must call `releaseParked()`
+    // at the end. `timeOutNextSend` models a compliant link that times out its own write.
+    // With `guardWrites`, a send while an earlier one is still in flight throws `busy`, as the real
+    // connection does. `trickle` is returned by `nextFrame` whenever nothing else is queued.
+    private enum SendFault { case park, ownTimeout }
+    private var faults: [SendFault] = []
+    private var parked: [CheckedContinuation<Void, Never>] = []
+    private var inFlight = false
+    private let guardWrites: Bool
     private var trickleFrame: Frame?
-    func hangNextSend() { lock.withLock { hangSends += 1 } }
+    func parkNextSend() { lock.withLock { faults.append(.park) } }
+    func timeOutNextSend() { lock.withLock { faults.append(.ownTimeout) } }
     func setTrickle(_ frame: Frame?) { lock.withLock { trickleFrame = frame } }
+    func releaseParked() {
+        let all = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            defer { parked = [] }
+            return parked
+        }
+        for continuation in all { continuation.resume() }
+    }
 
     func send(_ frame: Frame) async throws {
-        let hang = lock.withLock { () -> Bool in
-            guard hangSends > 0 else { return false }
-            hangSends -= 1
-            return true
+        let fault = try lock.withLock { () -> SendFault? in
+            if guardWrites && inFlight { throw RingError.busy("another write is in progress") }
+            return faults.isEmpty ? nil : faults.removeFirst()
         }
-        // The session abandons the write at its deadline and cancels it, which ends this sleep.
-        if hang { try await Task.sleep(for: .seconds(3600)) }
+        switch fault {
+        case .ownTimeout:
+            // The link clears its own in-flight state before reporting, so the next send is accepted.
+            throw RingError.timeout("write confirmation")
+        case .park:
+            lock.withLock { inFlight = true }
+            await withCheckedContinuation { continuation in lock.withLock { parked.append(continuation) } }
+            lock.withLock { inFlight = false }
+        case nil:
+            break
+        }
         let replies = onSend(frame)
         lock.withLock {
             sentFrames.append(frame)
@@ -331,11 +354,22 @@ private func expectTimeout(_ body: () async throws -> Void) async {
 
 private let deviceReply = Frame(group: 0x02, key: 0x00, payload: [7])
 
-@Test(.timeLimit(.minutes(1))) func writeThatNeverCompletesTimesOutAndTheNextRequestWorks() async throws {
-    let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
+@Test(.timeLimit(.minutes(1))) func linkThatTimesOutItsOwnWriteLeavesTheSessionUsable() async throws {
+    let link = FakeLink(guardWrites: true) { $0.type == 0x0200 ? [deviceReply] : [] }
     let s = session(link)
-    link.hangNextSend()
+    link.timeOutNextSend()
     await expectTimeout { _ = try await s.request(Command.deviceInfo) }
+    #expect(try await s.request(Command.deviceInfo) == deviceReply)
+}
+
+@Test(.timeLimit(.minutes(1))) func backstopEndsAWriteOnALinkThatNeverReturns() async throws {
+    // A non-compliant link: the write ignores cancellation and never returns. The session must
+    // still report a timeout instead of hanging (the link itself stays stuck, which is its fault).
+    let link = FakeLink(guardWrites: true) { $0.type == 0x0200 ? [deviceReply] : [] }
+    let s = RingSession(link: link, replyTimeout: 0.05, conversationTimeout: 0.3)
+    link.parkNextSend()
+    await expectTimeout { _ = try await s.request(Command.deviceInfo) }
+    link.releaseParked()
     #expect(try await s.request(Command.deviceInfo) == deviceReply)
 }
 
@@ -374,4 +408,36 @@ private let deviceReply = Frame(group: 0x02, key: 0x00, payload: [7])
     let clock = SteppingClock()
     let s = RingSession(link: link, replyTimeout: 0.05, conversationTimeout: 5, monotonicNow: { clock.now() })
     await expectTimeout { _ = try await s.request(Command.deviceInfo) }
+}
+
+// MARK: withDeadline
+
+@Test(.timeLimit(.minutes(1))) func deadlineHelperReturnsTheOperationsResultWhenItWins() async throws {
+    // The long deadline must not keep the call waiting: the timer is cancelled when the operation wins.
+    let value = try await withDeadline(3600, "never") { 42 }
+    #expect(value == 42)
+}
+
+@Test(.timeLimit(.minutes(1))) func deadlineHelperGivesUpOnAnOperationThatIgnoresCancellation() async throws {
+    let parked = ParkedOperation()
+    await expectTimeout {
+        try await withDeadline(0.05, "stuck") { await parked.park() }
+    }
+    parked.release()
+}
+
+@Test(.timeLimit(.minutes(1))) func deadlineHelperPropagatesTheOperationsError() async throws {
+    do {
+        try await withDeadline(3600, "never") { throw PersistFailure() }
+        Issue.record("expected an error")
+    } catch is PersistFailure {
+    }
+}
+
+// @unchecked Sendable: all state is guarded by `lock`.
+private final class ParkedOperation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    func park() async { await withCheckedContinuation { c in lock.withLock { continuation = c } } }
+    func release() { lock.withLock { continuation.take() }?.resume() }
 }
