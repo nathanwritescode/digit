@@ -23,8 +23,10 @@ Priorities for v1, in order: sleep tracking, then steps, then everything else th
 Packages/RingKit/
   Sources/RingProtocol/    pure Swift: frames, CRC, commands, record decoders (no Bluetooth)
   Sources/RingTransport/   CoreBluetooth connection and request/response sessions
+  Sources/RingStore/       GRDB-backed on-device store: rings, raw history transfers, clock-set log (no Bluetooth; the app does not link it yet)
   Sources/ringprobe/       macOS command-line tool for probing a ring
   Tests/RingProtocolTests/ Swift Testing tests
+  Tests/RingStoreTests/    store tests on in-memory and temporary-file databases
   Tests/RingTransportTests/ session tests against a scripted fake RingLink (no Bluetooth)
 App/
   Digit.xcodeproj          iOS app project (SwiftUI, iOS 26, Swift 6, iPhone only); depends on RingKit
@@ -33,7 +35,7 @@ App/
 captures/                  raw ring captures (git-ignored, private)
 ```
 
-Planned but not yet built: a ring abstraction with per-device capabilities, the on-device store (GRDB) with export, and the Apple Health writer (write-only for now, behind an interface that can add reading later). The SwiftUI app exists as an empty skeleton with a placeholder screen.
+Planned but not yet built: a ring abstraction with per-device capabilities, export from the on-device store (the store exists with raw tables only; typed tables are planned), and the Apple Health writer (write-only for now, behind an interface that can add reading later). The SwiftUI app exists as an empty skeleton with a placeholder screen.
 
 ## Commands
 
