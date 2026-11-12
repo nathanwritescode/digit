@@ -360,6 +360,26 @@ private let sleepOneSecondGaps = "affa 2c00 00000000 0a070000 ffff 2c01 8403 580
     #expect(records[1].time.timeIntervalSince(records[0].time) == 3600)
 }
 
+// Synthetic bytes. Byte ranges let ingestion tell which fetch first contained a record.
+@Test func locatedDecodersReportByteRanges() {
+    let activityBytes = hex("00000000 08070000 e803 bc02 2800  01000000 09070000 0100 0000 0000  ff")
+    let activity = ActivityRecord.decodeLocated(activityBytes, timeZone: utc)
+    #expect(activity.map(\.offset) == [0, 14])
+    #expect(activity.map(\.length) == [14, 14])
+    #expect(activity.map(\.record) == ActivityRecord.decode(activityBytes, timeZone: utc))
+
+    let heart = HeartRateRecord.decodeLocated(hex("3c000000 00 48  78000000 00 4a  ff"), timeZone: utc)
+    #expect(heart.map(\.offset) == [0, 6])
+    #expect(heart.map(\.length) == [6, 6])
+
+    let first = "affa 2400 00000000 78150000 ffff 0000 100e 0807" + "f2 00000000 080700" + "f1 08070000 100e00"
+    let second = "affa 1c00 a08c0000 a8930000 ffff 0807 0000 0000" + "f3 a08c0000 080700"
+    let sleep = SleepSession.decodeLocated(hex(first + second), timeZone: utc)
+    #expect(sleep.map(\.offset) == [0, 36])
+    #expect(sleep.map(\.length) == [36, 28])
+    #expect(sleep.map(\.record) == SleepSession.decode(hex(first + second), timeZone: utc))
+}
+
 @Test func millisecondConversionClampsUnrepresentableDates() {
     #expect(HistoryTransfer.millisecondsSince1970(Date(timeIntervalSince1970: .infinity)) == 8_640_000_000_000_000)
     #expect(HistoryTransfer.millisecondsSince1970(Date(timeIntervalSince1970: -.infinity)) == -8_640_000_000_000_000)

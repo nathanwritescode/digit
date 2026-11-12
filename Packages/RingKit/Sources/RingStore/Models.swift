@@ -44,6 +44,13 @@ public struct TransferListing: Equatable, Sendable {
     public var skippedUnknownKind: Int
 }
 
+/// The fetch log listing, with the rows this version could not read counted rather than hidden.
+public struct ObservationListing: Equatable, Sendable {
+    public var observations: [TransferObservation]
+    /// Rows left out because their kind code is unknown to this version of the app.
+    public var skippedUnknownKind: Int
+}
+
 public enum InsertOutcome: Equatable, Sendable {
     /// A new row was written. `pruned` earlier rows (same ring and kind, data a strict prefix of
     /// this one's) were deleted in the same transaction; 0 when none were superseded.
@@ -80,4 +87,6 @@ public enum RingStoreError: Error, Equatable, Sendable {
     case fileAccess(path: String, errno: Int32)
     /// A stored value could not be read back (for example an unknown history kind name).
     case corruptRow(String)
+    /// `ingest` does not handle this kind (the combined record is tracked separately).
+    case notIngestible(HistoryKind)
 }
