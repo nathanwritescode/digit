@@ -19,9 +19,10 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     private var gateReached = false
     private var gateContinuation: CheckedContinuation<Void, Never>?
 
-    init(stale: [Frame] = [], guardWrites: Bool = false, onSend: @escaping @Sendable (Frame) -> [Frame] = { _ in [] }) {
+    init(stale: [Frame] = [], guardWrites: Bool = false, writeTimeout: TimeInterval = 0.02, onSend: @escaping @Sendable (Frame) -> [Frame] = { _ in [] }) {
         inbox = stale
         self.guardWrites = guardWrites
+        self.writeTimeout = writeTimeout
         self.onSend = onSend
     }
 
@@ -32,10 +33,13 @@ private final class FakeLink: RingLink, @unchecked Sendable {
 
     // Scripted faults for `send`. `parkNextSend` models a link that ignores cancellation and
     // never returns (the real CheckedContinuation behaviour): the test must call `releaseParked()`
-    // at the end. `timeOutNextSend` models a compliant link that times out its own write.
+    // at the end. `timeOutNextSend` models a compliant link like the real connection: it holds the
+    // write in flight for its own `writeTimeout`, ignoring cancellation, then clears the in-flight
+    // state and throws.
     // With `guardWrites`, a send while an earlier one is still in flight throws `busy`, as the real
     // connection does. `trickle` is returned by `nextFrame` whenever nothing else is queued.
     private enum SendFault { case park, ownTimeout }
+    let writeTimeout: TimeInterval
     private var faults: [SendFault] = []
     private var parked: [CheckedContinuation<Void, Never>] = []
     private var inFlight = false
@@ -59,7 +63,16 @@ private final class FakeLink: RingLink, @unchecked Sendable {
         }
         switch fault {
         case .ownTimeout:
-            // The link clears its own in-flight state before reporting, so the next send is accepted.
+            lock.withLock { inFlight = true }
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global().asyncAfter(deadline: .now() + writeTimeout) {
+                    // The link clears its own in-flight state before reporting, so the next send is
+                    // accepted. Done here, not after resuming, so task scheduling delay cannot let
+                    // the session's backstop observe a write that has already timed out.
+                    self.lock.withLock { self.inFlight = false }
+                    continuation.resume()
+                }
+            }
             throw RingError.timeout("write confirmation")
         case .park:
             lock.withLock { inFlight = true }
@@ -354,9 +367,13 @@ private func expectTimeout(_ body: () async throws -> Void) async {
 
 private let deviceReply = Frame(group: 0x02, key: 0x00, payload: [7])
 
-@Test(.timeLimit(.minutes(1))) func linkThatTimesOutItsOwnWriteLeavesTheSessionUsable() async throws {
-    let link = FakeLink(guardWrites: true) { $0.type == 0x0200 ? [deviceReply] : [] }
-    let s = session(link)
+// The write deadline has one owner, the link. If the session's own deadline on a write could fire
+// before the link's, the link would still have the write in flight and refuse the next one. The
+// combinations include a reply timeout much shorter than the link's write timeout.
+@Test(.timeLimit(.minutes(1)), arguments: [0.03, 0.05, 0.1], [0.03, 0.1, 0.2])
+func linkThatTimesOutItsOwnWriteLeavesTheSessionUsable(replyTimeout: Double, writeTimeout: Double) async throws {
+    let link = FakeLink(guardWrites: true, writeTimeout: writeTimeout) { $0.type == 0x0200 ? [deviceReply] : [] }
+    let s = RingSession(link: link, replyTimeout: replyTimeout)
     link.timeOutNextSend()
     await expectTimeout { _ = try await s.request(Command.deviceInfo) }
     #expect(try await s.request(Command.deviceInfo) == deviceReply)
@@ -366,11 +383,29 @@ private let deviceReply = Frame(group: 0x02, key: 0x00, payload: [7])
     // A non-compliant link: the write ignores cancellation and never returns. The session must
     // still report a timeout instead of hanging (the link itself stays stuck, which is its fault).
     let link = FakeLink(guardWrites: true) { $0.type == 0x0200 ? [deviceReply] : [] }
-    let s = RingSession(link: link, replyTimeout: 0.05, conversationTimeout: 0.3)
+    let s = RingSession(link: link, replyTimeout: 0.05)
     link.parkNextSend()
+    // Independent watchdog: without the backstop the parked write would keep this test alive past
+    // any time limit, so release it and fail instead of hanging.
+    let watchdogFired = Flag()
+    let watchdog = Task {
+        try? await Task.sleep(for: .seconds(3))
+        guard !Task.isCancelled else { return }
+        watchdogFired.set()
+        link.releaseParked()
+    }
     await expectTimeout { _ = try await s.request(Command.deviceInfo) }
+    watchdog.cancel()
+    #expect(!watchdogFired.isSet, "the session did not give up on the write by itself")
     link.releaseParked()
-    #expect(try await s.request(Command.deviceInfo) == deviceReply)
+}
+
+// @unchecked Sendable: all state is guarded by `lock`.
+private final class Flag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    func set() { lock.withLock { value = true } }
+    var isSet: Bool { lock.withLock { value } }
 }
 
 @Test(.timeLimit(.minutes(1))) func linkGoingSilentMidTransferTimesOutAndTheNextRequestWorks() async throws {

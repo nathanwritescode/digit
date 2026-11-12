@@ -6,11 +6,13 @@ import RingProtocol
 public protocol RingLink: Sendable {
     /// Conformers must also refuse frames where `erasesRingData` is true, by throwing `RingError.refusedDestructive`.
     ///
-    /// Deadline contract: `send` must return or throw within a bounded time of the link's own
-    /// choosing, and after it throws the link must accept the next `send`. The link owns the write
-    /// deadline because only it can clear its own in-flight state. `RingSession` keeps a longer
-    /// backstop for a link that breaks this, but a link relying on it may be left unusable.
+    /// Deadline contract: `send` must return or throw within `writeTimeout`, and after it throws
+    /// the link must accept the next `send`. The link owns the write deadline because only it can
+    /// clear its own in-flight state. `RingSession` keeps a backstop that is always later than
+    /// `writeTimeout`, for a link that breaks this, but a link relying on it may be left unusable.
     func send(_ frame: Frame) async throws
+    /// The longest `send` may take before it throws.
+    var writeTimeout: TimeInterval { get }
     /// The next frame from the ring, in arrival order, or `nil` if none arrives within `timeout`.
     func nextFrame(timeout: TimeInterval) async -> Frame?
     /// Drops frames and partial frames left over from an earlier conversation.
@@ -192,14 +194,13 @@ public actor RingSession {
     /// Every write goes through here so the delete-range refusal holds even for a link that forgets it.
     private func transmit(_ frame: Frame, deadline: ContinuousClock.Instant) async throws {
         guard !frame.erasesRingData else { throw RingError.refusedDestructive(frame) }
-        // Backstop only. A compliant link times out its own write (RingConnection: 5 s) and is
-        // expected to fire first; this one is for a link that breaks the `RingLink.send` contract,
-        // so it must not fire before a compliant link's own deadline. Hence at least twice
-        // `replyTimeout`, or the time left in the conversation if that is longer. It can overrun the
-        // conversation deadline by up to that floor for a final write.
+        // Backstop only, for a link that breaks the `RingLink.send` contract. A compliant link
+        // throws by `writeTimeout` and clears its own in-flight state first; this deadline is
+        // always `replyTimeout` later than that, so it fires first only if the link is
+        // non-compliant. It is derived from the link's bound so the two cannot drift apart. A final
+        // write can therefore overrun the conversation deadline by up to `writeTimeout + replyTimeout`.
         let link = self.link
-        let remaining = max(deadline - now(), .seconds(2 * replyTimeout))
-        try await withDeadline(remaining / .seconds(1), "write confirmation") { try await link.send(frame) }
+        try await withDeadline(link.writeTimeout + replyTimeout, "write confirmation") { try await link.send(frame) }
     }
 
     /// Events the ring starts on its own (group `0x04`) must be echoed back with payload `[0x00]`.

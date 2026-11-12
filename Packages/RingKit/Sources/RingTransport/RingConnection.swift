@@ -79,10 +79,16 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     // drops the link (which resets this counter). If a confirmation were lost on a link that
     // stayed up, every later one would be attributed to the previous write. Unverified on the ring.
     private var abandonedWrites = 0
+    // Whether `didConnect` has arrived for the current attempt. CoreBluetooth hands back the same
+    // CBPeripheral object for the same device, so once the ring is rediscovered the identity guard
+    // cannot tell a late `didDisconnect` of an earlier, cancelled link from one for this attempt.
+    // A disconnect can only be for this attempt after it connected (a failure before that arrives
+    // as `didFailToConnect`), so disconnects before `didConnect` are ignored.
+    private var didConnectCurrent = false
     private var pendingNotifications = 0
     private var assemblers: [CBUUID: FrameAssembler] = [:]
     private let inbox = FrameInbox()
-    private let writeTimeout: TimeInterval
+    public let writeTimeout: TimeInterval
     private let stateTimeout: TimeInterval
 
     /// - Parameters:
@@ -243,8 +249,8 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     }
 
     /// Fails the connect after a setup step went wrong and gives up on the link.
-    private func failSetup(_ peripheral: CBPeripheral, _ error: RingError) {
-        central.cancelPeripheralConnection(peripheral)
+    private func failSetup(_ error: RingError) {
+        resetLink(cancelling: true)
         finishConnect(.failure(error))
     }
 
@@ -258,6 +264,7 @@ public final class RingConnection: NSObject, @unchecked Sendable {
             if cancelling { central.cancelPeripheralConnection(peripheral) }
         }
         peripheral = nil
+        didConnectCurrent = false
         commandCharacteristic = nil
         pendingNotifications = 0
         abandonedWrites = 0
@@ -307,6 +314,7 @@ extension RingConnection: CBCentralManagerDelegate {
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         // Callbacks for a peripheral an earlier attempt dropped must not touch the current one.
         guard peripheral === self.peripheral else { return }
+        didConnectCurrent = true
         peripheral.discoverServices([YCBT.service])
     }
 
@@ -317,7 +325,7 @@ extension RingConnection: CBCentralManagerDelegate {
     }
 
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        guard peripheral === self.peripheral else { return }
+        guard peripheral === self.peripheral, didConnectCurrent else { return }
         resetLink(cancelling: false)
         failPending(connect: RingError.connectionFailed(error?.localizedDescription ?? "disconnected"),
                     write: RingError.notConnected)
@@ -328,11 +336,11 @@ extension RingConnection: CBPeripheralDelegate {
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard peripheral === self.peripheral else { return }
         if let error {
-            failSetup(peripheral, RingError.connectionFailed(error.localizedDescription))
+            failSetup(.connectionFailed(error.localizedDescription))
             return
         }
         guard let service = peripheral.services?.first(where: { $0.uuid == YCBT.service }) else {
-            failSetup(peripheral, .missingService)
+            failSetup(.missingService)
             return
         }
         peripheral.discoverCharacteristics([YCBT.command, YCBT.upload], for: service)
@@ -341,12 +349,12 @@ extension RingConnection: CBPeripheralDelegate {
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         guard peripheral === self.peripheral else { return }
         if let error {
-            failSetup(peripheral, RingError.connectionFailed(error.localizedDescription))
+            failSetup(.connectionFailed(error.localizedDescription))
             return
         }
         let characteristics = service.characteristics ?? []
         guard let command = characteristics.first(where: { $0.uuid == YCBT.command }) else {
-            failSetup(peripheral, .missingService)
+            failSetup(.missingService)
             return
         }
         commandCharacteristic = command
@@ -360,7 +368,7 @@ extension RingConnection: CBPeripheralDelegate {
     public func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         guard peripheral === self.peripheral else { return }
         if let error {
-            failSetup(peripheral, .connectionFailed(error.localizedDescription))
+            failSetup(.connectionFailed(error.localizedDescription))
             return
         }
         pendingNotifications -= 1
