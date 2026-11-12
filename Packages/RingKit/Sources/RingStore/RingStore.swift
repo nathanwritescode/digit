@@ -111,30 +111,35 @@ public final class RingStore: Sendable {
         ORDER BY id LIMIT 1
         """
 
-    /// Which rows the new transfer supersedes: same ring and kind, strictly shorter, and a prefix of
-    /// the new data. The new row is longer than all of them, so it never matches itself. An
-    /// existing empty transfer is a prefix of everything and goes when any non-empty one arrives.
-    /// Shared by the observation copy and the delete so they always cover the same rows.
-    private static let supersededWhere =
-        "WHERE ring_id = ? AND kind = ? AND length(data) < ? AND substr(?, 1, length(data)) = data"
-
-    private static let observeSupersededSQL = """
-        INSERT INTO transfer_observation (ring_id, kind, data_length, header, fetched_at, time_zone_identifier)
-        SELECT ring_id, kind, length(data), header, fetched_at, time_zone_identifier
-        FROM history_transfer \(supersededWhere) ORDER BY id
+    /// Deletes the transfers the new one supersedes: same ring and kind, strictly shorter, and a
+    /// prefix of the new data. The new row is longer than all of them, so it never matches itself.
+    /// An existing empty transfer is a prefix of everything and goes when any non-empty one arrives.
+    private static let pruneSupersededSQL = """
+        DELETE FROM history_transfer
+        WHERE ring_id = ? AND kind = ? AND length(data) < ? AND substr(?, 1, length(data)) = data
         """
 
-    private static let pruneSupersededSQL = "DELETE FROM history_transfer \(supersededWhere)"
-
-    private static let observeIncomingSQL = """
-        INSERT INTO transfer_observation (ring_id, kind, data_length, header, fetched_at, time_zone_identifier)
-        VALUES (?, ?, ?, ?, ?, ?)
+    /// The fetch log entry written for every `insert`. Naming the unique columns means re-importing
+    /// the same capture adds nothing, while any other constraint failure still throws.
+    static let insertObservationSQL = """
+        INSERT INTO transfer_observation
+        (ring_id, kind, data_length, header, fetched_at, time_zone_identifier, content_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(ring_id, kind, content_hash, fetched_at) DO NOTHING
         """
 
     /// Stores `transfer` for `ringID`, in one write transaction with any pruning.
     ///
+    /// Every call records one `transfer_observation` of the incoming transfer (ring, kind, data
+    /// length, header, fetch time, zone, content hash), whatever the outcome, so the observations
+    /// are the complete fetch log. The same transfer fetched at the same instant is logged once.
+    /// That log is what tells ingestion which bytes existed before each sync, including that a
+    /// buffer was unchanged at a sync, and an empty fetch after a non-empty one is the only trace
+    /// of a buffer reset. Read it with `observations`.
+    ///
     /// - Identical bytes (same ring, kind and data) already stored are a no-op that keeps the first
-    ///   row (`.duplicate`); the header, fetch time and zone do not count.
+    ///   row (`.duplicate`); the header, fetch time and zone of the new fetch live only in its
+    ///   observation.
     /// - If an existing transfer for that ring and kind is longer and starts with the new data,
     ///   the new one adds nothing (an older capture imported late, or a truncated fetch) and is
     ///   not stored (`.supersededByExisting`).
@@ -147,15 +152,9 @@ public final class RingStore: Sendable {
     /// kind exists (it is a `.duplicate` of an existing empty one, else superseded by a non-empty
     /// one), and an existing empty transfer is pruned when a non-empty one arrives.
     ///
-    /// Every transfer that is pruned, and every incoming transfer that is skipped as superseded,
-    /// leaves a `transfer_observation` row (ring, kind, data length, header, fetch time, zone) in
-    /// the same transaction. The fetch time with the data length is the only evidence of which
-    /// bytes of the buffer existed at that fetch; ingestion needs it to pick the right clock-set
-    /// when the ring's clock moved backwards between syncs. Read them with `observations`. A
-    /// skipped empty transfer after a non-empty one is also recorded: it is the only trace of a
-    /// buffer reset. The pruned row's data is gone, since the superseding row holds all of it.
-    /// A `.duplicate` records nothing. Anything that references a transfer by row id must survive
-    /// its deletion.
+    /// A pruned row's data is gone because the superseding row holds all of it, and its own
+    /// observation (made when it was inserted) stays. Anything that references a transfer by row id
+    /// must survive its deletion.
     ///
     /// Only a clash on the content hash counts as a duplicate; any other constraint failure throws.
     @discardableResult
@@ -165,6 +164,12 @@ public final class RingStore: Sendable {
         let data = Data(transfer.data)
         return try writer.write { db in
             try Self.requireRing(db, ringID)
+            try db.execute(
+                sql: Self.insertObservationSQL,
+                arguments: [
+                    ringID.uuidString, kindCode, data.count, Data(transfer.header),
+                    HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),
+                ])
             if let existing = try Int64.fetchOne(
                 db, sql: "SELECT id FROM history_transfer WHERE content_hash = ?", arguments: [Data(hash)])
             {
@@ -174,12 +179,6 @@ public final class RingStore: Sendable {
                 db, sql: Self.findSupersederSQL,
                 arguments: [ringID.uuidString, kindCode, data.count, data.count, data])
             {
-                try db.execute(
-                    sql: Self.observeIncomingSQL,
-                    arguments: [
-                        ringID.uuidString, kindCode, data.count, Data(transfer.header),
-                        HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier,
-                    ])
                 return .supersededByExisting(existingID: superseder)
             }
             try db.execute(
@@ -195,9 +194,7 @@ public final class RingStore: Sendable {
                 throw RingStoreError.corruptRow("content hash conflict that the duplicate check did not see")
             }
             let id = db.lastInsertedRowID
-            let pruneArguments: StatementArguments = [ringID.uuidString, kindCode, data.count, data]
-            try db.execute(sql: Self.observeSupersededSQL, arguments: pruneArguments)
-            try db.execute(sql: Self.pruneSupersededSQL, arguments: pruneArguments)
+            try db.execute(sql: Self.pruneSupersededSQL, arguments: [ringID.uuidString, kindCode, data.count, data])
             return .inserted(id: id, pruned: db.changesCount)
         }
     }
@@ -213,8 +210,9 @@ public final class RingStore: Sendable {
         }
     }
 
-    /// What pruning removed or skipped for a ring, optionally of one kind, ordered by fetch time
-    /// then row id. Rows with a kind code this version does not know are skipped.
+    /// The fetch log for a ring, optionally of one kind: one entry per distinct fetch (same data
+    /// at the same instant counts once) whether or not its transfer row still exists, ordered by
+    /// fetch time then row id. Rows with a kind code this version does not know are skipped.
     public func observations(ringID: UUID, kind: HistoryKind? = nil) throws -> [TransferObservation] {
         var sql = "SELECT * FROM transfer_observation WHERE ring_id = ?"
         var arguments: [any DatabaseValueConvertible] = [ringID.uuidString]
@@ -230,6 +228,7 @@ public final class RingStore: Sendable {
                 return TransferObservation(
                     id: try Self.column(row, "id"), ringID: try Self.uuid(try Self.column(row, "ring_id")),
                     kind: kind, dataLength: try Self.column(row, "data_length"), header: [UInt8](header),
+                    contentHash: [UInt8](try Self.column(row, "content_hash") as Data),
                     fetchedAt: HistoryTransfer.date(millisecondsSince1970: try Self.column(row, "fetched_at")),
                     timeZoneIdentifier: try Self.column(row, "time_zone_identifier"))
             }
@@ -240,9 +239,9 @@ public final class RingStore: Sendable {
     /// (ties by row id). The range is inclusive at both ends and compared in whole milliseconds,
     /// each bound rounded down the same way stored times are.
     ///
-    /// After pruning, a row's fetch time is that of the surviving (longest) transfer, so a range in
-    /// the past may return nothing although its data lives in a later row. The earlier fetch times
-    /// are in `observations`.
+    /// A row's `fetched_at` is only the time of the fetch that produced that row. After pruning or
+    /// duplicates, a range in the past may return nothing although its data lives in a later row;
+    /// every fetch time is in `observations`.
     ///
     /// A row whose kind code this version does not know is skipped and counted in
     /// `TransferListing.skippedUnknownKind` instead of failing the whole listing.
@@ -385,10 +384,19 @@ public final class RingStore: Sendable {
                     data_length INTEGER NOT NULL CHECK (data_length >= 0),
                     header BLOB NOT NULL,
                     fetched_at INTEGER NOT NULL,
-                    time_zone_identifier TEXT NOT NULL
+                    time_zone_identifier TEXT NOT NULL,
+                    content_hash BLOB NOT NULL,
+                    UNIQUE (ring_id, kind, content_hash, fetched_at)
                 ) STRICT;
+                -- For the ordered listing; the unique index cannot serve it.
                 CREATE INDEX transfer_observation_ring_kind_fetched
                     ON transfer_observation (ring_id, kind, fetched_at);
+
+                -- Transfers stored under v1 are in the log before any of them can be pruned.
+                INSERT INTO transfer_observation
+                    (ring_id, kind, data_length, header, fetched_at, time_zone_identifier, content_hash)
+                SELECT ring_id, kind, length(data), header, fetched_at, time_zone_identifier, content_hash
+                FROM history_transfer ORDER BY id;
                 """)
         }
         return migrator

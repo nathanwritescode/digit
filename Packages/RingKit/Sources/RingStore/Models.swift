@@ -20,15 +20,18 @@ public struct StoredTransfer: Equatable, Sendable {
     public var transfer: HistoryTransfer
 }
 
-/// A record that a transfer was fetched, kept after pruning removed it or skipped it as
-/// superseded: when, how long its data was, and under which zone. The data itself is in the
-/// superseding transfer.
+/// A record of one fetch: when, how long its data was, under which zone, and the content hash of
+/// that data. It stays whether or not the transfer row still exists (pruning deletes the row, a
+/// duplicate never had one of its own). The data itself is in a surviving transfer that starts
+/// with it.
 public struct TransferObservation: Equatable, Sendable {
     public var id: Int64
     public var ringID: UUID
     public var kind: HistoryKind
     public var dataLength: Int
     public var header: [UInt8]
+    /// `RingStore.contentHash` of the observed data, the same value a stored transfer carries.
+    public var contentHash: [UInt8]
     /// Whole milliseconds.
     public var fetchedAt: Date
     public var timeZoneIdentifier: String

@@ -116,17 +116,17 @@ struct PruningTests {
             }
             #expect(throws: DatabaseError.self) { try store.insert(transfer(data: [1, 2, 3]), ringID: ring.id) }
             #expect(try rows(store, ring.id) == [[1, 2]])
-            // The observation copy ran before the failing delete; it must have rolled back too.
-            #expect(try store.observations(ringID: ring.id).isEmpty)
+            // The incoming transfer's observation was written first; it must have rolled back too.
+            #expect(try store.observations(ringID: ring.id).map(\.dataLength) == [2])
             try store.writer.write { db in try db.execute(sql: "DROP TRIGGER block_delete") }
             guard case .inserted(_, 1) = try store.insert(transfer(data: [1, 2, 3]), ringID: ring.id)
             else { Issue.record("expected insert pruning one"); return }
             #expect(try rows(store, ring.id) == [[1, 2, 3]])
-            #expect(try store.observations(ringID: ring.id).count == 1)
+            #expect(try store.observations(ringID: ring.id).map(\.dataLength) == [2, 3])
         }
     }
 
-    @Test func prunedTransfersLeaveObservations() throws {
+    @Test func growingBufferLogsEveryFetch() throws {
         try onEachStore { store in
             let ring = try store.registerRing(protocolFamily: "ycbt")
             try store.insert(transfer(data: [1], header: [0xA], at: t0, zone: "Europe/London"), ringID: ring.id)
@@ -136,15 +136,60 @@ struct PruningTests {
                 transfer(data: [1, 2, 3], header: [0xC], at: t0.addingTimeInterval(20), zone: "UTC"), ringID: ring.id)
             #expect(try rows(store, ring.id) == [[1, 2, 3]])
             let obs = try store.observations(ringID: ring.id)
-            #expect(obs.map(\.dataLength) == [1, 2])
-            #expect(obs.map(\.header) == [[0xA], [0xB]])
-            #expect(obs.map(\.fetchedAt) == [t0, t0.addingTimeInterval(10)])
-            #expect(obs.map(\.timeZoneIdentifier) == ["Europe/London", "Asia/Tokyo"])
+            #expect(obs.map(\.dataLength) == [1, 2, 3])
+            #expect(obs.map(\.header) == [[0xA], [0xB], [0xC]])
+            #expect(obs.map(\.fetchedAt) == [t0, t0.addingTimeInterval(10), t0.addingTimeInterval(20)])
+            #expect(obs.map(\.timeZoneIdentifier) == ["Europe/London", "Asia/Tokyo", "UTC"])
             #expect(obs.allSatisfy { $0.ringID == ring.id && $0.kind == .heartRate })
+            // Each observation's hash is that of the first dataLength bytes of the surviving transfer.
+            let survivor = [UInt8]([1, 2, 3])
+            for o in obs {
+                let prefix = Array(survivor.prefix(o.dataLength))
+                #expect(o.contentHash == RingStore.contentHash(ringID: ring.id, kind: .heartRate, data: prefix))
+            }
         }
     }
 
-    @Test func supersededByExistingRecordsAnObservationAndStoresNothing() throws {
+    @Test func duplicateAtAnotherTimeIsLoggedAndSameFetchTwiceOnce() throws {
+        try onEachStore { store in
+            let ring = try store.registerRing(protocolFamily: "ycbt")
+            try store.insert(transfer(data: [1, 2], at: t0), ringID: ring.id)
+            try store.insert(transfer(data: [1, 2], at: t0), ringID: ring.id)  // exactly the same fetch
+            #expect(try store.observations(ringID: ring.id).count == 1)
+            let outcome = try store.insert(transfer(data: [1, 2], header: [4], at: t0.addingTimeInterval(60)), ringID: ring.id)
+            guard case .duplicate = outcome else { Issue.record("expected duplicate"); return }
+            #expect(try store.observations(ringID: ring.id).map(\.fetchedAt) == [t0, t0.addingTimeInterval(60)])
+            #expect(try rows(store, ring.id) == [[1, 2]])
+        }
+    }
+
+    @Test func identicalImportOutOfOrderLogsBothFetchTimes() throws {
+        try onEachStore { store in
+            let ring = try store.registerRing(protocolFamily: "ycbt")
+            let t2 = t0.addingTimeInterval(1000)
+            guard case .inserted(let id, _) = try store.insert(transfer(data: [1, 2], at: t2), ringID: ring.id)
+            else { Issue.record("expected insert"); return }
+            #expect(try store.insert(transfer(data: [1, 2], at: t0), ringID: ring.id) == .duplicate(existingID: id))
+            #expect(try store.observations(ringID: ring.id).map(\.fetchedAt) == [t0, t2])
+        }
+    }
+
+    @Test func observationsComeBackInFetchTimeOrderNotInsertionOrder() throws {
+        try onEachStore { store in
+            let ring = try store.registerRing(protocolFamily: "ycbt")
+            try store.insert(transfer(data: [1], at: t0.addingTimeInterval(300)), ringID: ring.id)
+            try store.insert(transfer(data: [2], at: t0.addingTimeInterval(100)), ringID: ring.id)
+            try store.insert(transfer(data: [3], at: t0.addingTimeInterval(200)), ringID: ring.id)
+            #expect(try store.observations(ringID: ring.id).map(\.dataLength) == [1, 1, 1])
+            #expect(
+                try store.observations(ringID: ring.id).map(\.fetchedAt)
+                    == [100, 200, 300].map { t0.addingTimeInterval($0) })
+            #expect(try store.observations(ringID: ring.id).first?.contentHash
+                == RingStore.contentHash(ringID: ring.id, kind: .heartRate, data: [2]))
+        }
+    }
+
+    @Test func supersededByExistingIsLoggedAndStoresNothing() throws {
         try onEachStore { store in
             let ring = try store.registerRing(protocolFamily: "ycbt")
             try store.insert(transfer(data: [1, 2, 3, 4]), ringID: ring.id)
@@ -152,23 +197,20 @@ struct PruningTests {
             try store.insert(transfer(data: [1, 2], header: [5], at: later, zone: "Asia/Tokyo"), ringID: ring.id)
             #expect(try rows(store, ring.id) == [[1, 2, 3, 4]])
             let obs = try store.observations(ringID: ring.id)
-            #expect(obs.count == 1)
-            #expect(obs.first?.dataLength == 2)
-            #expect(obs.first?.header == [5])
-            #expect(obs.first?.fetchedAt == later)
-            #expect(obs.first?.timeZoneIdentifier == "Asia/Tokyo")
-            // A duplicate records nothing.
-            try store.insert(transfer(data: [1, 2, 3, 4]), ringID: ring.id)
-            #expect(try store.observations(ringID: ring.id).count == 1)
+            #expect(obs.count == 2)
+            #expect(obs.last?.dataLength == 2)
+            #expect(obs.last?.header == [5])
+            #expect(obs.last?.fetchedAt == later)
+            #expect(obs.last?.timeZoneIdentifier == "Asia/Tokyo")
         }
     }
 
-    @Test func emptyAfterNonEmptyRecordsAZeroLengthObservation() throws {
+    @Test func emptyAfterNonEmptyLogsAZeroLengthObservation() throws {
         try onEachStore { store in
             let ring = try store.registerRing(protocolFamily: "ycbt")
             try store.insert(transfer(data: [1]), ringID: ring.id)
             try store.insert(transfer(data: [], at: t0.addingTimeInterval(5)), ringID: ring.id)
-            #expect(try store.observations(ringID: ring.id).map(\.dataLength) == [0])
+            #expect(try store.observations(ringID: ring.id).map(\.dataLength) == [1, 0])
             #expect(try rows(store, ring.id) == [[1]])
         }
     }
@@ -178,38 +220,56 @@ struct PruningTests {
             let a = try store.registerRing(protocolFamily: "ycbt")
             let b = try store.registerRing(protocolFamily: "ycbt")
             try store.insert(transfer(.heartRate, data: [1]), ringID: a.id)
-            try store.insert(transfer(.heartRate, data: [1, 2]), ringID: a.id)  // prunes one on a/heartRate
+            try store.insert(transfer(.heartRate, data: [1, 2]), ringID: a.id)
             try store.insert(transfer(.sleep, data: [1]), ringID: a.id)
             try store.insert(transfer(.heartRate, data: [1]), ringID: b.id)
-            #expect(try store.observations(ringID: a.id).count == 1)
-            #expect(try store.observations(ringID: a.id, kind: .heartRate).count == 1)
-            #expect(try store.observations(ringID: a.id, kind: .sleep).isEmpty)
-            #expect(try store.observations(ringID: b.id).isEmpty)
+            #expect(try store.observations(ringID: a.id).count == 3)
+            #expect(try store.observations(ringID: a.id, kind: .heartRate).count == 2)
+            #expect(try store.observations(ringID: a.id, kind: .sleep).count == 1)
+            #expect(try store.observations(ringID: b.id).count == 1)
         }
     }
 
-    @Test func v1DatabaseMigratesToV2WithRowsIntact() throws {
-        let queue = try DatabaseQueue()
-        let ringID = UUID().uuidString
-        try RingStore.migrator.migrate(queue, upTo: "v1")
-        try queue.write { db in
-            try db.execute(
-                sql: "INSERT INTO ring (id, protocol_family, first_seen_at) VALUES (?, 'ycbt', 0)", arguments: [ringID])
-            try db.execute(
-                sql: RingStore.insertTransferSQL,
-                arguments: [ringID, "heartRate", Data([1]), Data([1, 2]), 5, "UTC", Data([9])])
+    /// A database created by v1 (a prefix chain of three rows) is upgraded by opening it with
+    /// `RingStore`; the migration's backfill puts the three rows in the log, then a longer transfer
+    /// prunes all three at once.
+    @Test func v1DatabaseUpgradesBackfillsTheLogAndPrunesSeveralRows() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("ring.sqlite")
+        let ringID = UUID()
+        let chain: [[UInt8]] = [[1], [1, 2], [1, 2, 3]]
+        do {
+            let pool = try DatabasePool(path: url.path)
+            try RingStore.migrator.migrate(pool, upTo: "v1")
+            try pool.write { db in
+                try db.execute(
+                    sql: "INSERT INTO ring (id, protocol_family, first_seen_at) VALUES (?, 'ycbt', 0)",
+                    arguments: [ringID.uuidString])
+                for (i, data) in chain.enumerated() {
+                    let hash = RingStore.contentHash(ringID: ringID, kind: .heartRate, data: data)
+                    try db.execute(
+                        sql: RingStore.insertTransferSQL,
+                        arguments: [
+                            ringID.uuidString, "heartRate", Data([UInt8(i)]), Data(data),
+                            1_000 * (i + 1), "UTC", Data(hash),
+                        ])
+                }
+            }
         }
-        try RingStore.migrator.migrate(queue)
-        let (count, data, observed) = try queue.read { db in
-            (
-                try Int.fetchOne(db, sql: "SELECT count(*) FROM history_transfer"),
-                try Data.fetchOne(db, sql: "SELECT data FROM history_transfer"),
-                try Int.fetchOne(db, sql: "SELECT count(*) FROM transfer_observation")
-            )
-        }
-        #expect(count == 1)
-        #expect(data == Data([1, 2]))
-        #expect(observed == 0)
+        let store = try RingStore(url: url)
+        let backfilled = try store.observations(ringID: ringID)
+        #expect(backfilled.map(\.dataLength) == [1, 2, 3])
+        #expect(backfilled.map(\.fetchedAt) == [1, 2, 3].map { Date(timeIntervalSince1970: Double($0)) })
+        #expect(backfilled.map(\.contentHash)
+            == chain.map { RingStore.contentHash(ringID: ringID, kind: .heartRate, data: $0) })
+        guard case .inserted(_, let pruned) = try store.insert(
+            transfer(data: [1, 2, 3, 4], at: t0), ringID: ringID)
+        else { Issue.record("expected insert"); return }
+        #expect(pruned == 3)
+        #expect(try rows(store, ringID) == [[1, 2, 3, 4]])
+        #expect(try store.observations(ringID: ringID).count == 4)
     }
 
     @Test func concurrentGrowingInsertsEndWithTheLongest() async throws {
