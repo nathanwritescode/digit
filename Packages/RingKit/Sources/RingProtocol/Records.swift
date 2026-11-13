@@ -162,6 +162,10 @@ public struct SleepSession: Equatable, Sendable {
     public var start: Date
     public var end: Date
     public var stages: [SleepStage]
+    /// How many 8-byte stage entries in this session were not decoded because their kind byte is
+    /// unknown or their duration is zero. None has been seen from an R99; counted so a gap in the
+    /// night is not unaccounted for. The skipped entries are not kept anywhere in decoded form.
+    public var skippedStages = 0
 
     public func total(_ kind: SleepStageKind) -> TimeInterval {
         stages.lazy.filter { $0.kind == kind }.reduce(0) { $0 + $1.duration }
@@ -184,6 +188,7 @@ public struct SleepSession: Equatable, Sendable {
             guard b[i] == 0xAF, b[i + 1] == 0xFA, recordLength >= headerSize else { break }
             let recordEnd = min(i + recordLength, b.count)
             var stages: [SleepStage] = []
+            var skipped = 0
             var j = i + headerSize
             while j + stageSize <= recordEnd {
                 if let kind = SleepStageKind(rawValue: b[j]), b.u24(j + 5) > 0 {
@@ -191,6 +196,8 @@ public struct SleepSession: Equatable, Sendable {
                         kind: kind,
                         start: RingTime.date(fromRingSeconds: b.u32(j + 1), timeZone: timeZone),
                         duration: TimeInterval(b.u24(j + 5))))
+                } else {
+                    skipped += 1
                 }
                 j += stageSize
             }
@@ -199,7 +206,7 @@ public struct SleepSession: Equatable, Sendable {
                 record: SleepSession(
                     start: RingTime.date(fromRingSeconds: b.u32(i + 4), timeZone: timeZone),
                     end: RingTime.date(fromRingSeconds: b.u32(i + 8), timeZone: timeZone),
-                    stages: stages),
+                    stages: stages, skippedStages: skipped),
                 offset: i, length: recordLength))
             i += recordLength
         }

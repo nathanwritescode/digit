@@ -117,6 +117,7 @@ extension RingStore {
             try applyActivity(db, ringID, derived.rows, &result)
             record(derived, rows: derived.rows.values.map(\.timeSource), into: &result)
         case .sleep:
+            var skippedByRow: [Int64: Int] = [:]
             let derived = try derive(
                 transfers, resolver, SleepSession.decodeLocated, reference: { $0.end },
                 times: { r in [r.start, r.end] + r.stages.flatMap { [$0.start, $0.end] } },
@@ -138,6 +139,7 @@ extension RingStore {
             ) { r, o in
                 let shift = -TimeInterval(o.seconds)
                 let start = r.start.addingTimeInterval(shift)
+                skippedByRow[ms(start)] = r.skippedStages
                 return (start, SleepSessionRecord(
                     start: start, end: r.end.addingTimeInterval(shift),
                     utcOffsetSeconds: o.seconds, ringLocalSeconds: ringSeconds(r.start), timeSource: o.source,
@@ -147,6 +149,7 @@ extension RingStore {
                     }))
             }
             try applySleep(db, ringID, derived.rows, &result)
+            result.skippedSleepStages = derived.rows.keys.reduce(0) { $0 + (skippedByRow[$1] ?? 0) }
             record(derived, rows: derived.rows.values.map(\.timeSource), into: &result)
         case .combined:
             throw RingStoreError.notIngestible(kind)
