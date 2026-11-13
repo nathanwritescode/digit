@@ -25,7 +25,8 @@ extension RingStore {
     /// that do not form a whole record are counted in `unusableBytes` (activity and heart-rate
     /// decoders ignore a trailing partial record; the sleep decoder stops at the first thing that
     /// is not a session record, or at a session cut short, so what follows it is counted and not
-    /// ingested), and a record before 2020 is counted and skipped.
+    /// ingested), and a record the sanity checks refuse is counted and skipped, in
+    /// `IngestionResult.rejectedImplausible` or `rejectedFuture`.
     @discardableResult
     public func ingest(ringID: UUID, kind: HistoryKind) throws -> IngestionResult {
         guard Self.ingestibleKinds.contains(kind) else { throw RingStoreError.notIngestible(kind) }
@@ -93,7 +94,7 @@ extension RingStore {
                 let instant = r.time.addingTimeInterval(-TimeInterval(o.seconds))
                 return (instant, HeartRateReading(
                     time: instant, bpm: r.bpm, mode: Int(r.mode), utcOffsetSeconds: o.seconds,
-                    ringLocalSeconds: ringSeconds(r.time), timeSource: o.source))
+                    ringLocalSeconds: RingTime.ringSeconds(fromWallClock: r.time), timeSource: o.source))
             }
             try applyHeartRate(db, ringID, derived.rows, &result)
             record(derived, rows: derived.rows.values.map(\.timeSource), into: &result)
@@ -112,7 +113,8 @@ extension RingStore {
                 return (start, ActivityInterval(
                     start: start, end: r.end.addingTimeInterval(shift), steps: r.steps,
                     distanceMeters: r.distanceMeters, kilocalories: r.kilocalories,
-                    utcOffsetSeconds: o.seconds, ringLocalSeconds: ringSeconds(r.start), timeSource: o.source))
+                    utcOffsetSeconds: o.seconds,
+                    ringLocalSeconds: RingTime.ringSeconds(fromWallClock: r.start), timeSource: o.source))
             }
             try applyActivity(db, ringID, derived.rows, &result)
             record(derived, rows: derived.rows.values.map(\.timeSource), into: &result)
@@ -138,14 +140,15 @@ extension RingStore {
                 },
                 startTime: { $0.start },
                 // Sessions with one ring-local start are one session the ring rewrote.
-                supersedeKey: { ringSeconds($0.start) }
+                supersedeKey: { RingTime.ringSeconds(fromWallClock: $0.start) }
             ) { r, o in
                 let shift = -TimeInterval(o.seconds)
                 let start = r.start.addingTimeInterval(shift)
                 skippedByRow[ms(start)] = r.skippedStages
                 return (start, SleepSessionRecord(
                     start: start, end: r.end.addingTimeInterval(shift),
-                    utcOffsetSeconds: o.seconds, ringLocalSeconds: ringSeconds(r.start), timeSource: o.source,
+                    utcOffsetSeconds: o.seconds,
+                    ringLocalSeconds: RingTime.ringSeconds(fromWallClock: r.start), timeSource: o.source,
                     stages: r.stages.map {
                         SleepStageEntry(
                             kind: $0.kind, start: $0.start.addingTimeInterval(shift), durationSeconds: Int($0.duration))
@@ -169,8 +172,6 @@ extension RingStore {
         for source in sources { result.rowsByTimeSource[source, default: 0] += 1 }
     }
 
-    /// Seconds since 2000-01-01 of a ring-local reading decoded as if UTC.
-    private static func ringSeconds(_ asIfUTC: Date) -> Int { Int(asIfUTC.timeIntervalSince1970 - 946_684_800) }
 
     /// One place a record's bytes were found.
     private struct Occurrence {
@@ -295,25 +296,25 @@ extension RingStore {
             ]
             if let row = existing.removeValue(forKey: key) {
                 if row.value == value { result.unchanged += 1; continue }
-                try db.execute(
+                try db.cachedStatement(
                     sql: """
                         UPDATE heart_rate_reading SET bpm = ?, mode = ?, utc_offset_seconds = ?, ring_local_seconds = ?,
                         time_source = ? WHERE id = ?
-                        """,
-                    arguments: args + [row.id])
+                        """
+                ).execute(arguments: args + [row.id])
                 result.updated += 1
             } else {
-                try db.execute(
+                try db.cachedStatement(
                     sql: """
                         INSERT INTO heart_rate_reading (bpm, mode, utc_offset_seconds, ring_local_seconds, time_source,
                         ring_id, time) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                    arguments: args + [ringID.uuidString, key])
+                        """
+                ).execute(arguments: args + [ringID.uuidString, key])
                 result.inserted += 1
             }
         }
         for row in existing.values {
-            try db.execute(sql: "DELETE FROM heart_rate_reading WHERE id = ?", arguments: [row.id])
+            try db.cachedStatement(sql: "DELETE FROM heart_rate_reading WHERE id = ?").execute(arguments: [row.id])
             result.deleted += 1
         }
     }
@@ -330,25 +331,25 @@ extension RingStore {
             ]
             if let row = existing.removeValue(forKey: key) {
                 if row.value == value { result.unchanged += 1; continue }
-                try db.execute(
+                try db.cachedStatement(
                     sql: """
                         UPDATE activity_interval SET "end" = ?, steps = ?, distance_meters = ?, kilocalories = ?,
                         utc_offset_seconds = ?, ring_local_seconds = ?, time_source = ? WHERE id = ?
-                        """,
-                    arguments: args + [row.id])
+                        """
+                ).execute(arguments: args + [row.id])
                 result.updated += 1
             } else {
-                try db.execute(
+                try db.cachedStatement(
                     sql: """
                         INSERT INTO activity_interval ("end", steps, distance_meters, kilocalories, utc_offset_seconds,
                         ring_local_seconds, time_source, ring_id, start) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                    arguments: args + [ringID.uuidString, key])
+                        """
+                ).execute(arguments: args + [ringID.uuidString, key])
                 result.inserted += 1
             }
         }
         for row in existing.values {
-            try db.execute(sql: "DELETE FROM activity_interval WHERE id = ?", arguments: [row.id])
+            try db.cachedStatement(sql: "DELETE FROM activity_interval WHERE id = ?").execute(arguments: [row.id])
             result.deleted += 1
         }
     }
@@ -362,40 +363,41 @@ extension RingStore {
             let sessionID: Int64
             if let row = existing.removeValue(forKey: key) {
                 if row.value == value { result.unchanged += 1; continue }
-                try db.execute(
+                try db.cachedStatement(
                     sql: """
                         UPDATE sleep_session SET "end" = ?, utc_offset_seconds = ?, ring_local_seconds = ?,
                         time_source = ? WHERE id = ?
-                        """,
-                    arguments: [
-                        ms(value.end), value.utcOffsetSeconds, value.ringLocalSeconds,
-                        TimeSourceCode.code(for: value.timeSource), row.id,
-                    ])
-                try db.execute(sql: "DELETE FROM sleep_stage WHERE session_id = ?", arguments: [row.id])
+                        """
+                ).execute(arguments: [
+                    ms(value.end), value.utcOffsetSeconds, value.ringLocalSeconds,
+                    TimeSourceCode.code(for: value.timeSource), row.id,
+                ])
+                try db.cachedStatement(sql: "DELETE FROM sleep_stage WHERE session_id = ?").execute(arguments: [row.id])
                 sessionID = row.id
                 result.updated += 1
             } else {
-                try db.execute(
+                try db.cachedStatement(
                     sql: """
                         INSERT INTO sleep_session (ring_id, start, "end", utc_offset_seconds, ring_local_seconds,
                         time_source) VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                    arguments: [
-                        ringID.uuidString, key, ms(value.end), value.utcOffsetSeconds, value.ringLocalSeconds,
-                        TimeSourceCode.code(for: value.timeSource),
-                    ])
+                        """
+                ).execute(arguments: [
+                    ringID.uuidString, key, ms(value.end), value.utcOffsetSeconds, value.ringLocalSeconds,
+                    TimeSourceCode.code(for: value.timeSource),
+                ])
                 sessionID = db.lastInsertedRowID
                 result.inserted += 1
             }
             for (ordinal, stage) in value.stages.enumerated() {
-                try db.execute(
-                    sql: "INSERT INTO sleep_stage (session_id, ordinal, kind, start, duration_seconds) VALUES (?, ?, ?, ?, ?)",
+                try db.cachedStatement(
+                    sql: "INSERT INTO sleep_stage (session_id, ordinal, kind, start, duration_seconds) VALUES (?, ?, ?, ?, ?)"
+                ).execute(
                     arguments: [sessionID, ordinal, StageCode.code(for: stage.kind), ms(stage.start), stage.durationSeconds])
             }
         }
         for row in existing.values {
             // The stages go with it (ON DELETE CASCADE).
-            try db.execute(sql: "DELETE FROM sleep_session WHERE id = ?", arguments: [row.id])
+            try db.cachedStatement(sql: "DELETE FROM sleep_session WHERE id = ?").execute(arguments: [row.id])
             result.deleted += 1
         }
     }
@@ -408,7 +410,7 @@ extension RingStore {
         case .sleep: table = "sleep_session"  // stages cascade
         case .combined: throw RingStoreError.notIngestible(kind)
         }
-        try db.execute(sql: "DELETE FROM \(table) WHERE ring_id = ?", arguments: [ringID.uuidString])
+        try db.cachedStatement(sql: "DELETE FROM \(table) WHERE ring_id = ?").execute(arguments: [ringID.uuidString])
     }
 
     // MARK: Reading rows

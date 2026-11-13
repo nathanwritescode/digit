@@ -111,6 +111,14 @@ private let utc = TimeZone(identifier: "UTC")!
     #expect(RingTime.date(fromRingSeconds: raw, timeZone: sixHoursBehind) == Date(timeIntervalSince1970: 1_767_225_600 + 6 * 3600))
 }
 
+@Test func ringSecondsFromWallClockInvertsTheAsIfUTCStep() {
+    // Synthetic values. 2000-01-01 00:00:00 is raw 0; 2026-01-01 00:00:00 is 9497 days later.
+    #expect(RingTime.ringSeconds(fromWallClock: Date(timeIntervalSince1970: 946_684_800)) == 0)
+    #expect(RingTime.ringSeconds(fromWallClock: Date(timeIntervalSince1970: 1_767_225_600)) == 9497 * 86400)
+    // A decoded record time in UTC round-trips back to the raw value.
+    #expect(RingTime.ringSeconds(fromWallClock: RingTime.date(fromRingSeconds: 123_456_789, timeZone: utc)) == 123_456_789)
+}
+
 // Synthetic records built from the documented layouts; replace with real captures once the ring has history.
 @Test func decodesActivityAndHeartRecords() {
     let activity = ActivityRecord.decode(hex("00000000 08070000 e803 bc02 2800"), timeZone: utc)

@@ -16,7 +16,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             let r1 = hrBytes(wall(at(1800), offset: 3600), bpm: 61)
             let r2 = hrBytes(wall(at(5400), offset: 3600), bpm: 62)
             try f.fetch(.heartRate, r1 + r2, at: at(7200))
@@ -40,7 +40,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.activity, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             func bucket(_ start: Double, _ offset: Int, steps: Int) -> [UInt8] {
                 activityBytes(start: wall(at(start), offset: offset), end: wall(at(start + 799), offset: offset), steps: steps)
             }
@@ -63,7 +63,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             let t = wall(at(1800), offset: 3600)
             try f.fetch(.heartRate, hrBytes(t, bpm: 60) + hrBytes(t, bpm: 61), at: at(3600))
             let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
@@ -79,7 +79,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.activity, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             try f.setClock(at: at(7200), offset: 0)  // clock back; that sync's fetch was missed
             // Both have the wall-clock start of real instant 9000 under offset 0: the first was
             // written under +3600 (real 5400), the second under 0.
@@ -100,7 +100,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             func ring(_ text: String) -> UInt32 {
-                UInt32(ISO8601DateFormatter().date(from: text)!.timeIntervalSince1970 - 946_684_800)
+                UInt32(RingTime.ringSeconds(fromWallClock: ISO8601DateFormatter().date(from: text)!))
             }
             let data = hrBytes(ring("2019-12-31T23:59:59Z"), bpm: 50) + hrBytes(ring("2020-01-01T00:00:00Z"), bpm: 51)
             try f.fetch(.heartRate, data, at: t0, zone: "UTC")
@@ -115,7 +115,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.sleep, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             let s = wall(at(1000), offset: 3600)
             let good = sleepBytes(start: s, end: s + 600, stages: [(242, s, 600)])
             // Starts in 2000 but ends in 2027.
@@ -140,7 +140,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             let a = hrBytes(wall(at(5400), offset: 3600), bpm: 58)  // wall clock 9000
             try f.fetch(.heartRate, a, at: at(7200))
             try f.setClock(at: at(7210), offset: 0)
@@ -161,7 +161,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.activity, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             // The same wall-clock bucket twice: real 4800-5400 under +3600, then real 8400-9000 under 0.
             let a = activityBytes(start: wall(at(4800), offset: 3600), end: wall(at(5400), offset: 3600), steps: 0)
             try f.fetch(.activity, a, at: at(7200))
@@ -186,7 +186,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.sleep, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             let start = wall(at(1000), offset: 3600)
             let v1 = sleepBytes(start: start, end: wall(at(3000), offset: 3600), stages: [(242, start, 1000)])
             try f.fetch(.sleep, v1, at: at(3500))
@@ -213,7 +213,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             let fetched = at(3600)
-            func ringSeconds(_ d: Date) -> UInt32 { UInt32(d.timeIntervalSince1970 - 946_684_800) }
+            func ringSeconds(_ d: Date) -> UInt32 { UInt32(RingTime.ringSeconds(fromWallClock: d)) }
             let inside = hrBytes(ringSeconds(fetched.addingTimeInterval(86_400)), bpm: 50)
             let outside = hrBytes(ringSeconds(fetched.addingTimeInterval(86_401)), bpm: 51)
             let allFF = [UInt8](repeating: 0xFF, count: 6)  // 255 bpm: implausible, not future
@@ -231,7 +231,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             let fetched = at(3600)
-            func ringSeconds(_ resolved: Date) -> UInt32 { UInt32(resolved.timeIntervalSince1970 - 18000 - 946_684_800) }
+            func ringSeconds(_ resolved: Date) -> UInt32 { UInt32(RingTime.ringSeconds(fromWallClock: resolved.addingTimeInterval(-18000))) }
             let inside = hrBytes(ringSeconds(fetched.addingTimeInterval(86_400)), bpm: 50)
             let outside = hrBytes(ringSeconds(fetched.addingTimeInterval(86_401)), bpm: 51)
             try f.fetch(.heartRate, inside + outside, at: fetched, zone: "America/New_York")
@@ -485,7 +485,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             for kind in [HistoryKind.heartRate, .activity, .sleep] { try f.fetch(kind, [], at: at(-10)) }
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             let w = wall(at(600), offset: 3600)
             try f.fetch(.heartRate, hrBytes(w, bpm: 60), at: at(3600))
             try f.fetch(.activity, activityBytes(start: w, end: w + 1799, steps: 1), at: at(3600))
@@ -505,7 +505,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.sleep, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             let s = wall(at(1000), offset: 3600)
             let stages = SleepStageKind.allCases.enumerated().map { (i, kind) in
                 (kind: kind.rawValue, start: s + UInt32(i * 100), seconds: 99)

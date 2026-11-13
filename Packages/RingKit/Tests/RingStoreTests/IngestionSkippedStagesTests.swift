@@ -85,7 +85,7 @@ struct IngestionSkippedStagesTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.sleep, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: plus1)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: plus1)
             try f.fetch(.sleep, [], at: at(7200))
             try f.setClock(at: at(7210), offset: 0)
             let aStart = wall(at(2100), offset: plus1)

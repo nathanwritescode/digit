@@ -2,7 +2,7 @@ import Foundation
 import RingProtocol
 
 /// How the UTC offset of a typed row was chosen. Stored as a frozen text code.
-public enum TimeSource: Equatable, Hashable, Sendable, CaseIterable {
+public enum TimeSource: Sendable, CaseIterable {
     /// The logs single out the clock-set that was in force when the record was written.
     case resolved
     /// Several clock-sets fit; the latest was used.
@@ -116,13 +116,6 @@ struct TimeResolver {
         }
         let lastAbsent = sightings.last { $0.dataLength <= offset && $0.fetchedAt < first.fetchedAt }?.fetchedAt
         return Window(firstSeen: first.fetchedAt, firstSeenZone: first.timeZoneIdentifier, lastAbsent: lastAbsent)
-    }
-
-    func resolve(
-        sightings: [Sighting], offset: Int, length: Int, reference: Date, start: Date? = nil
-    ) throws -> ResolvedOffset {
-        resolve(
-            window: try window(sightings: sightings, offset: offset, length: length), reference: reference, start: start)
     }
 
     /// The widest gap between two UTC offsets. A record stamped under the unknown clock the ring had

@@ -4,6 +4,14 @@ import Foundation
 public enum RingTime {
     private static let epochOffset: TimeInterval = 946_684_800
 
+    /// Seconds since 2000-01-01 of a wall-clock reading held as a `Date` as if it were UTC (what
+    /// the record decoders return before any time zone is applied). The inverse of the first step
+    /// of `date(fromRingSeconds:timeZone:)`. Pure arithmetic, no I/O. The result is negative for dates before 2000 and can exceed
+    /// `UInt32.max` for dates far past the ring's range, so a caller that narrows it must check.
+    public static func ringSeconds(fromWallClock asIfUTC: Date) -> Int {
+        Int(asIfUTC.timeIntervalSince1970 - epochOffset)
+    }
+
     public static func date(fromRingSeconds raw: UInt32, timeZone: TimeZone) -> Date {
         let asIfUTC = Date(timeIntervalSince1970: TimeInterval(raw) + epochOffset)
         // Two passes so the offset is taken at the real instant, not the wall-clock one.
