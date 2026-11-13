@@ -29,26 +29,40 @@ extension RingStore {
     /// `IngestionResult.rejectedImplausible` or `rejectedFuture`.
     @discardableResult
     public func ingest(ringID: UUID, kind: HistoryKind) throws -> IngestionResult {
+        try writer.write { db in try Self.checkedIngest(db, ringID: ringID, kind: kind) }
+    }
+
+    @discardableResult
+    public func ingest(ringID: UUID, kind: HistoryKind) async throws -> IngestionResult {
+        try await writer.write { db in try Self.checkedIngest(db, ringID: ringID, kind: kind) }
+    }
+
+    private static func checkedIngest(_ db: Database, ringID: UUID, kind: HistoryKind) throws -> IngestionResult {
         guard Self.ingestibleKinds.contains(kind) else { throw RingStoreError.notIngestible(kind) }
-        return try writer.write { db in
-            try Self.requireRing(db, ringID)
-            return try Self.ingest(db, ringID: ringID, kind: kind)
-        }
+        try Self.requireRing(db, ringID)
+        return try Self.ingest(db, ringID: ringID, kind: kind)
     }
 
     /// Deletes the ring's typed rows for activity, sleep and heart rate and derives them again from
     /// the stored transfers, in one transaction. The result is what `ingest` would converge on.
     @discardableResult
     public func rebuild(ringID: UUID) throws -> [HistoryKind: IngestionResult] {
-        try writer.write { db in
-            try Self.requireRing(db, ringID)
-            var results: [HistoryKind: IngestionResult] = [:]
-            for kind in Self.ingestibleKinds {
-                try Self.deleteTypedRows(db, ringID: ringID, kind: kind)
-                results[kind] = try Self.ingest(db, ringID: ringID, kind: kind)
-            }
-            return results
+        try writer.write { db in try Self.rebuild(db, ringID: ringID) }
+    }
+
+    @discardableResult
+    public func rebuild(ringID: UUID) async throws -> [HistoryKind: IngestionResult] {
+        try await writer.write { db in try Self.rebuild(db, ringID: ringID) }
+    }
+
+    private static func rebuild(_ db: Database, ringID: UUID) throws -> [HistoryKind: IngestionResult] {
+        try Self.requireRing(db, ringID)
+        var results: [HistoryKind: IngestionResult] = [:]
+        for kind in Self.ingestibleKinds {
+            try Self.deleteTypedRows(db, ringID: ringID, kind: kind)
+            results[kind] = try Self.ingest(db, ringID: ringID, kind: kind)
         }
+        return results
     }
 
     /// All heart-rate readings for a ring, oldest first.
@@ -56,14 +70,26 @@ extension RingStore {
         try writer.read { db in try Self.heartRateRows(db, ringID: ringID) }
     }
 
+    public func heartRateReadings(ringID: UUID) async throws -> [StoredRow<HeartRateReading>] {
+        try await writer.read { db in try Self.heartRateRows(db, ringID: ringID) }
+    }
+
     /// All activity intervals for a ring, oldest first.
     public func activityIntervals(ringID: UUID) throws -> [StoredRow<ActivityInterval>] {
         try writer.read { db in try Self.activityRows(db, ringID: ringID) }
     }
 
+    public func activityIntervals(ringID: UUID) async throws -> [StoredRow<ActivityInterval>] {
+        try await writer.read { db in try Self.activityRows(db, ringID: ringID) }
+    }
+
     /// All sleep sessions for a ring, oldest first, with their stages in order.
     public func sleepSessions(ringID: UUID) throws -> [StoredRow<SleepSessionRecord>] {
         try writer.read { db in try Self.sleepRows(db, ringID: ringID) }
+    }
+
+    public func sleepSessions(ringID: UUID) async throws -> [StoredRow<SleepSessionRecord>] {
+        try await writer.read { db in try Self.sleepRows(db, ringID: ringID) }
     }
 
     // MARK: Derivation

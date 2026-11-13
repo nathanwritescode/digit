@@ -207,9 +207,12 @@ struct RingStoreTests {
     }
 
     @Test func ringTableHoldsNoDeviceIdentifiers() throws {
-        // Only an app-generated id plus family, model, firmware and first-seen time.
+        // An app-generated id plus family, model, firmware and first-seen time, and (v4) the
+        // identifier CoreBluetooth gave this phone for the ring: a per-phone UUID, not the
+        // Bluetooth address, name suffix or serial number. Anything else added here needs the
+        // same justification.
         let columns = try RingStore().writer.read { db in try db.columns(in: "ring").map(\.name) }
-        #expect(columns == ["id", "protocol_family", "model", "firmware", "first_seen_at"])
+        #expect(columns == ["id", "protocol_family", "model", "firmware", "first_seen_at", "peripheral_identifier"])
     }
 
     @Test func storageCodesForKindsAreFrozen() {
@@ -296,7 +299,7 @@ struct RingStoreTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = try RingStore(url: dir.appendingPathComponent("ring.sqlite"))
-        let ring = try store.registerRing(protocolFamily: "ycbt")
+        let ring = try sync(store).registerRing(protocolFamily: "ycbt")
         let ringID = ring.id
         let outcomes = try await withThrowingTaskGroup(of: InsertOutcome.self) { group in
             for i in 0..<32 {
@@ -311,6 +314,6 @@ struct RingStoreTests {
         let inserted = outcomes.filter { if case .inserted = $0 { true } else { false } }
         #expect(inserted.count == 1)
         #expect(outcomes.count == 32)
-        #expect(try store.transfers(ringID: ringID).transfers.count == 1)
+        #expect(try sync(store).transfers(ringID: ringID).transfers.count == 1)
     }
 }
