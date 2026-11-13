@@ -117,12 +117,12 @@ struct PruningTests {
             #expect(throws: DatabaseError.self) { try store.insert(transfer(data: [1, 2, 3]), ringID: ring.id) }
             #expect(try rows(store, ring.id) == [[1, 2]])
             // The incoming transfer's observation was written first; it must have rolled back too.
-            #expect(try store.observations(ringID: ring.id).map(\.dataLength) == [2])
+            #expect(try store.observations(ringID: ring.id).observations.map(\.dataLength) == [2])
             try store.writer.write { db in try db.execute(sql: "DROP TRIGGER block_delete") }
             guard case .inserted(_, 1) = try store.insert(transfer(data: [1, 2, 3]), ringID: ring.id)
             else { Issue.record("expected insert pruning one"); return }
             #expect(try rows(store, ring.id) == [[1, 2, 3]])
-            #expect(try store.observations(ringID: ring.id).map(\.dataLength) == [2, 3])
+            #expect(try store.observations(ringID: ring.id).observations.map(\.dataLength) == [2, 3])
         }
     }
 
@@ -135,7 +135,7 @@ struct PruningTests {
             try store.insert(
                 transfer(data: [1, 2, 3], header: [0xC], at: t0.addingTimeInterval(20), zone: "UTC"), ringID: ring.id)
             #expect(try rows(store, ring.id) == [[1, 2, 3]])
-            let obs = try store.observations(ringID: ring.id)
+            let obs = try store.observations(ringID: ring.id).observations
             #expect(obs.map(\.dataLength) == [1, 2, 3])
             #expect(obs.map(\.header) == [[0xA], [0xB], [0xC]])
             #expect(obs.map(\.fetchedAt) == [t0, t0.addingTimeInterval(10), t0.addingTimeInterval(20)])
@@ -155,10 +155,10 @@ struct PruningTests {
             let ring = try store.registerRing(protocolFamily: "ycbt")
             try store.insert(transfer(data: [1, 2], at: t0), ringID: ring.id)
             try store.insert(transfer(data: [1, 2], at: t0), ringID: ring.id)  // exactly the same fetch
-            #expect(try store.observations(ringID: ring.id).count == 1)
+            #expect(try store.observations(ringID: ring.id).observations.count == 1)
             let outcome = try store.insert(transfer(data: [1, 2], header: [4], at: t0.addingTimeInterval(60)), ringID: ring.id)
             guard case .duplicate = outcome else { Issue.record("expected duplicate"); return }
-            #expect(try store.observations(ringID: ring.id).map(\.fetchedAt) == [t0, t0.addingTimeInterval(60)])
+            #expect(try store.observations(ringID: ring.id).observations.map(\.fetchedAt) == [t0, t0.addingTimeInterval(60)])
             #expect(try rows(store, ring.id) == [[1, 2]])
         }
     }
@@ -170,7 +170,7 @@ struct PruningTests {
             guard case .inserted(let id, _) = try store.insert(transfer(data: [1, 2], at: t2), ringID: ring.id)
             else { Issue.record("expected insert"); return }
             #expect(try store.insert(transfer(data: [1, 2], at: t0), ringID: ring.id) == .duplicate(existingID: id))
-            #expect(try store.observations(ringID: ring.id).map(\.fetchedAt) == [t0, t2])
+            #expect(try store.observations(ringID: ring.id).observations.map(\.fetchedAt) == [t0, t2])
         }
     }
 
@@ -180,11 +180,11 @@ struct PruningTests {
             try store.insert(transfer(data: [1], at: t0.addingTimeInterval(300)), ringID: ring.id)
             try store.insert(transfer(data: [2], at: t0.addingTimeInterval(100)), ringID: ring.id)
             try store.insert(transfer(data: [3], at: t0.addingTimeInterval(200)), ringID: ring.id)
-            #expect(try store.observations(ringID: ring.id).map(\.dataLength) == [1, 1, 1])
+            #expect(try store.observations(ringID: ring.id).observations.map(\.dataLength) == [1, 1, 1])
             #expect(
-                try store.observations(ringID: ring.id).map(\.fetchedAt)
+                try store.observations(ringID: ring.id).observations.map(\.fetchedAt)
                     == [100, 200, 300].map { t0.addingTimeInterval($0) })
-            #expect(try store.observations(ringID: ring.id).first?.contentHash
+            #expect(try store.observations(ringID: ring.id).observations.first?.contentHash
                 == RingStore.contentHash(ringID: ring.id, kind: .heartRate, data: [2]))
         }
     }
@@ -196,7 +196,7 @@ struct PruningTests {
             let later = t0.addingTimeInterval(99)
             try store.insert(transfer(data: [1, 2], header: [5], at: later, zone: "Asia/Tokyo"), ringID: ring.id)
             #expect(try rows(store, ring.id) == [[1, 2, 3, 4]])
-            let obs = try store.observations(ringID: ring.id)
+            let obs = try store.observations(ringID: ring.id).observations
             #expect(obs.count == 2)
             #expect(obs.last?.dataLength == 2)
             #expect(obs.last?.header == [5])
@@ -210,7 +210,7 @@ struct PruningTests {
             let ring = try store.registerRing(protocolFamily: "ycbt")
             try store.insert(transfer(data: [1]), ringID: ring.id)
             try store.insert(transfer(data: [], at: t0.addingTimeInterval(5)), ringID: ring.id)
-            #expect(try store.observations(ringID: ring.id).map(\.dataLength) == [1, 0])
+            #expect(try store.observations(ringID: ring.id).observations.map(\.dataLength) == [1, 0])
             #expect(try rows(store, ring.id) == [[1]])
         }
     }
@@ -223,10 +223,10 @@ struct PruningTests {
             try store.insert(transfer(.heartRate, data: [1, 2]), ringID: a.id)
             try store.insert(transfer(.sleep, data: [1]), ringID: a.id)
             try store.insert(transfer(.heartRate, data: [1]), ringID: b.id)
-            #expect(try store.observations(ringID: a.id).count == 3)
-            #expect(try store.observations(ringID: a.id, kind: .heartRate).count == 2)
-            #expect(try store.observations(ringID: a.id, kind: .sleep).count == 1)
-            #expect(try store.observations(ringID: b.id).count == 1)
+            #expect(try store.observations(ringID: a.id).observations.count == 3)
+            #expect(try store.observations(ringID: a.id, kind: .heartRate).observations.count == 2)
+            #expect(try store.observations(ringID: a.id, kind: .sleep).observations.count == 1)
+            #expect(try store.observations(ringID: b.id).observations.count == 1)
         }
     }
 
@@ -259,7 +259,7 @@ struct PruningTests {
             }
         }
         let store = try RingStore(url: url)
-        let backfilled = try store.observations(ringID: ringID)
+        let backfilled = try store.observations(ringID: ringID).observations
         #expect(backfilled.map(\.dataLength) == [1, 2, 3])
         #expect(backfilled.map(\.fetchedAt) == [1, 2, 3].map { Date(timeIntervalSince1970: Double($0)) })
         #expect(backfilled.map(\.contentHash)
@@ -269,7 +269,7 @@ struct PruningTests {
         else { Issue.record("expected insert"); return }
         #expect(pruned == 3)
         #expect(try rows(store, ringID) == [[1, 2, 3, 4]])
-        #expect(try store.observations(ringID: ringID).count == 4)
+        #expect(try store.observations(ringID: ringID).observations.count == 4)
     }
 
     @Test func concurrentGrowingInsertsEndWithTheLongest() async throws {

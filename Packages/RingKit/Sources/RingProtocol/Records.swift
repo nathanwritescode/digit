@@ -44,6 +44,24 @@ public struct CurrentActivity: Equatable, Sendable {
     }
 }
 
+/// A decoded record with the bytes it came from, so ingestion can tell which fetch first
+/// contained it. `offset` and `length` are in bytes within the data that was decoded. For a sleep
+/// session `length` is the record's declared length, which can run past the end of the data when
+/// the data is cut short; callers that need whole records check `offset + length <= data.count`.
+public struct Located<Record: Sendable>: Sendable {
+    public let record: Record
+    public let offset: Int
+    public let length: Int
+
+    public init(record: Record, offset: Int, length: Int) {
+        self.record = record
+        self.offset = offset
+        self.length = length
+    }
+}
+
+extension Located: Equatable where Record: Equatable {}
+
 /// One stored activity interval (history kind `.activity`, 14 bytes each).
 /// On an R99 (firmware 2.32) the records were 30-minute buckets, and their step counts agreed with
 /// the combined record for the same hour. Verified against one real night; test fixtures are synthetic.
@@ -54,14 +72,23 @@ public struct ActivityRecord: Equatable, Sendable {
     public var distanceMeters: Int
     public var kilocalories: Int
 
+    public static let size = 14
+
     public static func decode(_ b: [UInt8], timeZone: TimeZone) -> [ActivityRecord] {
-        stride(from: 0, to: b.count - 13, by: 14).map { i in
-            ActivityRecord(
-                start: RingTime.date(fromRingSeconds: b.u32(i), timeZone: timeZone),
-                end: RingTime.date(fromRingSeconds: b.u32(i + 4), timeZone: timeZone),
-                steps: Int(b.u16(i + 8)),
-                distanceMeters: Int(b.u16(i + 10)),
-                kilocalories: Int(b.u16(i + 12)))
+        decodeLocated(b, timeZone: timeZone).map(\.record)
+    }
+
+    /// Whole records with their byte ranges; a trailing partial record is ignored.
+    public static func decodeLocated(_ b: [UInt8], timeZone: TimeZone) -> [Located<ActivityRecord>] {
+        stride(from: 0, to: b.count - (size - 1), by: size).map { i in
+            Located(
+                record: ActivityRecord(
+                    start: RingTime.date(fromRingSeconds: b.u32(i), timeZone: timeZone),
+                    end: RingTime.date(fromRingSeconds: b.u32(i + 4), timeZone: timeZone),
+                    steps: Int(b.u16(i + 8)),
+                    distanceMeters: Int(b.u16(i + 10)),
+                    kilocalories: Int(b.u16(i + 12))),
+                offset: i, length: size)
         }
     }
 }
@@ -75,17 +102,26 @@ public struct HeartRateRecord: Equatable, Sendable {
     public var mode: UInt8
     public var bpm: Int
 
+    public static let size = 6
+
     public static func decode(_ b: [UInt8], timeZone: TimeZone) -> [HeartRateRecord] {
-        stride(from: 0, to: b.count - 5, by: 6).map { i in
-            HeartRateRecord(
-                time: RingTime.date(fromRingSeconds: b.u32(i), timeZone: timeZone),
-                mode: b[i + 4],
-                bpm: Int(b[i + 5]))
+        decodeLocated(b, timeZone: timeZone).map(\.record)
+    }
+
+    /// Whole records with their byte ranges; a trailing partial record is ignored.
+    public static func decodeLocated(_ b: [UInt8], timeZone: TimeZone) -> [Located<HeartRateRecord>] {
+        stride(from: 0, to: b.count - (size - 1), by: size).map { i in
+            Located(
+                record: HeartRateRecord(
+                    time: RingTime.date(fromRingSeconds: b.u32(i), timeZone: timeZone),
+                    mode: b[i + 4],
+                    bpm: Int(b[i + 5])),
+                offset: i, length: size)
         }
     }
 }
 
-public enum SleepStageKind: UInt8, Sendable {
+public enum SleepStageKind: UInt8, CaseIterable, Sendable {
     case deep = 241
     case light = 242
     case rem = 243
@@ -132,8 +168,15 @@ public struct SleepSession: Equatable, Sendable {
     }
 
     public static func decode(_ b: [UInt8], timeZone: TimeZone) -> [SleepSession] {
+        decodeLocated(b, timeZone: timeZone).map(\.record)
+    }
+
+    /// Sessions with their byte ranges. Decoding stops at the first thing that is not a session
+    /// record, so bytes after it are not reported. A session cut short by the end of the data is
+    /// still returned (as `decode` always did), with its declared `length` running past the data.
+    public static func decodeLocated(_ b: [UInt8], timeZone: TimeZone) -> [Located<SleepSession>] {
         let headerSize = 20, stageSize = 8
-        var sessions: [SleepSession] = []
+        var sessions: [Located<SleepSession>] = []
         var i = 0
         while i + headerSize <= b.count {
             let recordLength = Int(b.u16(i + 2))
@@ -152,10 +195,12 @@ public struct SleepSession: Equatable, Sendable {
                 j += stageSize
             }
             stages.sort { $0.start < $1.start }
-            sessions.append(SleepSession(
-                start: RingTime.date(fromRingSeconds: b.u32(i + 4), timeZone: timeZone),
-                end: RingTime.date(fromRingSeconds: b.u32(i + 8), timeZone: timeZone),
-                stages: stages))
+            sessions.append(Located(
+                record: SleepSession(
+                    start: RingTime.date(fromRingSeconds: b.u32(i + 4), timeZone: timeZone),
+                    end: RingTime.date(fromRingSeconds: b.u32(i + 8), timeZone: timeZone),
+                    stages: stages),
+                offset: i, length: recordLength))
             i += recordLength
         }
         return sessions

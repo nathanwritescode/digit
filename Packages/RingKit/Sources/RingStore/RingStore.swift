@@ -212,8 +212,14 @@ public final class RingStore: Sendable {
 
     /// The fetch log for a ring, optionally of one kind: one entry per distinct fetch (same data
     /// at the same instant counts once) whether or not its transfer row still exists, ordered by
-    /// fetch time then row id. Rows with a kind code this version does not know are skipped.
-    public func observations(ringID: UUID, kind: HistoryKind? = nil) throws -> [TransferObservation] {
+    /// fetch time then row id. Rows with a kind code this version does not know are left out and
+    /// counted in `ObservationListing.skippedUnknownKind`, so a skipped row is not read as "no
+    /// fetch". (With `kind` given, no unknown row can match, so the count is 0.)
+    public func observations(ringID: UUID, kind: HistoryKind? = nil) throws -> ObservationListing {
+        try writer.read { db in try Self.observations(db, ringID: ringID, kind: kind) }
+    }
+
+    static func observations(_ db: Database, ringID: UUID, kind: HistoryKind?) throws -> ObservationListing {
         var sql = "SELECT * FROM transfer_observation WHERE ring_id = ?"
         var arguments: [any DatabaseValueConvertible] = [ringID.uuidString]
         if let kind {
@@ -221,18 +227,21 @@ public final class RingStore: Sendable {
             arguments.append(KindCode.code(for: kind))
         }
         sql += " ORDER BY fetched_at, id"
-        return try writer.read { db in
-            try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments)).compactMap { row in
-                guard let kind = KindCode.kind(forCode: try Self.column(row, "kind")) else { return nil }
-                let header: Data = try Self.column(row, "header")
-                return TransferObservation(
-                    id: try Self.column(row, "id"), ringID: try Self.uuid(try Self.column(row, "ring_id")),
-                    kind: kind, dataLength: try Self.column(row, "data_length"), header: [UInt8](header),
-                    contentHash: [UInt8](try Self.column(row, "content_hash") as Data),
-                    fetchedAt: HistoryTransfer.date(millisecondsSince1970: try Self.column(row, "fetched_at")),
-                    timeZoneIdentifier: try Self.column(row, "time_zone_identifier"))
+        var listing = ObservationListing(observations: [], skippedUnknownKind: 0)
+        for row in try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments)) {
+            guard let kind = KindCode.kind(forCode: try Self.column(row, "kind")) else {
+                listing.skippedUnknownKind += 1
+                continue
             }
+            let header: Data = try Self.column(row, "header")
+            listing.observations.append(TransferObservation(
+                id: try Self.column(row, "id"), ringID: try Self.uuid(try Self.column(row, "ring_id")),
+                kind: kind, dataLength: try Self.column(row, "data_length"), header: [UInt8](header),
+                contentHash: [UInt8](try Self.column(row, "content_hash") as Data),
+                fetchedAt: HistoryTransfer.date(millisecondsSince1970: try Self.column(row, "fetched_at")),
+                timeZoneIdentifier: try Self.column(row, "time_zone_identifier")))
         }
+        return listing
     }
 
     /// Transfers for a ring, optionally of one kind and within a fetched-at range, oldest first
@@ -248,6 +257,12 @@ public final class RingStore: Sendable {
     public func transfers(
         ringID: UUID, kind: HistoryKind? = nil, fetchedWithin range: ClosedRange<Date>? = nil
     ) throws -> TransferListing {
+        try writer.read { db in try Self.transfers(db, ringID: ringID, kind: kind, fetchedWithin: range) }
+    }
+
+    static func transfers(
+        _ db: Database, ringID: UUID, kind: HistoryKind?, fetchedWithin range: ClosedRange<Date>?
+    ) throws -> TransferListing {
         var clauses = ["ring_id = ?"]
         var arguments: [any DatabaseValueConvertible] = [ringID.uuidString]
         if let kind {
@@ -260,17 +275,15 @@ public final class RingStore: Sendable {
             arguments.append(HistoryTransfer.millisecondsSince1970(range.upperBound))
         }
         let sql = "SELECT * FROM history_transfer WHERE \(clauses.joined(separator: " AND ")) ORDER BY fetched_at, id"
-        return try writer.read { db in
-            var listing = TransferListing(transfers: [], skippedUnknownKind: 0)
-            for row in try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments)) {
-                if let stored = try Self.storedTransfer(row) {
-                    listing.transfers.append(stored)
-                } else {
-                    listing.skippedUnknownKind += 1
-                }
+        var listing = TransferListing(transfers: [], skippedUnknownKind: 0)
+        for row in try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments)) {
+            if let stored = try Self.storedTransfer(row) {
+                listing.transfers.append(stored)
+            } else {
+                listing.skippedUnknownKind += 1
             }
-            return listing
         }
+        return listing
     }
 
     // MARK: Clock sets
@@ -289,16 +302,18 @@ public final class RingStore: Sendable {
 
     /// Clock-set events for a ring in time order (ties in the order recorded).
     public func clockSets(ringID: UUID) throws -> [ClockSetEvent] {
-        try writer.read { db in
-            try Row.fetchAll(
-                db, sql: "SELECT * FROM clock_set WHERE ring_id = ? ORDER BY instant, id", arguments: [ringID.uuidString]
-            ).map { row in
-                ClockSetEvent(
-                    ringID: try Self.uuid(try Self.column(row, "ring_id")),
-                    instant: HistoryTransfer.date(millisecondsSince1970: try Self.column(row, "instant")),
-                    timeZoneIdentifier: try Self.column(row, "time_zone_identifier"),
-                    utcOffsetSeconds: try Self.column(row, "utc_offset_seconds"))
-            }
+        try writer.read { db in try Self.clockSets(db, ringID: ringID) }
+    }
+
+    static func clockSets(_ db: Database, ringID: UUID) throws -> [ClockSetEvent] {
+        try Row.fetchAll(
+            db, sql: "SELECT * FROM clock_set WHERE ring_id = ? ORDER BY instant, id", arguments: [ringID.uuidString]
+        ).map { row in
+            ClockSetEvent(
+                ringID: try Self.uuid(try Self.column(row, "ring_id")),
+                instant: HistoryTransfer.date(millisecondsSince1970: try Self.column(row, "instant")),
+                timeZoneIdentifier: try Self.column(row, "time_zone_identifier"),
+                utcOffsetSeconds: try Self.column(row, "utc_offset_seconds"))
         }
     }
 
@@ -399,6 +414,61 @@ public final class RingStore: Sendable {
                 FROM history_transfer ORDER BY id;
                 """)
         }
+        // Typed rows derived from the raw transfers by `ingest`. Deliberately no reference to
+        // `history_transfer` (pruning deletes transfer rows, and a transfer's hash changes whenever
+        // its buffer grows) and no provenance columns: rows are always re-derived. `kind` and
+        // `time_source` hold frozen text codes (see `StageCode`, `TimeSourceCode`), unchecked like
+        // `history_transfer.kind` so a later code needs no table rebuild.
+        migrator.registerMigration("v3") { db in
+            try db.execute(sql: """
+                CREATE TABLE heart_rate_reading (
+                    id INTEGER PRIMARY KEY,
+                    ring_id TEXT NOT NULL REFERENCES ring(id),
+                    time INTEGER NOT NULL,
+                    bpm INTEGER NOT NULL,
+                    mode INTEGER NOT NULL,
+                    utc_offset_seconds INTEGER NOT NULL,
+                    ring_local_seconds INTEGER NOT NULL,
+                    time_source TEXT NOT NULL,
+                    UNIQUE (ring_id, time)
+                ) STRICT;
+
+                CREATE TABLE activity_interval (
+                    id INTEGER PRIMARY KEY,
+                    ring_id TEXT NOT NULL REFERENCES ring(id),
+                    start INTEGER NOT NULL,
+                    "end" INTEGER NOT NULL,
+                    steps INTEGER NOT NULL,
+                    distance_meters INTEGER NOT NULL,
+                    kilocalories INTEGER NOT NULL,
+                    utc_offset_seconds INTEGER NOT NULL,
+                    ring_local_seconds INTEGER NOT NULL,
+                    time_source TEXT NOT NULL,
+                    UNIQUE (ring_id, start)
+                ) STRICT;
+
+                CREATE TABLE sleep_session (
+                    id INTEGER PRIMARY KEY,
+                    ring_id TEXT NOT NULL REFERENCES ring(id),
+                    start INTEGER NOT NULL,
+                    "end" INTEGER NOT NULL,
+                    utc_offset_seconds INTEGER NOT NULL,
+                    ring_local_seconds INTEGER NOT NULL,
+                    time_source TEXT NOT NULL,
+                    UNIQUE (ring_id, start)
+                ) STRICT;
+
+                CREATE TABLE sleep_stage (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER NOT NULL REFERENCES sleep_session(id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    start INTEGER NOT NULL,
+                    duration_seconds INTEGER NOT NULL,
+                    UNIQUE (session_id, ordinal)
+                ) STRICT;
+                """)
+        }
         return migrator
     }
 
@@ -441,7 +511,7 @@ public final class RingStore: Sendable {
     // MARK: Row conversion
 
     /// Decodes a column, turning any failure into `corruptRow` (GRDB's subscript would trap).
-    private static func column<T: DatabaseValueConvertible>(_ row: Row, _ name: String) throws -> T {
+    static func column<T: DatabaseValueConvertible>(_ row: Row, _ name: String) throws -> T {
         do {
             return try row.decode(T.self, forColumn: name)
         } catch {
@@ -449,12 +519,12 @@ public final class RingStore: Sendable {
         }
     }
 
-    private static func uuid(_ text: String) throws -> UUID {
+    static func uuid(_ text: String) throws -> UUID {
         guard let id = UUID(uuidString: text) else { throw RingStoreError.corruptRow("ring id") }
         return id
     }
 
-    private static func requireRing(_ db: Database, _ id: UUID) throws {
+    static func requireRing(_ db: Database, _ id: UUID) throws {
         let exists = try Bool.fetchOne(db, sql: "SELECT EXISTS (SELECT 1 FROM ring WHERE id = ?)", arguments: [id.uuidString])
         if exists != true { throw RingStoreError.unknownRing(id) }
     }
