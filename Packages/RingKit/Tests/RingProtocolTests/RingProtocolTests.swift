@@ -283,6 +283,24 @@ private let combinedB = "100e0000 0a00 50 00 00 62 11 26 1f 2a05 0000 00 ccdd"
     #expect(exactly100.spo2 == 100)
 }
 
+// SYNTHETIC bytes. 255 in SpO2, respiration, HRV or CVRR is a filler, not a reading; heart rate is unchanged.
+@Test func combinedValueOf255IsAbsentInTheFourVitals() throws {
+    let r = try #require(CombinedRecord.decode(hex("3c000000 0000 ff 00 00 ff ff ff ff 0000 0000 00 0000"), timeZone: utc).first)
+    #expect(r.spo2 == nil && r.respirationRate == nil && r.hrv == nil && r.cvrr == nil)
+    #expect(r.heartRate == 255)
+    let mixed = try #require(CombinedRecord.decode(hex("3c000000 0000 00 00 00 61 ff 25 ff 0000 0000 00 0000"), timeZone: utc).first)
+    #expect(mixed.spo2 == 97 && mixed.respirationRate == nil && mixed.hrv == 37 && mixed.cvrr == nil)
+}
+
+@Test func combinedDecodeLocatedReportsByteRangesAndMatchesDecode() throws {
+    let bytes = hex(combinedA + combinedB + "01020304050607")
+    let located = CombinedRecord.decodeLocated(bytes, timeZone: utc)
+    #expect(located.map(\.offset) == [0, 20])
+    #expect(located.map(\.length) == [20, 20])
+    #expect(located.map(\.record) == CombinedRecord.decode(bytes, timeZone: utc))
+    #expect(CombinedRecord.decodeLocated(Array(bytes.prefix(19)), timeZone: utc).isEmpty)
+}
+
 @Test func decodesSeveralCombinedRecordsAndIgnoresTruncation() throws {
     let records = CombinedRecord.decode(hex(combinedA + combinedB + "01020304050607"), timeZone: utc)
     #expect(records.count == 2)

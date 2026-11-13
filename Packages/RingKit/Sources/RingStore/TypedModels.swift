@@ -2,8 +2,8 @@ import Foundation
 import RingProtocol
 
 // Typed rows derived from raw transfers. Instants are real instants (the ring's wall-clock
-// reading minus `utcOffsetSeconds`), in whole milliseconds in the database. Nothing here comes
-// from the combined record.
+// reading minus `utcOffsetSeconds`), in whole milliseconds in the database. From the combined
+// record only `VitalsReading` is derived, and only SpO2, respiration, HRV and CVRR.
 
 /// A typed row with its database id. Ids stay the same across repeated ingestion while the row's
 /// key is still derived; compare `value`s, not ids, when comparing two databases.
@@ -22,6 +22,21 @@ public struct HeartRateReading: Equatable, Sendable {
     /// resolved instant it never changes, but it is not unique either: the hour repeated after the
     /// clock goes back, or two readings in one ring second, share it. Part of what identifies a
     /// record, not all of it (#12, #14 decide the exact key).
+    public var ringLocalSeconds: Int
+    public var timeSource: TimeSource
+}
+
+/// SpO2, respiration rate, HRV and CVRR from one combined record. A nil value was absent (0 or 255,
+/// or SpO2 outside 1...100); it is never a stored zero. Heart rate and steps of the combined record
+/// are not here (the heart-rate and activity records supply them), nor are the vendor estimates.
+public struct VitalsReading: Equatable, Sendable {
+    public var time: Date
+    public var spo2: Int?
+    public var respirationRate: Int?
+    public var hrv: Int?
+    public var cvrr: Int?
+    public var utcOffsetSeconds: Int
+    /// The record's raw ring time; see `HeartRateReading.ringLocalSeconds`.
     public var ringLocalSeconds: Int
     public var timeSource: TimeSource
 }
@@ -89,6 +104,10 @@ public struct IngestionResult: Equatable, Sendable {
     /// not add it up across syncs. Those stages (unknown kind byte or zero duration) are not stored; the raw bytes are.
     /// Always 0 for heart rate and activity.
     public var skippedSleepStages = 0
+    /// Combined records only: distinct records in which SpO2, respiration, HRV and CVRR were all
+    /// absent. They produce no row and are not rejected (the ring logged a reading with nothing
+    /// measured, such as heart rate only). Always 0 for other kinds.
+    public var withoutVitals = 0
 }
 
 /// The strings stored in `sleep_stage.kind`. NEVER CHANGE an existing code; no default, so a new
