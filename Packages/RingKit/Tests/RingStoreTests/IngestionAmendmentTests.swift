@@ -278,6 +278,50 @@ struct IngestionAmendmentTests {
         }
     }
 
+    // MARK: A session that spans an offset change (P), through ingestion
+
+    /// The clock goes back from -14400 to -18000 at t0. The session truly started at t0 - 1800 (stamped
+    /// under the old clock, ring-local t0 - 16200) and ended at t0 + 18000 (stamped under the new one,
+    /// ring-local t0). The stage lies inside the ring-local bounds, so the session is not rejected.
+    @Test func aSleepSessionStartedBeforeTheClockWentBackIsAmbiguousThroughIngestion() throws {
+        try onEachStore { store in
+            let f = try Fixture(store)
+            try f.setClock(at: at(-200_000), offset: -14400)
+            try f.fetch(.sleep, [], at: at(-600))
+            try f.setClock(at: at(0), offset: -18000)
+            let start = wall(at(-1800), offset: -14400)
+            let end = wall(at(18_000), offset: -18000)
+            try f.fetch(.sleep, sleepBytes(start: start, end: end, stages: [(242, start, 16_000)]), at: at(21_600))
+            let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
+            #expect(result.inserted == 1 && result.rejectedImplausible == 0)
+            let row = try #require(try store.sleepSessions(ringID: f.ring.id).first).value
+            #expect(row.timeSource == .ambiguous && row.utcOffsetSeconds == -18000 && row.end == at(18_000))
+        }
+    }
+
+    // MARK: First-sync coverage (L), through ingestion
+
+    /// No earlier clock-set: the ring's first logged clock-set is at t0. Rows written on the first day
+    /// (within 26 hours plus the tolerance) are `ambiguous`, the same kinds past that are `resolved`.
+    @Test func onARingsFirstDayRowsAreAmbiguousAndAfterwardsResolved() throws {
+        try onEachStore { store in
+            let f = try Fixture(store)
+            for kind in [HistoryKind.heartRate, .activity, .sleep] { try f.fetch(kind, [], at: at(-10)) }
+            try f.setClock(at: at(0), offset: plus1)  // the first clock-set, with no earlier one
+            let early = 1800.0, late = 26.0 * 3600 + 600
+            func w(_ real: Double) -> UInt32 { wall(at(real), offset: plus1) }
+            try f.fetch(.heartRate, hrBytes(w(early), bpm: 60) + hrBytes(w(late), bpm: 61), at: at(100_000))
+            try f.fetch(.activity, activityBytes(start: w(early - 600), end: w(early), steps: 1)
+                + activityBytes(start: w(late - 600), end: w(late), steps: 2), at: at(100_000))
+            try f.fetch(.sleep, sleepBytes(start: w(early - 900), end: w(early), stages: [(242, w(early - 900), 900)])
+                + sleepBytes(start: w(late - 900), end: w(late), stages: [(242, w(late - 900), 900)]), at: at(100_000))
+            for kind in [HistoryKind.heartRate, .activity, .sleep] { try store.ingest(ringID: f.ring.id, kind: kind) }
+            #expect(try store.heartRateReadings(ringID: f.ring.id).map(\.value.timeSource) == [.ambiguous, .resolved])
+            #expect(try store.activityIntervals(ringID: f.ring.id).map(\.value.timeSource) == [.ambiguous, .resolved])
+            #expect(try store.sleepSessions(ringID: f.ring.id).map(\.value.timeSource) == [.ambiguous, .resolved])
+        }
+    }
+
     // MARK: Sanity bounds (N)
 
     /// Fetched long after the records so that even a 48-hour session is not "from the future".
@@ -315,15 +359,17 @@ struct IngestionAmendmentTests {
                 session(1, [(242, 600, 30)]),  // starts exactly at the session end
                 session(2, [(242, 0, 30)], length: 0),  // zero-length session
                 session(3, []),  // no stages
+                session(8, [], length: 0),  // zero-length session with no stages
             ]
             let rejected: [[UInt8]] = [
                 session(4, [(242, 0, 661)]),  // ends 61 s after
                 session(5, [(242, 601, 30)]),  // starts one second after the session end
                 session(6, [(242, 0, 30)], length: 172_801),  // longer than 48 hours
+                sleepBytes(start: s + 90_005, end: s + 90_000, stages: []),  // starts after it ends, no stages
             ]
             try f.fetch(.sleep, (accepted + rejected).flatMap { $0 }, at: late)
             let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
-            #expect(result.inserted == 4 && result.rejectedImplausible == 3)
+            #expect(result.inserted == 5 && result.rejectedImplausible == 4)
             // Exactly 48 hours is allowed.
             let exact = sleepBytes(start: s + 90_000, end: s + 90_000 + 172_800, stages: [(242, s + 90_000, 30)])
             try f.fetch(.sleep, (accepted + rejected).flatMap { $0 } + exact, at: late.addingTimeInterval(1))
@@ -383,6 +429,21 @@ struct IngestionAmendmentTests {
             try f.fetch(.sleep, fine + over, at: at(3600))
             let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
             #expect(result.inserted == 1 && result.rejectedFuture == 1 && result.rejectedImplausible == 0)
+        }
+    }
+
+    /// A later copy that is plausible (30 hours, under the 48-hour cap) but ends more than 24 hours after
+    /// its first sighting is future-dated. It is judged before supersession, so the good copy stays.
+    @Test func aFutureDatedRewriteOfASleepSessionDoesNotSupersedeTheGoodCopy() throws {
+        try onEachStore { store in
+            let f = try clockedFixture(store, kinds: [.sleep])
+            let s = wall(at(1000), offset: plus1)
+            try f.fetch(.sleep, sleepBytes(start: s, end: s + 600, stages: [(242, s, 600)]), at: at(3600))
+            try f.fetch(.sleep, sleepBytes(start: s, end: s + 108_000, stages: [(242, s, 600)]), at: at(7200))
+            #expect(try store.transfers(ringID: f.ring.id, kind: .sleep).transfers.count == 2)
+            let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
+            #expect(result.inserted == 1 && result.superseded == 0 && result.rejectedFuture == 1 && result.rejectedImplausible == 0)
+            #expect(try store.sleepSessions(ringID: f.ring.id).map(\.value.end) == [at(1000 + 600)])
         }
     }
 

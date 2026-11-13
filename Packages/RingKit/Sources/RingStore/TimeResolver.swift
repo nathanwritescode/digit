@@ -41,8 +41,11 @@ struct ResolvedOffset: Equatable, Sendable {
 /// (observations) bounds when a record was written and the clock-set log says which offset was in
 /// force. The rules are summarised in AGENTS.md (Decisions, Store).
 ///
-/// Not handled: a clock-set in the middle of a record's own time span (a sleep session that
-/// straddles one). The session's end is the reference and every stage gets the same offset.
+/// A sleep session is resolved from its end and every stage gets that offset, but one that spans a
+/// clock-set with a different offset is marked `ambiguous` (see `resolve(window:reference:start:)`),
+/// assuming the ring stamps a session's end with the clock in force at that moment (unverified,
+/// #32). Not handled: a clock-set in the middle of an activity bucket or a heart-rate reading, and
+/// the stages of a session that spans a change, which can fall outside its own start and end.
 struct TimeResolver {
     /// Slack on the period bounds, for the seconds between a record's real time and what the ring
     /// stamped (clock drift, rounding) and between fetch and clock-set instants.
@@ -133,8 +136,8 @@ struct TimeResolver {
     ///   been stamped under the ring's unknown earlier clock (the vendor's app set it, or the app was
     ///   reinstalled). Near the first clock-set (within 26 hours plus the tolerance) its instant under
     ///   the first logged offset can look valid, so it is not `resolved`.
-    /// - A sleep session whose resolved span holds a clock-set with a different offset from the one
-    ///   before it was stamped partly under each clock. `start` is the session's ring-local start.
+    /// - A sleep session that spans a clock-set with a different offset from the one before it was
+    ///   stamped partly under each clock. `start` is the session's ring-local start (see below).
     ///
     /// An `assumed` result stays `assumed`.
     func resolve(window w: Window, reference: Date, start: Date? = nil) -> ResolvedOffset {
@@ -150,12 +153,14 @@ struct TimeResolver {
             return downgraded
         }
         if kind == .sleep, let start {
-            let begin = start.addingTimeInterval(-TimeInterval(base.seconds))
+            // The start was stamped by the clock in force then, which is the one before the change: when
+            // the clock goes back, decoding it with the end's offset would put it too late and miss a
+            // change early in the session. So each offset change is tested against the start as
+            // stamped under the clock before it, widened by the tolerance (all bounds strict).
             for k in clockSets.indices.dropFirst()
-            where clockSets[k].instant > begin && clockSets[k].instant < end
-                && clockSets[k].utcOffsetSeconds != clockSets[k - 1].utcOffsetSeconds
-            {
-                return downgraded
+            where clockSets[k].utcOffsetSeconds != clockSets[k - 1].utcOffsetSeconds {
+                let earliest = start.addingTimeInterval(-TimeInterval(clockSets[k - 1].utcOffsetSeconds) - Self.tolerance)
+                if clockSets[k].instant > earliest && clockSets[k].instant < end { return downgraded }
             }
         }
         return base

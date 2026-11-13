@@ -285,9 +285,13 @@ struct TimeResolutionTests {
     @Test func aRecordAWeekOlderThanTheOnlyClockSetIsAssumed() throws {
         let rec = filler(1)
         let week = 7.0 * 86400
-        #expect(try resolve([obs(rec, 3600, id: 1)], [clock(0, 3600)], data: rec, reference: at(-week + 3600)) == assumed(3600))
+        // A single clock-set, exactly as the amendment states it.
+        #expect(try resolve(
+            [obs(rec, 3600, id: 1)], [clock(0, 3600)], data: rec, reference: at(-week + 3600), anchored: false)
+            == assumed(3600))
         // Nor is one dated well after it was first seen.
-        #expect(try resolve([obs(rec, 3600, id: 1)], [clock(0, 3600)], data: rec, reference: at(50000)) == assumed(3600))
+        #expect(try resolve(
+            [obs(rec, 3600, id: 1)], [clock(0, 3600)], data: rec, reference: at(50000), anchored: false) == assumed(3600))
         // The same record shortly after the clock-set is certain.
         #expect(try resolve([obs(rec, 3600, id: 1)], [clock(0, 3600)], data: rec, reference: at(1800 + 3600)) == resolved(3600))
     }
@@ -400,6 +404,73 @@ struct TimeResolutionTests {
         let after = try resolve(
             fetches, log, data: rec, reference: at(0), kind: .sleep, start: at(-3600), anchored: false)
         #expect(after == resolved(-18000))
+    }
+
+    /// Time zero is 07:00 UTC. Offsets -14400 then -18000. The session starts at 06:30 UTC (02:30
+    /// ring-local under the old clock); a fetch without it at 07:00, then the clock-set to -18000; it ends
+    /// at 12:00 UTC (07:00 ring-local under the new clock) and is fetched at 13:00. The clock change is
+    /// early in the session. Decoding the start with the new offset put it after the change and missed it.
+    @Test func aClockGoingBackEarlyInASleepSessionIsAmbiguous() throws {
+        let rec = filler(1)
+        let result = try resolve(
+            [obs([], 0, id: 1), obs(rec, 21600, id: 2)], [clock(-200_000, -14400), clock(5, -18000)], data: rec,
+            reference: at(0), kind: .sleep, start: at(-1800 - 14400), anchored: false)
+        #expect(result == ambiguous(-18000))
+    }
+
+    /// A six-hour change (clock forward) three hours after the true start.
+    @Test func aSixHourChangeThreeHoursIntoASessionIsAmbiguous() throws {
+        let rec = filler(1)
+        let result = try resolve(
+            [obs([], 10_790, id: 1), obs(rec, 25_200, id: 2)], [clock(-200_000, -21600), clock(10_800, 0)], data: rec,
+            reference: at(18_000), kind: .sleep, start: at(-21_600), anchored: false)
+        #expect(result == ambiguous(0))
+    }
+
+    @Test func clockSetsInsideASessionThatDoNotChangeTheOffsetLeaveItResolved() throws {
+        let rec = filler(1)
+        let log = [clock(-200_000, 3600), clock(5000, 3600), clock(6000, 3600)]
+        let result = try resolve(
+            [obs([], 4800, id: 1), obs(rec, 20_000, id: 2)], log, data: rec, reference: at(8000 + 3600), kind: .sleep,
+            start: at(4000 + 3600), anchored: false)
+        #expect(result == resolved(3600))
+    }
+
+    @Test func anOffsetThatChangesAndChangesBackInsideASessionIsAmbiguous() throws {
+        let rec = filler(1)
+        let log = [clock(-200_000, 0), clock(5000, 3600), clock(6000, 0)]
+        let result = try resolve(
+            [obs([], 4800, id: 1), obs(rec, 20_000, id: 2)], log, data: rec, reference: at(8000), kind: .sleep,
+            start: at(4000), anchored: false)
+        #expect(result == ambiguous(0))
+    }
+
+    /// Strict bounds. The clock goes forward from offset 0 to 3600 at time 0. The session's end resolves to
+    /// `reference - 3600`; it spans the change when the clock-set is after the start as stamped under the old
+    /// clock minus 120 s, and before the resolved end. A clock-set exactly at either bound does not count.
+    @Test func aClockSetExactlyAtTheBoundsOfASessionIsNotInsideIt() throws {
+        let rec = filler(1)
+        let log = [clock(-200_000, 0), clock(0, 3600)]
+        let fetches = [obs([], -5, id: 1), obs(rec, 10_000, id: 2)]
+        func result(end: Double, start: Double) throws -> ResolvedOffset {
+            try resolve(fetches, log, data: rec, reference: at(end + 3600), kind: .sleep, start: at(start), anchored: false)
+        }
+        // Lower bound: the clock-set at 0 is exactly start - 0 - 120 (start 120): not spanning; start 119: spanning.
+        #expect(try result(end: 5000, start: 120) == resolved(3600))
+        #expect(try result(end: 5000, start: 119) == ambiguous(3600))
+        // Upper bound: the resolved end is exactly the clock-set (end 0): not spanning; end 1: spanning.
+        #expect(try result(end: 0, start: -1000) == resolved(3600))
+        #expect(try result(end: 1, start: -1000) == ambiguous(3600))
+    }
+
+    /// A sleep session always reaches back before the log, so even when the last-absent fetch is after
+    /// the first clock-set it is `ambiguous` within 26 hours of it. Heart rate in the same log is resolved.
+    @Test func aSleepSessionNearTheFirstClockSetIsAmbiguousEvenWithALaterLastAbsentFetch() throws {
+        let rec = filler(1)
+        let fetches = [obs([], 3600, id: 1), obs(rec, 14_400, id: 2)]
+        let log = [clock(0, 3600)]
+        #expect(try resolve(fetches, log, data: rec, reference: at(5000 + 3600), kind: .sleep, anchored: false) == ambiguous(3600))
+        #expect(try resolve(fetches, log, data: rec, reference: at(5000 + 3600), anchored: false) == resolved(3600))
     }
 
     // MARK: The same-offset bound (K)
