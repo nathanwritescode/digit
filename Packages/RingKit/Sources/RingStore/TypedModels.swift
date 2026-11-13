@@ -19,8 +19,9 @@ public struct HeartRateReading: Equatable, Sendable {
     public var mode: Int
     public var utcOffsetSeconds: Int
     /// The record's raw ring time (seconds since 2000-01-01 by the ring's clock; the start for
-    /// activity and sleep). Unlike the resolved instant it never changes, so a record is
-    /// identified by ring, kind and this value.
+    /// activity and sleep). Unlike the resolved instant it never changes, but it is not unique
+    /// either: the hour repeated after the clock goes back, or two readings in one ring second,
+    /// share it. Part of what identifies a record, not all of it (#12, #14 decide the exact key).
     public var ringLocalSeconds: Int
     public var timeSource: TimeSource
 }
@@ -33,8 +34,9 @@ public struct ActivityInterval: Equatable, Sendable {
     public var kilocalories: Int
     public var utcOffsetSeconds: Int
     /// The record's raw ring time (seconds since 2000-01-01 by the ring's clock; the start for
-    /// activity and sleep). Unlike the resolved instant it never changes, so a record is
-    /// identified by ring, kind and this value.
+    /// activity and sleep). Unlike the resolved instant it never changes, but it is not unique
+    /// either: the hour repeated after the clock goes back, or two readings in one ring second,
+    /// share it. Part of what identifies a record, not all of it (#12, #14 decide the exact key).
     public var ringLocalSeconds: Int
     public var timeSource: TimeSource
 }
@@ -50,8 +52,9 @@ public struct SleepSessionRecord: Equatable, Sendable {
     public var end: Date
     public var utcOffsetSeconds: Int
     /// The record's raw ring time (seconds since 2000-01-01 by the ring's clock; the start for
-    /// activity and sleep). Unlike the resolved instant it never changes, so a record is
-    /// identified by ring, kind and this value.
+    /// activity and sleep). Unlike the resolved instant it never changes, but it is not unique
+    /// either: the hour repeated after the clock goes back, or two readings in one ring second,
+    /// share it. Part of what identifies a record, not all of it (#12, #14 decide the exact key).
     public var ringLocalSeconds: Int
     public var timeSource: TimeSource
     /// In the order the decoder returned them; the table keeps that order as `ordinal`.
@@ -74,9 +77,15 @@ public struct IngestionResult: Equatable, Sendable {
     /// summed over transfers.
     public var unusableBytes = 0
     /// Distinct records that resolved to the same unique key (two readings in one ring second, an
-    /// ambiguous repeated hour, a sleep session that changed in place). The one later in the
-    /// buffer is kept and the other is counted here, never dropped silently.
+    /// ambiguous repeated hour). The one later in the buffer is kept and the other is counted here:
+    /// a distinct record was dropped, never silently.
     public var collisions = 0
+    /// Sleep sessions the ring rewrote (the same ring-local start in an earlier copy), counted when
+    /// only the copy latest in the buffer is kept. Not a loss: the later copy replaces the earlier.
+    public var superseded = 0
+    /// Records dated more than 24 hours after the fetch that first showed them (a record cannot be
+    /// written after it was fetched; this also catches bytes such as FF FF FF FF).
+    public var rejectedFuture = 0
 }
 
 /// The strings stored in `sleep_stage.kind`. NEVER CHANGE an existing code; no default, so a new

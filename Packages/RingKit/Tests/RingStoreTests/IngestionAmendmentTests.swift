@@ -131,6 +131,99 @@ struct IngestionAmendmentTests {
         }
     }
 
+    // MARK: Identity (bytes plus occurrence number)
+
+    /// After the clock goes back the ring repeats wall-clock times, and a repeated reading with the
+    /// same value is byte for byte the same. Two readings with identical bytes in one buffer are two
+    /// records, each resolved on its own.
+    @Test func twoReadingsWithIdenticalBytesEitherSideOfAClockSetAreTwoRecords() throws {
+        try onEachStore { store in
+            let f = try Fixture(store)
+            try f.fetch(.heartRate, [], at: at(-10))
+            try f.setClock(at: at(0), offset: 3600)
+            let a = hrBytes(wall(at(5400), offset: 3600), bpm: 58)  // wall clock 9000
+            try f.fetch(.heartRate, a, at: at(7200))
+            try f.setClock(at: at(7210), offset: 0)
+            let b = hrBytes(wall(at(9000), offset: 0), bpm: 58)  // wall clock 9000 again
+            #expect(a == b)
+            try f.fetch(.heartRate, a + b, at: at(14400))
+            let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
+            #expect(result.inserted == 2 && result.collisions == 0)
+            let rows = try store.heartRateReadings(ringID: f.ring.id).map(\.value)
+            #expect(rows.map(\.time) == [at(5400), at(9000)])
+            #expect(rows.map(\.utcOffsetSeconds) == [3600, 0])
+            #expect(rows.map(\.timeSource) == [.resolved, .resolved])
+            #expect(try store.ingest(ringID: f.ring.id, kind: .heartRate).unchanged == 2)
+        }
+    }
+
+    @Test func twoZeroStepActivityBucketsWithIdenticalBytesAreTwoRecords() throws {
+        try onEachStore { store in
+            let f = try Fixture(store)
+            try f.fetch(.activity, [], at: at(-10))
+            try f.setClock(at: at(0), offset: 3600)
+            // The same wall-clock bucket twice: real 4800-5400 under +3600, then real 8400-9000 under 0.
+            let a = activityBytes(start: wall(at(4800), offset: 3600), end: wall(at(5400), offset: 3600), steps: 0)
+            try f.fetch(.activity, a, at: at(7200))
+            try f.setClock(at: at(7210), offset: 0)
+            let b = activityBytes(start: wall(at(8400), offset: 0), end: wall(at(9000), offset: 0), steps: 0)
+            #expect(a == b)
+            try f.fetch(.activity, a + b, at: at(14400))
+            let result = try store.ingest(ringID: f.ring.id, kind: .activity)
+            #expect(result.inserted == 2 && result.collisions == 0)
+            let rows = try store.activityIntervals(ringID: f.ring.id).map(\.value)
+            #expect(rows.map(\.start) == [at(4800), at(8400)])
+            #expect(rows.map(\.utcOffsetSeconds) == [3600, 0])
+            #expect(rows.map(\.timeSource) == [.resolved, .resolved])
+        }
+    }
+
+    // MARK: Superseded sleep sessions
+
+    /// The ring rewrote a session after the clock went back: the new copy has the same start bytes,
+    /// a later end stamped by the new clock and another stage, and is not a prefix of the old one.
+    @Test func aRewrittenSleepSessionKeepsOnlyTheLatestCopyEvenWhenTheCopiesResolveToDifferentInstants() throws {
+        try onEachStore { store in
+            let f = try Fixture(store)
+            try f.fetch(.sleep, [], at: at(-10))
+            try f.setClock(at: at(0), offset: 3600)
+            let start = wall(at(1000), offset: 3600)
+            let v1 = sleepBytes(start: start, end: wall(at(3000), offset: 3600), stages: [(242, start, 1000)])
+            try f.fetch(.sleep, v1, at: at(3500))
+            try f.setClock(at: at(3510), offset: 0)
+            let v2 = sleepBytes(
+                start: start, end: wall(at(5000), offset: 0), stages: [(242, start, 1000), (241, start + 1001, 500)])
+            try f.fetch(.sleep, v2, at: at(7200))
+            #expect(try store.transfers(ringID: f.ring.id, kind: .sleep).transfers.count == 2)
+
+            let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
+            #expect(result.superseded == 1 && result.collisions == 0 && result.inserted == 1)
+            let rows = try store.sleepSessions(ringID: f.ring.id).map(\.value)
+            #expect(rows.count == 1)
+            #expect(rows[0].stages.count == 2 && rows[0].ringLocalSeconds == Int(start))
+            #expect(rows[0].end == at(5000))
+        }
+    }
+
+    // MARK: Records from the future
+
+    /// A record cannot be written after it was fetched. The fetch is at t0 + 3600, so a record
+    /// 24 hours after it is allowed and one a second later is not; FF FF FF FF is year 2136.
+    @Test func recordsDatedMoreThanADayAfterTheirFetchAreRejectedAsFuture() throws {
+        try onEachStore { store in
+            let f = try Fixture(store)
+            let fetched = at(3600)
+            func ringSeconds(_ d: Date) -> UInt32 { UInt32(d.timeIntervalSince1970 - 946_684_800) }
+            let inside = hrBytes(ringSeconds(fetched.addingTimeInterval(86_400)), bpm: 50)
+            let outside = hrBytes(ringSeconds(fetched.addingTimeInterval(86_401)), bpm: 51)
+            let allFF = [UInt8](repeating: 0xFF, count: 6)
+            try f.fetch(.heartRate, inside + outside + allFF, at: fetched, zone: "UTC")
+            let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
+            #expect(result.rejectedFuture == 2 && result.inserted == 1)
+            #expect(try store.heartRateReadings(ringID: f.ring.id).map(\.value.bpm) == [50])
+        }
+    }
+
     @Test func theRingLocalTimeIsStoredForEveryTable() throws {
         try onEachStore { store in
             let f = try Fixture(store)

@@ -125,8 +125,9 @@ struct IngestionTests {
             try f.fetch(.sleep, closed, at: at(7200))
             let r = try store.ingest(ringID: f.ring.id, kind: .sleep)
             #expect(r.updated == 1 && r.inserted == 0 && r.deleted == 0)
-            // Different bytes under one key: a counted collision, the later copy kept.
-            #expect(r.collisions == 1)
+            // The same ring-local start in two copies: the ring rewrote it, so the earlier one is
+            // superseded (not a collision) and the later copy kept.
+            #expect(r.superseded == 1 && r.collisions == 0)
             let row = try #require(try store.sleepSessions(ringID: f.ring.id).first)
             #expect(row.id == id)
             #expect(row.value.end == at(1300))

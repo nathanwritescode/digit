@@ -72,6 +72,8 @@ extension RingStore {
         var rejected = 0
         var unusableBytes = 0
         var collisions = 0
+        var superseded = 0
+        var rejectedFuture = 0
     }
 
     private static func ingest(_ db: Database, ringID: UUID, kind: HistoryKind) throws -> IngestionResult {
@@ -84,7 +86,8 @@ extension RingStore {
         switch kind {
         case .heartRate:
             let derived = try derive(
-                transfers, resolver, HeartRateRecord.decodeLocated, reference: { $0.time }, plausible: { _ in true }
+                transfers, resolver, HeartRateRecord.decodeLocated, reference: { $0.time }, plausible: { _ in true },
+                supersedeKey: nil
             ) { r, o in
                 let instant = r.time.addingTimeInterval(-TimeInterval(o.seconds))
                 return (instant, HeartRateReading(
@@ -95,7 +98,8 @@ extension RingStore {
             record(derived, rows: derived.rows.values.map(\.timeSource), into: &result)
         case .activity:
             let derived = try derive(
-                transfers, resolver, ActivityRecord.decodeLocated, reference: { $0.end }, plausible: { _ in true }
+                transfers, resolver, ActivityRecord.decodeLocated, reference: { $0.end }, plausible: { _ in true },
+                supersedeKey: nil
             ) { r, o in
                 let shift = -TimeInterval(o.seconds)
                 let start = r.start.addingTimeInterval(shift)
@@ -114,7 +118,9 @@ extension RingStore {
                 plausible: { r in
                     r.start >= earliestPlausibleRingTime && r.start <= r.end
                         && r.stages.allSatisfy { $0.start >= earliestPlausibleRingTime }
-                }
+                },
+                // Sessions with one ring-local start are one session the ring rewrote.
+                supersedeKey: { ringSeconds($0.start) }
             ) { r, o in
                 let shift = -TimeInterval(o.seconds)
                 let start = r.start.addingTimeInterval(shift)
@@ -138,6 +144,8 @@ extension RingStore {
         result.rejectedBefore2020 = derived.rejected
         result.unusableBytes = derived.unusableBytes
         result.collisions = derived.collisions
+        result.superseded = derived.superseded
+        result.rejectedFuture = derived.rejectedFuture
         for source in sources { result.rowsByTimeSource[source, default: 0] += 1 }
     }
 
@@ -151,72 +159,97 @@ extension RingStore {
         var window: TimeResolver.Window
     }
 
+    /// A record's identity: its bytes and how many identical records came before it in the same
+    /// transfer. After the clock goes back the ring repeats wall-clock times, so two different
+    /// records can be byte for byte the same; occurrence `n` of some bytes in one transfer and
+    /// occurrence `n` in another are taken to be the same record. Known limit (#32): if a rolled-over
+    /// buffer dropped an earlier identical record, the numbering shifts and a record can be matched
+    /// to the wrong twin.
+    private struct IdentityKey: Hashable {
+        var bytes: [UInt8]
+        var occurrence: Int
+    }
+
     private struct Identity<R> {
         var record: R
         var occurrences: [Occurrence]
+
+        /// Buffer order: later transfer, then later offset.
+        var lastPosition: (Int, Int) {
+            occurrences.map { ($0.transfer, $0.offset) }.max { $0 < $1 } ?? (0, 0)
+        }
     }
 
     /// Decodes every transfer as wall-clock-as-UTC (what `TimeResolver` expects), then resolves
-    /// each distinct record once. A record's identity is its bytes (kind, ring-local times and
-    /// content), which can appear in several transfers; it is resolved from the occurrence with the
-    /// earliest first sighting (on a tie, one that has a last-absent fetch, then the latest), so the
-    /// same record never gets two instants. Two distinct records that still land on one key are a
-    /// collision: the one later in the buffer (later transfer, then later offset) is kept.
+    /// each distinct record once, from the occurrence with the earliest first sighting.
+    ///
+    /// That choice needs no tie-break: two transfers can share a first sighting only through an
+    /// observation that is a prefix of both, and then the record sits at the same offset in both
+    /// with the same earlier fetches, so the evidence is identical (equal first sightings at
+    /// different offsets would need two distinct observations at one instant; the first occurrence in
+    /// transfer order is then used, which is deterministic).
+    ///
+    /// Afterwards: sessions the ring rewrote are superseded (see `supersedeKey`), records dated more
+    /// than a day after they were first seen are rejected as future, and distinct records that still
+    /// share a key are a collision, the later in the buffer winning.
     private static func derive<R: Sendable, V>(
         _ transfers: [StoredTransfer], _ resolver: TimeResolver,
         _ decode: ([UInt8], TimeZone) -> [Located<R>],
         reference: (R) -> Date,
         plausible: (R) -> Bool,
+        supersedeKey: ((R) -> Int)?,
         _ build: (R, ResolvedOffset) -> (instant: Date, value: V)
     ) throws -> Derived<V> {
         var derived = Derived<V>()
-        var identities: [[UInt8]: Identity<R>] = [:]
-        var rejected: Set<[UInt8]> = []
+        var identities: [IdentityKey: Identity<R>] = [:]
+        var rejected: Set<IdentityKey> = []
         for (index, stored) in transfers.enumerated() {
             let data = stored.transfer.data
             let sightings = resolver.sightings(in: data)
+            var seen: [[UInt8]: Int] = [:]
             var consumed = 0
             for located in decode(data, .gmt) where located.offset + located.length <= data.count {
                 consumed += located.length
                 let bytes = Array(data[located.offset..<located.offset + located.length])
-                if rejected.contains(bytes) { continue }
+                let key = IdentityKey(bytes: bytes, occurrence: seen[bytes, default: 0])
+                seen[bytes, default: 0] += 1
+                if rejected.contains(key) { continue }
                 if reference(located.record) < earliestPlausibleRingTime || !plausible(located.record) {
-                    rejected.insert(bytes)
+                    rejected.insert(key)
                     continue
                 }
                 let window = try resolver.window(sightings: sightings, offset: located.offset, length: located.length)
-                identities[bytes, default: Identity(record: located.record, occurrences: [])]
+                identities[key, default: Identity(record: located.record, occurrences: [])]
                     .occurrences.append(Occurrence(transfer: index, offset: located.offset, window: window))
             }
             derived.unusableBytes += data.count - consumed
         }
         derived.rejected = rejected.count
 
-        // Keyed in buffer order (later transfer, then later offset) of each identity's last
-        // occurrence, so the later one wins a collision.
-        func lastPosition(_ i: Identity<R>) -> (Int, Int) {
-            guard let last = i.occurrences.max(by: { ($0.transfer, $0.offset) < ($1.transfer, $1.offset) }) else { return (0, 0) }
-            return (last.transfer, last.offset)
+        var ordered = identities.values.sorted { $0.lastPosition < $1.lastPosition }
+        if let supersedeKey {
+            // Keep the copy latest in the buffer; the others were rewritten by it.
+            var latestByKey: [Int: Int] = [:]
+            for (i, identity) in ordered.enumerated() { latestByKey[supersedeKey(identity.record)] = i }
+            let kept = Set(latestByKey.values)
+            derived.superseded = ordered.count - kept.count
+            ordered = ordered.enumerated().filter { kept.contains($0.offset) }.map(\.element)
         }
-        for identity in identities.values.sorted(by: { lastPosition($0) < lastPosition($1) }) {
-            guard let chosen = identity.occurrences.min(by: { earlierEvidence($0.window, $1.window) }) else { continue }
-            let (instant, value) = build(identity.record, resolver.resolve(window: chosen.window, reference: reference(identity.record)))
+        for identity in ordered {
+            guard let chosen = identity.occurrences.min(by: { $0.window.firstSeen < $1.window.firstSeen }) else { continue }
+            let ref = reference(identity.record)
+            let offset = resolver.resolve(window: chosen.window, reference: ref)
+            // A record cannot have been written after it was fetched (this also catches FF FF FF FF).
+            if ref.addingTimeInterval(-TimeInterval(offset.seconds)).timeIntervalSince(chosen.window.firstSeen) > 86_400 {
+                derived.rejectedFuture += 1
+                continue
+            }
+            let (instant, value) = build(identity.record, offset)
             let key = ms(instant)
             if derived.rows[key] != nil { derived.collisions += 1 }
             derived.rows[key] = value
         }
         return derived
-    }
-
-    /// Whether `a` is better evidence than `b`: earlier first sighting; on a tie one with a
-    /// last-absent fetch, then the later last-absent.
-    private static func earlierEvidence(_ a: TimeResolver.Window, _ b: TimeResolver.Window) -> Bool {
-        if a.firstSeen != b.firstSeen { return a.firstSeen < b.firstSeen }
-        switch (a.lastAbsent, b.lastAbsent) {
-        case let (x?, y?): return x > y
-        case (_?, nil): return true
-        default: return false
-        }
     }
 
     // MARK: Applying the desired set

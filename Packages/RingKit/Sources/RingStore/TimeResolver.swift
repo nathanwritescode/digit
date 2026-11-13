@@ -47,10 +47,6 @@ struct TimeResolver {
     /// Slack on the period bounds, for the seconds between a record's real time and what the ring
     /// stamped (clock drift, rounding) and between fetch and clock-set instants.
     static let tolerance: TimeInterval = 120
-    /// A lone clock-set this soon after the last fetch that lacked the record was made in the
-    /// same sync as that fetch, so it was in force for the whole window.
-    static let sameSyncWindow: TimeInterval = 600
-
     let ringID: UUID
     let kind: HistoryKind
     /// Sorted by fetch time then row id.
@@ -123,45 +119,53 @@ struct TimeResolver {
         resolve(window: try window(sightings: sightings, offset: offset, length: length), reference: reference)
     }
 
-    /// `reference` is the record's ring-local end (its wall-clock reading decoded as if UTC).
+    /// `reference` is the record's ring-local time (its wall-clock reading decoded as if UTC): the
+    /// end for activity and sleep, the time for heart rate.
+    ///
+    /// Candidates are the latest clock-set at or before `lastAbsent` plus every clock-set between
+    /// `lastAbsent` and `firstSeen` (every clock-set before `firstSeen` when there is no
+    /// `lastAbsent`). If they all share one offset, that offset is certain. Otherwise each candidate
+    /// is tested: its proposed instant must lie in its own period and not after `firstSeen`
+    /// (both widened by the tolerance), and, for records written at about their reference time
+    /// (heart rate and activity), not before `lastAbsent` (widened). A sleep session is written
+    /// some time after it ends, so that last bound does not apply to it.
     func resolve(window w: Window, reference: Date) -> ResolvedOffset {
         let tol = Self.tolerance
         let eligible = clockSets.indices.filter { clockSets[$0].instant < w.firstSeen }
-        guard !eligible.isEmpty else {
+        var candidates = eligible
+        if let lastAbsent = w.lastAbsent {
+            let atOrBefore = eligible.last { clockSets[$0].instant <= lastAbsent }
+            candidates = (atOrBefore.map { [$0] } ?? []) + eligible.filter { clockSets[$0].instant > lastAbsent }
+        }
+        guard let latest = candidates.last else {
             // One offset for the whole sighting: the ring's clock does not follow daylight saving.
             let zone = TimeZone(identifier: w.firstSeenZone) ?? .gmt
             return ResolvedOffset(seconds: zone.secondsFromGMT(for: w.firstSeen), source: .assumed)
         }
-
-        var candidates = eligible
-        if let lastAbsent = w.lastAbsent {
-            let atOrBefore = eligible.last { clockSets[$0].instant <= lastAbsent }
-            let inWindow = eligible.filter { clockSets[$0].instant > lastAbsent }
-            if inWindow.isEmpty, let k = atOrBefore {
-                return ResolvedOffset(seconds: clockSets[k].utcOffsetSeconds, source: .resolved)
-            }
-            // The record's own time is deliberately not checked here: the log bounds when it was
-            // written, and a sleep session can be written after its end time.
-            if inWindow.count == 1,
-               clockSets[inWindow[0]].instant.timeIntervalSince(lastAbsent) <= Self.sameSyncWindow
-            {
-                return ResolvedOffset(seconds: clockSets[inWindow[0]].utcOffsetSeconds, source: .resolved)
-            }
-            candidates = (atOrBefore.map { [$0] } ?? []) + inWindow
+        // Includes a retried clock-set (same offset a few seconds apart) and any sync where the
+        // offset did not change.
+        if Set(candidates.map { clockSets[$0].utcOffsetSeconds }).count == 1 {
+            return ResolvedOffset(seconds: clockSets[latest].utcOffsetSeconds, source: .resolved)
         }
 
         let fitting = candidates.filter { k in
             let clock = clockSets[k]
             let proposed = reference.addingTimeInterval(-TimeInterval(clock.utcOffsetSeconds))
             let periodEnd = k + 1 < clockSets.count ? clockSets[k + 1].instant : w.firstSeen
-            return proposed >= clock.instant.addingTimeInterval(-tol)
+            var fits = proposed >= clock.instant.addingTimeInterval(-tol)
                 && proposed <= periodEnd.addingTimeInterval(tol)
                 && proposed <= w.firstSeen.addingTimeInterval(tol)
+            if fits, kind != .sleep, let lastAbsent = w.lastAbsent {
+                fits = proposed >= lastAbsent.addingTimeInterval(-tol)
+            }
+            return fits
         }
-        if fitting.count == 1 { return ResolvedOffset(seconds: clockSets[fitting[0]].utcOffsetSeconds, source: .resolved) }
-        if let latest = fitting.last { return ResolvedOffset(seconds: clockSets[latest].utcOffsetSeconds, source: .ambiguous) }
-        // Never empty: every eligible clock-set is either at or before `lastAbsent` or in the window.
-        let latest = candidates.last ?? eligible[eligible.count - 1]
+        // Fitting candidates are grouped by offset: two clock-sets with the same offset do not make
+        // a record ambiguous.
+        if Set(fitting.map { clockSets[$0].utcOffsetSeconds }).count == 1, let only = fitting.last {
+            return ResolvedOffset(seconds: clockSets[only].utcOffsetSeconds, source: .resolved)
+        }
+        if let best = fitting.last { return ResolvedOffset(seconds: clockSets[best].utcOffsetSeconds, source: .ambiguous) }
         return ResolvedOffset(seconds: clockSets[latest].utcOffsetSeconds, source: .assumed)
     }
 }

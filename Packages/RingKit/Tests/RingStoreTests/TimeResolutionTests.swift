@@ -20,15 +20,29 @@ struct TimeResolutionTests {
         ClockSetEvent(ringID: ring, instant: at(seconds), timeZoneIdentifier: "Europe/London", utcOffsetSeconds: offset)
     }
 
-    private func obs(_ data: [UInt8], _ seconds: Double, id: Int64, zone: String = "Europe/London") -> TransferObservation {
-        observation(ring, data: data, at: at(seconds), zone: zone, id: id)
+    /// A fetch of `data`; turned into an observation of the kind under test by `observations`.
+    struct Fetch {
+        var data: [UInt8]
+        var seconds: Double
+        var id: Int64
+        var zone: String
+    }
+
+    private func obs(_ data: [UInt8], _ seconds: Double, id: Int64, zone: String = "Europe/London") -> Fetch {
+        Fetch(data: data, seconds: seconds, id: id, zone: zone)
+    }
+
+    private func observations(_ fetches: [Fetch], kind: HistoryKind) -> [TransferObservation] {
+        fetches.map { observation(ring, kind, data: $0.data, at: at($0.seconds), zone: $0.zone, id: $0.id) }
     }
 
     /// Resolves the 6-byte record at `offset` of `data`; `reference` is the ring-local reading.
     private func resolve(
-        _ observations: [TransferObservation], _ clocks: [ClockSetEvent], data: [UInt8], offset: Int = 0, reference: Date
+        _ fetches: [Fetch], _ clocks: [ClockSetEvent], data: [UInt8], offset: Int = 0,
+        reference: Date, kind: HistoryKind = .heartRate
     ) throws -> ResolvedOffset {
-        let r = TimeResolver(ringID: ring, kind: .heartRate, observations: observations, clockSets: clocks)
+        let r = TimeResolver(
+            ringID: ring, kind: kind, observations: observations(fetches, kind: kind), clockSets: clocks)
         return try r.resolve(sightings: r.sightings(in: data), offset: offset, length: 6, reference: reference)
     }
 
@@ -36,67 +50,97 @@ struct TimeResolutionTests {
     private func ambiguous(_ seconds: Int) -> ResolvedOffset { ResolvedOffset(seconds: seconds, source: .ambiguous) }
     private func assumed(_ seconds: Int) -> ResolvedOffset { ResolvedOffset(seconds: seconds, source: .assumed) }
 
-    // MARK: Pure logic: which clock-set
+    // MARK: Worked cases (the clock goes back one hour at the second sync unless stated)
 
-    @Test func aLoneClockSetMadeInTheSameSyncAsTheLastAbsentFetchIsResolved() throws {
-        let rec = filler(1)
-        let result = try resolve(
-            [obs([], -10, id: 1), obs(rec, 3600, id: 2)], [clock(0, 3600)], data: rec, reference: at(1800 + 3600))
-        #expect(result == resolved(3600))
+    // Shared timeline: clock A (+3600) set at 0 after an empty fetch at -10; a fetch at 7200; clock B (0)
+    // set at 7210; a fetch at 14400.
+    private var clocks: [ClockSetEvent] { [clock(0, 3600), clock(7210, 0)] }
+
+    @Test func aHeartRateReadingWrittenWellAfterTheClockSetResolvesToTheNewOffset() throws {
+        let r0 = filler(1), r1 = filler(2)
+        let observations = [obs([], -10, id: 1), obs(r0, 7200, id: 2), obs(r0 + r1, 14400, id: 3)]
+        // Real 10000, stamped by clock B (offset 0).
+        #expect(try resolve(observations, clocks, data: r0 + r1, offset: 6, reference: at(10000)) == resolved(0))
     }
 
-    /// The clock goes back an hour at sync 3, whose fetch repeats sync 2's data. That unchanged
-    /// fetch is the last one without the later record, and the clock-set made right after it is
-    /// the one that applies. Without that fetch in the log both offsets fit.
+    @Test func aHeartRateReadingFromBeforeThePreviousFetchResolvesToTheOldOffset() throws {
+        let r0 = filler(1), r1 = filler(2)
+        let observations = [obs([], -10, id: 1), obs(r0, 7200, id: 2), obs(r0 + r1, 14400, id: 3)]
+        // Real 5000 under +3600, first seen at 7200: clock B did not exist yet.
+        #expect(try resolve(observations, clocks, data: r0 + r1, offset: 0, reference: at(5000 + 3600)) == resolved(3600))
+    }
+
+    /// Two readings with identical bytes either side of the clock-set (see identity in the
+    /// ingestion tests): the second is at offset 6 and sees the later window.
+    @Test func theSecondOfTwoIdenticalReadingsGetsItsOwnOffset() throws {
+        let r = filler(7)
+        let observations = [obs([], -10, id: 1), obs(r, 7200, id: 2), obs(r + r, 14400, id: 3)]
+        // Both have wall clock 9000: real 5400 under +3600, real 9000 under 0.
+        #expect(try resolve(observations, clocks, data: r + r, offset: 0, reference: at(9000)) == resolved(3600))
+        #expect(try resolve(observations, clocks, data: r + r, offset: 6, reference: at(9000)) == resolved(0))
+    }
+
+    @Test func aSleepSessionThatEndedMoreThanAnHourBeforeTheSyncButWasWrittenAfterItKeepsTheOldOffset() throws {
+        let rec = filler(1)
+        let observations = [obs([], -10, id: 1), obs([], 7200, id: 2), obs(rec, 14400, id: 3)]
+        // Ended at real 3000 (more than an hour before the sync at 7200) under +3600; seen first at 14400.
+        #expect(try resolve(observations, clocks, data: rec, reference: at(3000 + 3600), kind: .sleep) == resolved(3600))
+    }
+
+    @Test func aSleepSessionThatEndedWithinTheHourBeforeTheSyncAndWasWrittenAfterItIsAmbiguous() throws {
+        let rec = filler(1)
+        let observations = [obs([], -10, id: 1), obs([], 7200, id: 2), obs(rec, 14400, id: 3)]
+        // Ended at real 5400, within the hour before the sync, under +3600: wall clock 9000 also fits clock B.
+        #expect(try resolve(observations, clocks, data: rec, reference: at(5400 + 3600), kind: .sleep) == ambiguous(0))
+    }
+
+    /// Written between the fetch (at 7200) and the clock-set (at 7210), so stamped by the OLD clock.
+    /// Clock going back: the old offset's instant is fine, but the new offset also fits when the next
+    /// fetch is more than an hour later, so it is ambiguous (and the latest, wrong, offset is used).
+    /// Clock going forward: the new offset's instant lies before its own clock-set, so only the old
+    /// one fits and the record is resolved correctly.
+    @Test func aHeartRateReadingWrittenBetweenTheFetchAndTheClockSetOfOneSync() throws {
+        let rec = filler(1)
+        let observations = [obs([], 7200, id: 1), obs(rec, 14400, id: 2)]
+        // Going back: real 7205 stamped +3600 gives wall 10805.
+        #expect(try resolve(observations, clocks, data: rec, reference: at(7205 + 3600)) == ambiguous(0))
+        // Going forward (0 then +3600): real 7205 stamped 0 gives wall 7205.
+        let forward = [clock(0, 0), clock(7210, 3600)]
+        #expect(try resolve(observations, forward, data: rec, reference: at(7205)) == resolved(0))
+    }
+
+    @Test func aRetriedClockSetWithTheSameOffsetIsResolvedWhateverTheRecordsTime() throws {
+        let rec = filler(1)
+        let retried = [clock(0, 3600), clock(5, 3600)]
+        #expect(try resolve([obs([], -10, id: 1), obs(rec, 3600, id: 2)], retried, data: rec, reference: at(50000)) == resolved(3600))
+    }
+
+    @Test func withNoClockSetInTheWindowTheLatestEarlierOneIsUsed() throws {
+        let rec = filler(1)
+        let several = [clock(0, 3600), clock(100, 7200), clock(200, 0)]
+        // Last absent at 300, after all three clock-sets: only the latest (offset 0) is a candidate.
+        let observations = [obs([], 300, id: 1), obs(rec, 3600, id: 2)]
+        #expect(try resolve(observations, several, data: rec, reference: at(50000)) == resolved(0))
+    }
+
+    // MARK: Other rules
+
+    @Test func observationsThatAreNotPrefixesAreIgnored() {
+        let r = TimeResolver(ringID: ring, kind: .heartRate, observations: observations([
+            obs(filler(9), 100, id: 1), obs(filler(1), 3600, id: 2),
+        ], kind: .heartRate), clockSets: [clock(0, 3600)])
+        #expect(r.sightings(in: filler(1)).map(\.fetchedAt) == [at(3600)])
+    }
+
+    /// The unchanged fetch at the clock change (7200 here, repeating the previous data) is what
+    /// rules out the old offset for a reading written after it.
     @Test func anUnchangedFetchAtTheClockChangeRulesOutTheOldOffset() throws {
         let r0 = filler(1), r1 = filler(2)
         let both = r0 + r1
-        let clocks = [clock(0, 3600), clock(7210, 0)]
         let f1 = obs([], -10, id: 1), f2 = obs(r0, 3600, id: 2), f3 = obs(r0, 7200, id: 3), f4 = obs(both, 14400, id: 4)
         let reference = at(9010)
         #expect(try resolve([f1, f2, f3, f4], clocks, data: both, offset: 6, reference: reference) == resolved(0))
         #expect(try resolve([f1, f2, f4], clocks, data: both, offset: 6, reference: reference) == ambiguous(0))
-    }
-
-    @Test func observationsThatAreNotPrefixesAreIgnored() {
-        let r = TimeResolver(ringID: ring, kind: .heartRate, observations: [
-            obs(filler(9), 100, id: 1), obs(filler(1), 3600, id: 2),
-        ], clockSets: [clock(0, 3600)])
-        #expect(r.sightings(in: filler(1)).map(\.fetchedAt) == [at(3600)])
-    }
-
-    @Test func aWrittenLateRecordIsResolvedWhateverItsOwnTime() throws {
-        // A sleep session can be written after its end time: here its end is five minutes before the
-        // last fetch that lacked it, yet it was written under the clock set right after that fetch.
-        let rec = filler(1)
-        let result = try resolve(
-            [obs([], -10, id: 1), obs([], 3600, id: 2), obs(rec, 7200, id: 3)],
-            [clock(0, 3600), clock(3610, 0)], data: rec, reference: at(3300))
-        #expect(result == resolved(0))
-    }
-
-    @Test func aLoneClockSetMoreThan600SecondsAfterTheLastAbsentFetchFallsToTheCandidateRules() throws {
-        let rec = filler(1)
-        let observations = [obs([], -10, id: 1), obs([], 3600, id: 2), obs(rec, 7200, id: 3)]
-        // Exactly 600 s after the fetch still counts as the same sync.
-        #expect(try resolve(observations, [clock(0, 3600), clock(4200, 0)], data: rec, reference: at(6000)) == resolved(0))
-        // 601 s: a fetch was missed, so both clock-sets are candidates and both fit.
-        #expect(try resolve(observations, [clock(0, 3600), clock(4201, 0)], data: rec, reference: at(6000)) == ambiguous(0))
-    }
-
-    @Test func noLastAbsentFetchMeansEveryEarlierClockSetIsACandidate() throws {
-        let rec = filler(1)
-        // Only fits the earlier clock-set.
-        #expect(try resolve([obs(rec, 3600, id: 1)], [clock(0, 3600), clock(1000, 0)], data: rec, reference: at(4000 + 3600))
-            == assumed(0))  // p under +3600 = 4000, far past the period; under 0 = 7600, past the fetch
-    }
-
-    @Test func daylightSavingStartingMovesTheClockForward() throws {
-        let r0 = filler(1), r1 = filler(2)
-        let clocks = [clock(0, 0), clock(3610, 3600)]
-        let observations = [obs([], -10, id: 1), obs(r0, 3600, id: 2), obs(r0 + r1, 7200, id: 3)]
-        #expect(try resolve(observations, clocks, data: r0 + r1, offset: 6, reference: at(5000 + 3600)) == resolved(3600))
-        #expect(try resolve(observations, clocks, data: r0 + r1, offset: 0, reference: at(1800)) == resolved(0))
     }
 
     @Test func aMissedFetchLeavingTwoClockSetsInTheWindowIsAmbiguous() throws {
@@ -108,20 +152,28 @@ struct TimeResolutionTests {
 
     @Test func aZoneChangeBetweenSyncsResolvesEachRecordToItsOwnClockSet() throws {
         let r0 = filler(1), r1 = filler(2)
-        let clocks = [clock(0, 3600), clock(3610, -18000)]
+        let changed = [clock(0, 3600), clock(3610, -18000)]
         let observations = [obs([], -10, id: 1), obs(r0, 3600, id: 2), obs(r0 + r1, 7200, id: 3)]
-        #expect(try resolve(observations, clocks, data: r0 + r1, offset: 0, reference: at(1800 + 3600)) == resolved(3600))
-        #expect(try resolve(observations, clocks, data: r0 + r1, offset: 6, reference: at(5400 - 18000)) == resolved(-18000))
+        #expect(try resolve(observations, changed, data: r0 + r1, offset: 0, reference: at(1800 + 3600)) == resolved(3600))
+        #expect(try resolve(observations, changed, data: r0 + r1, offset: 6, reference: at(5400 - 18000)) == resolved(-18000))
+    }
+
+    @Test func daylightSavingStartingMovesTheClockForward() throws {
+        let r0 = filler(1), r1 = filler(2)
+        let forward = [clock(0, 0), clock(3610, 3600)]
+        let observations = [obs([], -10, id: 1), obs(r0, 3600, id: 2), obs(r0 + r1, 7200, id: 3)]
+        #expect(try resolve(observations, forward, data: r0 + r1, offset: 6, reference: at(5000 + 3600)) == resolved(3600))
+        #expect(try resolve(observations, forward, data: r0 + r1, offset: 0, reference: at(1800)) == resolved(0))
     }
 
     @Test func whenNothingFitsTheLatestCandidateIsAssumed() throws {
         let rec = filler(1)
-        // Two candidates, neither fits: the latest one is used (not the first).
+        // Two candidates with different offsets, neither fits: the latest is used (not the first).
         let result = try resolve(
             [obs(rec, 3600, id: 1)], [clock(0, 3600), clock(1000, 7200)], data: rec, reference: at(50000))
         #expect(result == assumed(7200))
-        // One candidate that does not fit.
-        #expect(try resolve([obs(rec, 3600, id: 1)], [clock(0, 3600)], data: rec, reference: at(50000)) == assumed(3600))
+        // A single clock-set is certain whatever the record's time: every candidate shares its offset.
+        #expect(try resolve([obs(rec, 3600, id: 1)], [clock(0, 3600)], data: rec, reference: at(50000)) == resolved(3600))
     }
 
     @Test func noClockSetAtAllIsAssumedWithTheZoneOffsetAtTheFirstSightingInstant() throws {
@@ -136,36 +188,54 @@ struct TimeResolutionTests {
 
     @Test func aClockSetExactlyAtTheFirstSightingIsNotACandidate() throws {
         let rec = filler(1)
-        // The reference fits the earlier clock-set; with the later one counted it would be ambiguous.
+        // Not a candidate, so the lone earlier clock-set is certain. Counted, the two would differ
+        // and both fit this reference (ambiguous).
         let result = try resolve([obs(rec, 3600, id: 1)], [clock(0, 3600), clock(3600, 0)], data: rec, reference: at(3600))
         #expect(result == resolved(3600))
     }
 
-    // MARK: Pure logic: the 120 second edges
+    // MARK: The 120 second edges (two candidates, so a fit decides; the other never fits)
 
     @Test func theProposedInstantMayBeUpTo120SecondsBeforeTheClockSet() throws {
         let rec = filler(1)
+        let two = [clock(-50000, 0), clock(0, 3600)]
         let observations = [obs(rec, 3600, id: 1)]
-        #expect(try resolve(observations, [clock(0, 3600)], data: rec, reference: at(-120 + 3600)) == resolved(3600))
-        #expect(try resolve(observations, [clock(0, 3600)], data: rec, reference: at(-121 + 3600)) == assumed(3600))
+        #expect(try resolve(observations, two, data: rec, reference: at(-120 + 3600)) == resolved(3600))
+        #expect(try resolve(observations, two, data: rec, reference: at(-121 + 3600)) == assumed(3600))
     }
 
     @Test func theProposedInstantMayBeUpTo120SecondsAfterTheFirstSighting() throws {
         let rec = filler(1)
+        // The third clock-set is after the first sighting: it only stretches the second's period.
+        let three = [clock(-50000, 0), clock(0, 3600), clock(10000, 0)]
         let observations = [obs(rec, 3600, id: 1)]
-        // A later clock-set makes the period end far past the fetch, so only the fetch bound applies.
-        let clocks = [clock(0, 3600), clock(10000, 0)]
-        #expect(try resolve(observations, clocks, data: rec, reference: at(3720 + 3600)) == resolved(3600))
-        #expect(try resolve(observations, clocks, data: rec, reference: at(3721 + 3600)) == assumed(3600))
+        #expect(try resolve(observations, three, data: rec, reference: at(3720 + 3600)) == resolved(3600))
+        #expect(try resolve(observations, three, data: rec, reference: at(3721 + 3600)) == assumed(3600))
     }
 
     @Test func theProposedInstantMayBeUpTo120SecondsAfterTheClockSetsPeriodEnds() throws {
         let rec = filler(1)
+        let two = [clock(0, 3600), clock(1000, 0)]
         let observations = [obs(rec, 3600, id: 1)]
-        let clocks = [clock(0, 3600), clock(1000, 0)]
-        // The period of the first ends at 1000; the second cannot fit (its proposed instant is past the fetch).
-        #expect(try resolve(observations, clocks, data: rec, reference: at(1120 + 3600)) == resolved(3600))
-        #expect(try resolve(observations, clocks, data: rec, reference: at(1121 + 3600)) == assumed(0))
+        // The second cannot fit: its proposed instant is past the fetch.
+        #expect(try resolve(observations, two, data: rec, reference: at(1120 + 3600)) == resolved(3600))
+        #expect(try resolve(observations, two, data: rec, reference: at(1121 + 3600)) == assumed(0))
+    }
+
+    /// Heart rate and activity are written at about their reference time, so a proposed instant
+    /// more than 120 s before the last fetch that lacked the record does not fit. A sleep session is
+    /// written after it ends, so the bound does not apply to it.
+    @Test func theLastAbsentLowerBoundAppliesToHeartRateAndActivityButNotSleep() throws {
+        let rec = filler(1)
+        let observations = [obs([], 3600, id: 1), obs(rec, 14400, id: 2)]
+        // Candidates: +3600 at 0 (at or before the last fetch) and 0 at 7210 (in the window).
+        let edge = [clock(0, 3600), clock(7210, 0)]
+        // Proposed under +3600 is exactly 120 s before the last absent fetch: fits; the other does not.
+        #expect(try resolve(observations, edge, data: rec, reference: at(3480 + 3600)) == resolved(3600))
+        for kind in [HistoryKind.heartRate, .activity] {
+            #expect(try resolve(observations, edge, data: rec, reference: at(3479 + 3600), kind: kind) == assumed(0))
+        }
+        #expect(try resolve(observations, edge, data: rec, reference: at(3479 + 3600), kind: .sleep) == resolved(3600))
     }
 
     @Test func clockSetsAtTheSameInstantKeepTheOrderTheyWereGiven() throws {
@@ -177,15 +247,23 @@ struct TimeResolutionTests {
         #expect(try resolve(observations, [b, a], data: rec, reference: at(60)) == ambiguous(60))
     }
 
-    /// A fetch after the record's first sighting that again lacked the record (a shorter, later
-    /// fetch of the same bytes) is not the last fetch that lacked it before it was seen.
+    /// Two fitting clock-sets with the same offset do not make a record ambiguous.
+    @Test func fittingCandidatesAreGroupedByOffsetNotByClockSet() throws {
+        let rec = filler(1)
+        let three = [clock(0, 3600), clock(100, 3600), clock(1000, 0)]
+        // Proposed instant 201 under +3600 fits both of the first two; the third does not fit.
+        #expect(try resolve([obs(rec, 3600, id: 1)], three, data: rec, reference: at(3801)) == resolved(3600))
+    }
+
+    /// A later fetch that again lacked the record (a shorter fetch of the same bytes) is not the
+    /// last fetch that lacked it before it was seen.
     @Test func aLaterFetchLackingTheRecordDoesNotMoveLastAbsent() throws {
         let both = filler(1) + filler(2)
         let observations = [
             obs(filler(1), 100, id: 1), obs(both, 200, id: 2), obs(filler(1), 300, id: 3),
         ]
-        // Correct: last absent 100, window holds two clock-sets, none fits a far reference: assumed.
-        // If the later fetch were taken, the latest clock-set would simply be "in force": resolved.
+        // Correct: last absent 100, so the window holds two clock-sets and none fits a far
+        // reference: assumed. Taking the later fetch would leave one candidate, which is certain.
         let result = try resolve(
             observations, [clock(0, 3600), clock(150, 7200), clock(160, 10800)], data: both, offset: 6, reference: at(100_000))
         #expect(result == assumed(10800))
@@ -283,10 +361,11 @@ struct TimeResolutionTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.setClock(at: at(0), offset: 3600)
+            try f.setClock(at: at(1000), offset: 7200)
             try f.fetch(.heartRate, hrBytes(wall(at(40000), offset: 3600), bpm: 60), at: at(3600))
             let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
             #expect(result.rowsByTimeSource == [.assumed: 1])
-            #expect(try store.heartRateReadings(ringID: f.ring.id).first?.value.utcOffsetSeconds == 3600)
+            #expect(try store.heartRateReadings(ringID: f.ring.id).first?.value.utcOffsetSeconds == 7200)
         }
     }
 
@@ -320,22 +399,32 @@ struct TimeResolutionTests {
         }
     }
 
-    /// A sleep session written after its end time (its end is minutes before the last fetch that
-    /// lacked it) still takes the clock-set made in that sync.
-    @Test func aSleepSessionWrittenLateIsResolvedThroughIngestion() throws {
+    /// Sleep sessions are written some time after they end. Clock A (+3600) is replaced by B (0)
+    /// at 7210, and the session first shows up at 14400.
+    private func sleepSession(endingAtReal end: Double, _ store: RingStore) throws -> SleepSessionRecord {
+        let f = try Fixture(store)
+        try f.fetch(.sleep, [], at: at(-10))
+        try f.setClock(at: at(0), offset: 3600)
+        try f.fetch(.sleep, [], at: at(7200))
+        try f.setClock(at: at(7210), offset: 0)
+        let start = wall(at(end - 900), offset: 3600)
+        try f.fetch(
+            .sleep, sleepBytes(start: start, end: wall(at(end), offset: 3600), stages: [(242, start, 900)]), at: at(14400))
+        try store.ingest(ringID: f.ring.id, kind: .sleep)
+        return try #require(try store.sleepSessions(ringID: f.ring.id).first).value
+    }
+
+    @Test func aSleepSessionThatEndedMoreThanAnHourBeforeTheSyncIsResolvedToTheOldOffset() throws {
         try onEachStore { store in
-            let f = try Fixture(store)
-            try f.fetch(.sleep, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
-            try f.fetch(.sleep, [], at: at(3600))
-            try f.setClock(at: at(3610), offset: 0)
-            let start = wall(at(2400), offset: 0)
-            try f.fetch(
-                .sleep, sleepBytes(start: start, end: wall(at(3300), offset: 0), stages: [(242, start, 900)]), at: at(7200))
-            let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
-            #expect(result.rowsByTimeSource == [.resolved: 1])
-            let row = try #require(try store.sleepSessions(ringID: f.ring.id).first).value
-            #expect(row.utcOffsetSeconds == 0 && row.end == at(3300))
+            let row = try sleepSession(endingAtReal: 3000, store)
+            #expect(row.timeSource == .resolved && row.utcOffsetSeconds == 3600 && row.end == at(3000))
+        }
+    }
+
+    @Test func aSleepSessionThatEndedWithinTheHourBeforeTheSyncIsAmbiguous() throws {
+        try onEachStore { store in
+            let row = try sleepSession(endingAtReal: 5400, store)
+            #expect(row.timeSource == .ambiguous && row.utcOffsetSeconds == 0)
         }
     }
 }
