@@ -54,6 +54,12 @@ public enum Command {
         ])
     }
 
+    /// Sets the ring's scheduled-reading interval. This changes a ring setting, so it is not on the
+    /// read-only list, and the only way to build it is through the validated `MonitoringInterval`.
+    public static func setMonitoringInterval(_ interval: MonitoringInterval) -> Frame {
+        Frame(group: 0x01, key: 0x0C, payload: interval.payload)
+    }
+
     public static let deviceInfo = Frame(group: 0x02, key: 0x00, payload: [0x47, 0x43])
     public static let currentActivity = Frame(group: 0x02, key: 0x0C)
 

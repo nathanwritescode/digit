@@ -10,6 +10,9 @@ ringprobe: talk to a YCBT smart ring from a Mac.
   ringprobe settime                     set the ring's clock to this Mac's local time
   ringprobe history <kind>|all --save <dir>
                                         fetch stored history: \(HistoryKind.allCases.map(\.name).joined(separator: ", "))
+  ringprobe monitor <1|5|10|15|20|30|60|off>
+                                        CHANGES A RING SETTING: how often the ring takes scheduled readings
+                                        (heart rate, SpO2, respiration, HRV). Asks for confirmation first.
   ringprobe raw <GGKK[:payloadhex]>...  send frames and print the replies
 
 Options:
@@ -148,6 +151,19 @@ do {
         let session = try await connect()
         try await session.setTime()
         print("ring clock set to \(timestamps.string(from: Date())) local time")
+
+    case "monitor":
+        // A deliberate write: validate and confirm before connecting, so nothing is sent otherwise.
+        guard operands.count == 1, let interval = MonitoringInterval(argument: operands[0]) else {
+            fail("monitor needs one of: 1, 5, 10, 15, 20, 30, 60, off")
+        }
+        print("About to send 010C \(Hex.encode(Command.setMonitoringInterval(interval).payload)): \(interval.summary).")
+        if !interval.isVerifiedOnHardware { print("This value has not been tried on a ring before.") }
+        print("The ring cannot report this setting back. Type yes to send it: ", terminator: "")
+        guard MonitoringInterval.isConfirmation(readLine()) else { fail("not confirmed; nothing sent") }
+        let session = try await connect()
+        try await session.setMonitoringInterval(interval)
+        print("ring accepted the setting")
 
     case "history":
         guard let which = operands.first else { fail(usage) }

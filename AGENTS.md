@@ -49,6 +49,7 @@ swift run ringprobe scan
 swift run ringprobe info
 swift run ringprobe history all --save ../../captures   # --save is required; one JSON file per kind (hex bytes, header, fetch time, time zone)
 swift run ringprobe raw 0200:4743   # send a known read-only frame
+swift run ringprobe monitor <1|5|10|15|20|30|60|off>   # CHANGES A RING SETTING (0x010C); planner only; asks for "yes" before connecting
 ```
 
 Build the app for the simulator from the repository root (needs Xcode, no signing):
@@ -87,7 +88,7 @@ Continuous integration (`.github/workflows/ci.yml`) runs `swift build` and `swif
 | Acknowledging a transfer | Does not discard it: a second fetch right after returned identical bytes |
 | Activity, sleep and heart record decoders | Verified against one real night: the Swift decoders matched an independent decode for all three, and the owner confirmed the sleep times matched their night (recorded on #6). Test fixtures remain synthetic |
 | Combined record (`0x0509`, 20 bytes) | Layout matches documentation. `CombinedRecord` decodes it; the Swift decoder was run against a real R99 capture (36 records) and every exposed field matched an independent decode (test fixtures remain synthetic). Timestamp, steps, heart rate, SpO2, respiration, HRV and CVRR are plausible and agree with the other records |
-| Monitoring interval (`0x010C`, payload `[enabled, minutes]`) | Verified at 1, 5 and 10 minutes, off, and back on. 15, 20, 30 and 60 minutes have never been sent. Details below |
+| Monitoring interval (`0x010C`, payload `[enabled, minutes]`) | Verified at 1, 5 and 10 minutes, off, and back on. 15, 20, 30 and 60 minutes have never been sent. Built only from `MonitoringInterval` (`Command.setMonitoringInterval`, `RingSession.setMonitoringInterval`, `ringprobe monitor`); tested against a scripted link only, not yet sent through them to a ring (#19 part 2). Not on the read-only list. Details below |
 | Battery percentage (device info byte 5) | Unverified: it has read 100% at every check so far (#25). Do not show it in the app until settled |
 | `0x0220` live snapshot, `0x0533` body data | Ring replies unsupported |
 | `0x051A` SpO2 history, `0x051E` temperature history | No reply at all, before or after a night of wear: treat as unsupported. SpO2 is available only in the combined record |

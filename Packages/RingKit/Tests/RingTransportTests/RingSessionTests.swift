@@ -484,3 +484,45 @@ private final class ParkedOperation: @unchecked Sendable {
     func park() async { await withCheckedContinuation { c in lock.withLock { continuation = c } } }
     func release() { lock.withLock { continuation.take() }?.resume() }
 }
+
+// Synthetic ring replies: `00` is the ack seen on the R99, `FC` the documented unsupported code.
+@Test(arguments: MonitoringInterval.allCases)
+func monitoringIntervalIsSentAndAckAccepted(interval: MonitoringInterval) async throws {
+    let link = FakeLink { $0.type == 0x010C ? [Frame(group: 0x01, key: 0x0C, payload: [0x00])] : [] }
+    try await session(link).setMonitoringInterval(interval)
+    #expect(link.sent == [Command.setMonitoringInterval(interval)])
+}
+
+@Test func monitoringIntervalUnsupportedReplyMapsToUnsupported() async throws {
+    let link = FakeLink { _ in [Frame(group: 0x01, key: 0x0C, payload: [0xFC])] }
+    await #expect(throws: MonitoringSettingError.unsupported) {
+        try await session(link).setMonitoringInterval(.tenMinutes)
+    }
+}
+
+@Test func monitoringIntervalOtherRepliesAreErrors() async throws {
+    let other = FakeLink { _ in [Frame(group: 0x01, key: 0x0C, payload: [0x01])] }
+    await #expect(throws: MonitoringSettingError.unexpectedReply(0x01)) {
+        try await session(other).setMonitoringInterval(.fiveMinutes)
+    }
+    let empty = FakeLink { _ in [Frame(group: 0x01, key: 0x0C, payload: [])] }
+    await #expect(throws: MonitoringSettingError.unexpectedReply(nil)) {
+        try await session(empty).setMonitoringInterval(.fiveMinutes)
+    }
+    // Another error code (not FC) stays a plain rejection.
+    let other2 = FakeLink { _ in [Frame(group: 0x01, key: 0x0C, payload: [0xFD])] }
+    do {
+        try await session(other2).setMonitoringInterval(.fiveMinutes)
+        Issue.record("expected an error")
+    } catch RingError.rejected(let frame) {
+        #expect(frame.payload == [0xFD])
+    }
+}
+
+@Test func monitoringIntervalWithNoReplyTimesOut() async throws {
+    let link = FakeLink()
+    do {
+        try await session(link).setMonitoringInterval(.off)
+        Issue.record("expected an error")
+    } catch RingError.timeout {}
+}
