@@ -7,13 +7,9 @@ import RingProtocol
 //
 // Grouping is computed over every session of the ring on each call, never over a window, so a
 // night is the same whichever query asks for it (rule 6). A ring has on the order of a thousand
-// sessions a year and the query reads only the session columns, not the stages, so this stays
-// cheap; stages are read only for the nights whose detail is asked for.
-
-/// The longest gap between one session's end and the next one's start for them to be one night:
-/// 60 minutes, inclusive. The ring reports no awake stages, so a brief wake-up is a gap between
-/// two sessions.
-public let sleepNightMaximumGapSeconds = 3600
+// sessions a year; the query reads every session row and one summed row per session and kind
+// (the totals), not the stage rows themselves, so this stays cheap. Stage rows are read only for
+// the night whose detail is asked for. Windowed grouping is tracked in #44.
 
 /// A calendar day on the ring's own clock. Not a `Date`: it carries no time zone.
 public struct SleepDay: Comparable, Hashable, Sendable {
@@ -35,7 +31,7 @@ public struct SleepDay: Comparable, Hashable, Sendable {
     /// Never uses the device's time zone.
     public init(instant: Date, utcOffsetSeconds: Int) {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "GMT")!
+        calendar.timeZone = TimeZone.gmt
         let parts = calendar.dateComponents(
             [.year, .month, .day], from: instant.addingTimeInterval(TimeInterval(utcOffsetSeconds)))
         self.init(year: parts.year!, month: parts.month!, day: parts.day!)
@@ -47,36 +43,71 @@ public struct SleepInterruption: Equatable, Sendable {
     public var start: Date
     public var end: Date
     public var seconds: Int { Int(end.timeIntervalSince(start).rounded(.down)) }
+
+    public init(start: Date, end: Date) {
+        self.start = start
+        self.end = end
+    }
 }
 
 /// One night: a maximal run of sessions, in start order, each starting at most
-/// `sleepNightMaximumGapSeconds` after the latest end seen so far in the night. See `RingStore.sleepNights` for the rules.
+/// `maximumGapSeconds` after the latest end seen so far in the night. See
+/// `RingStore.sleepNights(ringID:from:through:)` for the rules.
 public struct SleepNightSummary: Equatable, Sendable {
+    /// The longest gap between the latest end so far and the next session's start for that session
+    /// to join the night: 60 minutes, inclusive. The ring reports no awake stages, so a brief
+    /// wake-up is a gap between two sessions.
+    public static let maximumGapSeconds = 3600
+
     /// The calendar day the night ends on, by the own offset of the session with the latest end (the later in start order on a tie).
     public var day: SleepDay
+    /// That session's offset: the ring's clock the day is read on, so show the night's times on
+    /// it too, not in the device's current zone.
+    public var utcOffsetSeconds: Int
     /// First session's start.
     public var start: Date
     /// Latest end among the night's sessions.
     public var end: Date
-    /// Sum of stage durations as stored (not clipped), for every kind, including those at zero.
+    /// Sum of stage durations as stored (not clipped, so overlapping sessions count twice), for
+    /// every kind, including those at zero.
     public var secondsByKind: [SleepStageKind: Int]
     /// Sum over `deep`, `light`, `rem` and `nap` stages. `awake` is not counted.
     public var secondsAsleep: Int
     /// Stretches inside the night covered by no session; overlapping or contained sessions add none.
     public var interruptions: [SleepInterruption]
-    public var interruptionSeconds: Int
+    public var interruptionSeconds: Int { interruptions.reduce(0) { $0 + $1.seconds } }
     /// The least certain `timeSource` among the night's sessions (resolved, ambiguous, assumed).
     /// No session is left out because of its source; the caller decides how to show it.
     public var timeSource: TimeSource
     /// True for the night with the most time asleep among those of its day (the later-ending one
     /// on a tie); every other night of the day is a nap. Independent of `SleepStageKind.nap`.
     public var isMainSleep: Bool
+
+    public init(
+        day: SleepDay, utcOffsetSeconds: Int, start: Date, end: Date, secondsByKind: [SleepStageKind: Int],
+        secondsAsleep: Int, interruptions: [SleepInterruption], timeSource: TimeSource, isMainSleep: Bool
+    ) {
+        self.day = day
+        self.utcOffsetSeconds = utcOffsetSeconds
+        self.start = start
+        self.end = end
+        self.secondsByKind = secondsByKind
+        self.secondsAsleep = secondsAsleep
+        self.interruptions = interruptions
+        self.timeSource = timeSource
+        self.isMainSleep = isMainSleep
+    }
 }
 
 /// A night with its stages: all sessions' stages in time order.
 public struct SleepNightDetail: Equatable, Sendable {
     public var summary: SleepNightSummary
     public var stages: [SleepStageEntry]
+
+    public init(summary: SleepNightSummary, stages: [SleepStageEntry]) {
+        self.summary = summary
+        self.stages = stages
+    }
 }
 
 extension RingStore {
@@ -100,27 +131,31 @@ extension RingStore {
         }
     }
 
-    /// The stages of the night `summary` describes, found by its start and recomputed from the
-    /// current rows, so the summary inside is fresh; `nil` if no night starts there any more.
-    public func sleepNightDetail(ringID: UUID, for summary: SleepNightSummary) async throws -> SleepNightDetail? {
+    /// The night that starts at `start`, with its stages, recomputed from the current rows. Returns
+    /// `nil` whenever no night starts at that instant, which includes the case where ingestion has
+    /// moved the night's start since the summary was read (an offset re-resolved, or an earlier
+    /// session joined it), so callers must re-query. A stable night identifier is tracked separately.
+    public func sleepNightDetail(ringID: UUID, startingAt start: Date) async throws -> SleepNightDetail? {
         try await writer.read { db in
-            guard let night = try Self.sleepNightGroups(db, ringID: ringID).first(where: { $0.summary.start == summary.start })
+            guard let night = try Self.sleepNightGroups(db, ringID: ringID).first(where: { $0.summary.start == start })
             else { return nil }
             return try Self.detail(db, night)
         }
     }
 
-    /// Yields `latestSleepNight` now and again after every change to the sleep tables. Observing
-    /// stops when the consumer stops iterating or its task is cancelled. Errors end the stream.
+    /// Yields `latestSleepNight` now and again whenever it changes (a change to another ring's
+    /// sessions, or one that leaves this value the same, yields nothing). Only the newest
+    /// undelivered value is kept. Observing stops when the consumer stops iterating or its task
+    /// is cancelled. Errors end the stream.
     public func observeLatestSleepNight(ringID: UUID) -> AsyncThrowingStream<SleepNightDetail?, Error> {
         let writer = self.writer
-        return AsyncThrowingStream { continuation in
+        return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let task = Task {
                 do {
                     let observation = ValueObservation.tracking { db in
                         try Self.latestSleepNight(db, ringID: ringID)
-                    }
-                    for try await value in observation.values(in: writer) {
+                    }.removeDuplicates()
+                    for try await value in observation.values(in: writer, bufferingPolicy: .bufferingNewest(1)) {
                         continuation.yield(value)
                     }
                     continuation.finish()
@@ -215,7 +250,7 @@ extension RingStore {
         var runs: [[SessionRow]] = []
         var latestEnd: Int64 = 0
         for session in sessions {
-            if !runs.isEmpty, session.start - latestEnd <= Int64(sleepNightMaximumGapSeconds) * 1000 {
+            if !runs.isEmpty, session.start - latestEnd <= Int64(SleepNightSummary.maximumGapSeconds) * 1000 {
                 runs[runs.count - 1].append(session)
                 latestEnd = max(latestEnd, session.end)
             } else {
@@ -242,10 +277,11 @@ extension RingStore {
             }
             let summary = SleepNightSummary(
                 day: SleepDay(instant: date(last.end), utcOffsetSeconds: last.offset),  // rule 2
+                utcOffsetSeconds: last.offset,
                 start: date(run[0].start), end: date(last.end), secondsByKind: byKind,
                 secondsAsleep: [SleepStageKind.deep, .light, .rem, .nap].reduce(0) { $0 + (byKind[$1] ?? 0) },
-                interruptions: interruptions, interruptionSeconds: interruptions.reduce(0) { $0 + $1.seconds },
-                // Rule 4: the least certain source; `allCases` runs from most to least certain.
+                interruptions: interruptions,
+                // Rule 4: the least certain source.
                 timeSource: run.map(\.source).max { rank($0) < rank($1) } ?? .resolved,
                 isMainSleep: false)
             return NightGroup(summary: summary, sessionIDs: run.map(\.id))
@@ -267,6 +303,11 @@ extension RingStore {
     }
 
     private static func rank(_ source: TimeSource) -> Int {
-        TimeSource.allCases.firstIndex(of: source) ?? 0
+        // Exhaustive on purpose: a new case must be placed in the order here.
+        switch source {
+        case .resolved: 0
+        case .ambiguous: 1
+        case .assumed: 2
+        }
     }
 }

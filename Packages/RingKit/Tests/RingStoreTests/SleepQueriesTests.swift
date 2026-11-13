@@ -57,18 +57,22 @@ private func ingest(_ f: Fixture, _ sessions: [Session]) throws -> IngestionResu
     return try f.store.ingest(ringID: f.ring.id, kind: .sleep)
 }
 
-private func setColumns(_ f: Fixture, startingAt start: Double, offset: Int? = nil, source: String? = nil) throws {
+/// Changes the offset or time source of the one ingested session that starts at `start`. Ingestion
+/// would need an elaborate clock-set history to produce these, which is not what is under test.
+private func setColumns(_ f: Fixture, startingAt start: Double, offset: Int? = nil, source: TimeSource? = nil) throws {
     try f.store.writer.write { db in
-        let ms = Int64(at(start).timeIntervalSince1970 * 1000)
+        let ms = HistoryTransfer.millisecondsSince1970(at(start))
         if let offset {
             try db.execute(
                 sql: "UPDATE sleep_session SET utc_offset_seconds = ? WHERE ring_id = ? AND start = ?",
                 arguments: [offset, f.ring.id.uuidString, ms])
+            #expect(db.changesCount == 1)
         }
         if let source {
             try db.execute(
                 sql: "UPDATE sleep_session SET time_source = ? WHERE ring_id = ? AND start = ?",
-                arguments: [source, f.ring.id.uuidString, ms])
+                arguments: [TimeSourceCode.code(for: source), f.ring.id.uuidString, ms])
+            #expect(db.changesCount == 1)
         }
     }
 }
@@ -139,6 +143,64 @@ struct SleepQueriesTests {
         #expect(nights[0].interruptions.isEmpty)
     }
 
+    @Test func sessionsEndingTogetherTheLaterInStartOrderSuppliesDayAndOffset() async throws {
+        let f = try fixture(RingStore())
+        try ingest(f, [Session(20 * hour, 23.5 * hour), Session(21 * hour, 23.5 * hour)])
+        try setColumns(f, startingAt: 20 * hour, offset: 3600)  // would put the day on day 1
+        let night = try #require(try await allNights(f).first)
+        #expect(night.day == day0 && night.utcOffsetSeconds == 0)
+        #expect(night.start == at(20 * hour) && night.end == at(23.5 * hour))
+    }
+
+    @Test func aLaterNightCanFallOnAnEarlierDayAndTheLatestDayWins() async throws {
+        let f = try fixture(RingStore())
+        let d2 = 2 * 86400.0, d3 = 3 * 86400.0
+        try ingest(f, [Session(d2 + 22 * hour, d3 + 0.5 * hour), Session(d3 + 3 * hour, d3 + 4 * hour)])
+        try setColumns(f, startingAt: d2 + 22 * hour, offset: 3600)  // ends 01:30 on day 3
+        try setColumns(f, startingAt: d3 + 3 * hour, offset: -5 * 3600)  // ends 23:00 on day 2
+        let nights = try await allNights(f)
+        #expect(nights.map(\.day) == [day(3), day(2)])
+        #expect(nights.map(\.utcOffsetSeconds) == [3600, -5 * 3600])
+        #expect(try await f.store.latestSleepNight(ringID: f.ring.id)?.summary == nights[0])
+    }
+
+    @Test func detailStagesFollowTimeAcrossOverlappingSessions() async throws {
+        let f = try fixture(RingStore())
+        try ingest(f, [
+            Session(0, 2000, stages: [(241, 0, 500), (242, 1000, 1000)]),
+            Session(500, 1500, stages: [(243, 500, 900)]),
+        ])
+        let night = try #require(try await f.store.latestSleepNight(ringID: f.ring.id))
+        #expect(night.stages.map(\.kind) == [.deep, .rem, .light])
+    }
+
+    @Test func nightStartAndTwoInterruptionsWithSeveralSessions() async throws {
+        let f = try fixture(RingStore())
+        try ingest(f, [Session(0, hour), Session(hour + 10 * minute, 2 * hour), Session(2 * hour + 30 * minute, 3 * hour)])
+        let night = try #require(try await allNights(f).first)
+        #expect(night.start == at(0) && night.end == at(3 * hour))
+        #expect(night.interruptions.count == 2)
+        #expect(night.interruptionSeconds == 600 + 1800)
+    }
+
+    @Test func sleepDayIsReadInGMTWhateverTheDeviceZone() {
+        // Fixed expectations: they hold whatever the host zone, and fail if the calendar uses it
+        // (on a host that is not already GMT; CI runs in UTC, where only a hand-run with `TZ` set
+        // to another zone can tell the two apart, because `TimeZone.current` cannot be changed
+        // from inside the process).
+        // 23:30 UTC on day 0 is 00:00 on day 1 at +30 minutes, still day 0 at +29:59.
+        #expect(SleepDay(instant: at(23.5 * hour), utcOffsetSeconds: 1800) == day(1))
+        #expect(SleepDay(instant: at(23.5 * hour), utcOffsetSeconds: 1799) == day0)
+        // Negative: 00:30 UTC less an hour is 23:30 the day before.
+        #expect(SleepDay(instant: at(0.5 * hour), utcOffsetSeconds: -3600) == day(-1))
+        // Half-hour positive offset (+05:30): 18:30 UTC is midnight.
+        #expect(SleepDay(instant: at(18.5 * hour), utcOffsetSeconds: 19800) == day(1))
+        #expect(SleepDay(instant: at(18.5 * hour - 1), utcOffsetSeconds: 19800) == day0)
+        // A month and year boundary.
+        #expect(SleepDay(instant: Date(timeIntervalSince1970: 1_798_761_599), utcOffsetSeconds: 1)
+            == SleepDay(year: 2027, month: 1, day: 1))
+    }
+
     @Test func totalsPerKindAndTimeAsleep() async throws {
         let f = try fixture(RingStore())
         try ingest(f, [
@@ -192,10 +254,10 @@ struct SleepQueriesTests {
         let f = try fixture(RingStore())
         try ingest(f, [Session(0, hour), Session(hour + 600, 2 * hour), Session(2 * hour + 600, 3 * hour)])
         #expect(try await allNights(f)[0].timeSource == .resolved)
-        try setColumns(f, startingAt: hour + 600, source: "ambiguous")
+        try setColumns(f, startingAt: hour + 600, source: .ambiguous)
         #expect(try await allNights(f)[0].timeSource == .ambiguous)
-        try setColumns(f, startingAt: 2 * hour + 600, source: "assumed")
-        try setColumns(f, startingAt: 0, source: "resolved")
+        try setColumns(f, startingAt: 2 * hour + 600, source: .assumed)
+        try setColumns(f, startingAt: 0, source: .resolved)
         let nights = try await allNights(f)
         #expect(nights.count == 1 && nights[0].timeSource == .assumed)
         #expect(nights[0].secondsAsleep == 3600 + 3000 + 3000)
@@ -227,7 +289,7 @@ struct SleepQueriesTests {
 
         let latest = try #require(try await f.store.latestSleepNight(ringID: f.ring.id))
         #expect(latest.summary == wide[2])
-        let detail = try #require(try await f.store.sleepNightDetail(ringID: f.ring.id, for: wide[0]))
+        let detail = try #require(try await f.store.sleepNightDetail(ringID: f.ring.id, startingAt: wide[0].start))
         #expect(detail.summary == wide[0])
         #expect(detail.stages.count == 2)
         #expect(detail.stages.map(\.start) == detail.stages.map(\.start).sorted())
@@ -240,13 +302,11 @@ struct SleepQueriesTests {
             Session(1600, 2000, stages: [(242, 1600, 400)]),
         ])
         let summary = try #require(try await allNights(f).first)
-        let detail = try #require(try await f.store.sleepNightDetail(ringID: f.ring.id, for: summary))
+        let detail = try #require(try await f.store.sleepNightDetail(ringID: f.ring.id, startingAt: summary.start))
         #expect(detail.stages.map(\.kind) == [.deep, .rem, .light])
         #expect(detail.summary.interruptions == [SleepInterruption(start: at(1000), end: at(1600))])
 
-        var stale = summary
-        stale.start = at(-5)
-        #expect(try await f.store.sleepNightDetail(ringID: f.ring.id, for: stale) == nil)
+        #expect(try await f.store.sleepNightDetail(ringID: f.ring.id, startingAt: at(-5)) == nil)
     }
 
     @Test func emptyRingAndRingsAreIndependent() async throws {
@@ -287,6 +347,28 @@ struct SleepQueriesTests {
         #expect(try await f.store.latestSleepNight(ringID: f.ring.id) != nil)
     }
 
+    @Test func aChangeToAnotherRingYieldsNothingNew() async throws {
+        let store = try RingStore()
+        let f = try fixture(store)
+        let g = try fixture(store)
+        let ringID = f.ring.id
+        let seen = AsyncStream<SleepNightDetail?>.makeStream()
+        let task = Task {
+            for try await value in store.observeLatestSleepNight(ringID: ringID) { seen.continuation.yield(value) }
+            seen.continuation.finish()
+        }
+        var values = seen.stream.makeAsyncIterator()
+        #expect(try #require(await values.next()) == nil)
+
+        try ingest(g, [Session(5 * hour, 6 * hour)])  // another ring: must not yield
+        try ingest(f, [Session(0, hour)])  // a real change to this ring
+        // Had the other ring's change yielded, the next value would be an unchanged `nil`.
+        let next = try #require(await values.next())
+        #expect(next?.summary.start == at(0))
+        task.cancel()
+        try await task.value
+    }
+
     @Test func observationYieldsNowAndAfterAChangeAndEndsOnCancel() async throws {
         let f = try fixture(RingStore())
         let store = f.store
@@ -298,16 +380,12 @@ struct SleepQueriesTests {
         }
         var values = seen.stream.makeAsyncIterator()
 
-        let initial = await values.next()
-        #expect(initial != nil && initial! == nil)  // a first value with no night
+        let initial = try #require(await values.next())
+        #expect(initial == nil)  // a first value with no night
 
         try ingest(f, [Session(0, hour)])
-        var latest: SleepNightDetail?
-        // Further values may repeat the same state; read until the new night shows.
-        while latest == nil {
-            guard let next = await values.next() else { break }
-            latest = next
-        }
+        // Values are de-duplicated, so the next one is the new night.
+        let latest = try #require(await values.next())
         #expect(latest?.summary.start == at(0))
 
         task.cancel()
