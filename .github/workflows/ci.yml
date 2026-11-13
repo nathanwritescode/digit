@@ -59,6 +59,26 @@ jobs:
       - name: Show toolchain
         run: xcodebuild -version
 
+      # The signing team is set in a git-ignored Local.xcconfig. Choosing it in Xcode's
+      # Signing & Capabilities pane writes it into the project file instead, as the
+      # DEVELOPMENT_TEAM build setting and sometimes as DevelopmentTeam under TargetAttributes.
+      # The check is quiet (-q) so that a committed team ID is not also copied into this log.
+      - name: Check that no signing team is committed
+        run: |
+          project=App/Digit.xcodeproj/project.pbxproj
+          if [ ! -f "$project" ]; then
+            echo "::error::$project not found; update this check if the project moved."
+            exit 1
+          fi
+          if grep -qE "DEVELOPMENT_TEAM|DevelopmentTeam" "$project"; then
+            echo "::error::A signing team is set in project.pbxproj. Remove DEVELOPMENT_TEAM and DevelopmentTeam from it and set the team in App/Config/Local.xcconfig."
+            exit 1
+          fi
+          if git ls-files --error-unmatch App/Config/Local.xcconfig >/dev/null 2>&1; then
+            echo "::error::App/Config/Local.xcconfig is committed. Remove it from the repository; it holds the signing team."
+            exit 1
+          fi
+
       - name: Build for the iOS simulator
         run: |
           xcodebuild -project App/Digit.xcodeproj -scheme Digit \

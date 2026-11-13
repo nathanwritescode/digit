@@ -1,0 +1,10 @@
+// Copy this file to Local.xcconfig (same folder), then uncomment the line below and add
+// your Apple Developer team ID. Local.xcconfig is git-ignored; never commit a team ID.
+//
+// The team ID is the 10-character identifier shown under Membership details at
+// developer.apple.com/account.
+//
+// The line is commented out so that an unedited copy leaves the team unset, which Xcode
+// reports clearly, instead of a placeholder that fails later as an unknown team.
+
+// DEVELOPMENT_TEAM =

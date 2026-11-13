@@ -1,0 +1,9 @@
+// The development team is not committed: each developer sets it in Local.xcconfig, which is
+// git-ignored. Copy Local.xcconfig.example to Local.xcconfig and fill in your team ID.
+// Do not choose a team in Xcode's Signing & Capabilities pane: Xcode would write it into
+// project.pbxproj, and CI rejects that.
+//
+// The "?" makes the include optional, so the project still builds for the simulator (and in
+// CI) without the local file.
+
+#include? "Local.xcconfig"
