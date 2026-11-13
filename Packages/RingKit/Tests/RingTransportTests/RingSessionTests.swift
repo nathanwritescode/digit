@@ -370,7 +370,15 @@ private let deviceReply = Frame(group: 0x02, key: 0x00, payload: [7])
 // The write deadline has one owner, the link. If the session's own deadline on a write could fire
 // before the link's, the link would still have the write in flight and refuse the next one. The
 // combinations include a reply timeout much shorter than the link's write timeout.
-@Test(.timeLimit(.minutes(1)), arguments: [0.03, 0.05, 0.1], [0.03, 0.1, 0.2])
+//
+// The session's backstop fires `replyTimeout` after the link's own deadline, and the two run on
+// different timers (a task sleep and a dispatch queue). With a margin of tens of milliseconds a
+// loaded machine could delay the link's timer past the backstop, and the test failed on CI with
+// `busy` although the code was right (#37). The reply timeouts are therefore large enough to
+// absorb scheduling delay. This is still a race between real timers, not a proof: the test fails
+// reliably if the backstop is earlier than the link's deadline, and usually (two runs in three
+// when tried) if the two are equal. A deterministic version is tracked in #39.
+@Test(.timeLimit(.minutes(1)), arguments: [0.5, 1.0], [0.05, 0.5, 2.0])
 func linkThatTimesOutItsOwnWriteLeavesTheSessionUsable(replyTimeout: Double, writeTimeout: Double) async throws {
     let link = FakeLink(guardWrites: true, writeTimeout: writeTimeout) { $0.type == 0x0200 ? [deviceReply] : [] }
     let s = RingSession(link: link, replyTimeout: replyTimeout)
