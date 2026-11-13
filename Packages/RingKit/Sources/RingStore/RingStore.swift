@@ -50,43 +50,104 @@ public final class RingStore: Sendable {
     // MARK: Rings
 
     /// Registers a new ring under a freshly generated identifier.
+    ///
+    /// Every public function below that touches the database comes as a synchronous and an `async`
+    /// twin (same name, same arguments). Both run the same `static` implementation, so they cannot
+    /// drift. The app must use the `async` ones: the synchronous ones block the calling thread.
     @discardableResult
     public func registerRing(
         protocolFamily: String, model: String? = nil, firmware: String? = nil, now: Date = Date()
     ) throws -> StoredRing {
-        let firstSeen = HistoryTransfer.millisecondsSince1970(now)
-        let ring = StoredRing(
-            id: UUID(), protocolFamily: protocolFamily, model: model, firmware: firmware,
-            firstSeenAt: HistoryTransfer.date(millisecondsSince1970: firstSeen))
-        try writer.write { db in
-            try db.execute(
-                sql: "INSERT INTO ring (id, protocol_family, model, firmware, first_seen_at) VALUES (?, ?, ?, ?, ?)",
-                arguments: [ring.id.uuidString, ring.protocolFamily, ring.model, ring.firmware, firstSeen])
-        }
+        let ring = Self.newRing(protocolFamily: protocolFamily, model: model, firmware: firmware, now: now)
+        try writer.write { db in try Self.insertRing(db, ring) }
         return ring
     }
 
+    /// The `async` twin of `registerRing(protocolFamily:model:firmware:now:)`.
+    @discardableResult
+    public func registerRing(
+        protocolFamily: String, model: String? = nil, firmware: String? = nil, now: Date = Date()
+    ) async throws -> StoredRing {
+        let ring = Self.newRing(protocolFamily: protocolFamily, model: model, firmware: firmware, now: now)
+        try await writer.write { db in try Self.insertRing(db, ring) }
+        return ring
+    }
+
+    private static func newRing(protocolFamily: String, model: String?, firmware: String?, now: Date) -> StoredRing {
+        StoredRing(
+            id: UUID(), protocolFamily: protocolFamily, model: model, firmware: firmware,
+            firstSeenAt: HistoryTransfer.date(millisecondsSince1970: HistoryTransfer.millisecondsSince1970(now)))
+    }
+
+    private static func insertRing(_ db: Database, _ ring: StoredRing) throws {
+        try db.execute(
+            sql: "INSERT INTO ring (id, protocol_family, model, firmware, first_seen_at) VALUES (?, ?, ?, ?, ?)",
+            arguments: [
+                ring.id.uuidString, ring.protocolFamily, ring.model, ring.firmware,
+                HistoryTransfer.millisecondsSince1970(ring.firstSeenAt),
+            ])
+    }
+
     public func ring(id: UUID) throws -> StoredRing? {
-        try writer.read { db in
-            try Row.fetchOne(db, sql: "SELECT * FROM ring WHERE id = ?", arguments: [id.uuidString]).map(Self.ring)
-        }
+        try writer.read { db in try Self.ring(db, id: id) }
+    }
+
+    public func ring(id: UUID) async throws -> StoredRing? {
+        try await writer.read { db in try Self.ring(db, id: id) }
+    }
+
+    private static func ring(_ db: Database, id: UUID) throws -> StoredRing? {
+        try Row.fetchOne(db, sql: "SELECT * FROM ring WHERE id = ?", arguments: [id.uuidString]).map(Self.ring)
     }
 
     /// All rings, oldest first.
     public func rings() throws -> [StoredRing] {
-        try writer.read { db in
-            try Row.fetchAll(db, sql: "SELECT * FROM ring ORDER BY first_seen_at, id").map(Self.ring)
-        }
+        try writer.read { db in try Self.rings(db) }
+    }
+
+    public func rings() async throws -> [StoredRing] {
+        try await writer.read { db in try Self.rings(db) }
+    }
+
+    private static func rings(_ db: Database) throws -> [StoredRing] {
+        try Row.fetchAll(db, sql: "SELECT * FROM ring ORDER BY first_seen_at, id").map(Self.ring)
     }
 
     /// Updates the model and firmware the ring reported (for example after a firmware update).
     public func updateRing(id: UUID, model: String?, firmware: String?) throws {
-        try writer.write { db in
-            try db.execute(
-                sql: "UPDATE ring SET model = ?, firmware = ? WHERE id = ?",
-                arguments: [model, firmware, id.uuidString])
-            if db.changesCount == 0 { throw RingStoreError.unknownRing(id) }
-        }
+        try writer.write { db in try Self.updateRing(db, id: id, model: model, firmware: firmware) }
+    }
+
+    public func updateRing(id: UUID, model: String?, firmware: String?) async throws {
+        try await writer.write { db in try Self.updateRing(db, id: id, model: model, firmware: firmware) }
+    }
+
+    private static func updateRing(_ db: Database, id: UUID, model: String?, firmware: String?) throws {
+        try db.execute(
+            sql: "UPDATE ring SET model = ?, firmware = ? WHERE id = ?",
+            arguments: [model, firmware, id.uuidString])
+        if db.changesCount == 0 { throw RingStoreError.unknownRing(id) }
+    }
+
+    /// Remembers the identifier CoreBluetooth gave this phone for the ring (`CBPeripheral.identifier`),
+    /// so the app can reconnect without scanning; `nil` clears it. It replaces any earlier value.
+    ///
+    /// This is a UUID that means nothing off this device. It is not the Bluetooth address and not
+    /// the ring's serial number, and it must never appear in an export or leave the phone. Throws
+    /// `unknownRing` if no such ring is stored.
+    public func setPeripheralIdentifier(_ identifier: UUID?, forRing id: UUID) throws {
+        try writer.write { db in try Self.setPeripheralIdentifier(db, identifier, forRing: id) }
+    }
+
+    public func setPeripheralIdentifier(_ identifier: UUID?, forRing id: UUID) async throws {
+        try await writer.write { db in try Self.setPeripheralIdentifier(db, identifier, forRing: id) }
+    }
+
+    private static func setPeripheralIdentifier(_ db: Database, _ identifier: UUID?, forRing id: UUID) throws {
+        try db.execute(
+            sql: "UPDATE ring SET peripheral_identifier = ? WHERE id = ?",
+            arguments: [identifier?.uuidString, id.uuidString])
+        if db.changesCount == 0 { throw RingStoreError.unknownRing(id) }
     }
 
     // MARK: Transfers
@@ -159,55 +220,68 @@ public final class RingStore: Sendable {
     /// Only a clash on the content hash counts as a duplicate; any other constraint failure throws.
     @discardableResult
     public func insert(_ transfer: HistoryTransfer, ringID: UUID) throws -> InsertOutcome {
+        try writer.write { db in try Self.insert(db, transfer, ringID: ringID) }
+    }
+
+    @discardableResult
+    public func insert(_ transfer: HistoryTransfer, ringID: UUID) async throws -> InsertOutcome {
+        try await writer.write { db in try Self.insert(db, transfer, ringID: ringID) }
+    }
+
+    private static func insert(_ db: Database, _ transfer: HistoryTransfer, ringID: UUID) throws -> InsertOutcome {
         let hash = Self.contentHash(ringID: ringID, kind: transfer.kind, data: transfer.data)
         let kindCode = KindCode.code(for: transfer.kind)
         let data = Data(transfer.data)
-        return try writer.write { db in
-            try Self.requireRing(db, ringID)
-            try db.execute(
-                sql: Self.insertObservationSQL,
-                arguments: [
-                    ringID.uuidString, kindCode, data.count, Data(transfer.header),
-                    HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),
-                ])
-            if let existing = try Int64.fetchOne(
-                db, sql: "SELECT id FROM history_transfer WHERE content_hash = ?", arguments: [Data(hash)])
-            {
-                return .duplicate(existingID: existing)
-            }
-            if let superseder = try Int64.fetchOne(
-                db, sql: Self.findSupersederSQL,
-                arguments: [ringID.uuidString, kindCode, data.count, data.count, data])
-            {
-                return .supersededByExisting(existingID: superseder)
-            }
-            try db.execute(
-                sql: Self.insertTransferSQL,
-                arguments: [
-                    ringID.uuidString, kindCode, Data(transfer.header), data,
-                    HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),
-                ])
-            // Unreachable in practice: the hash lookup above already returned for a duplicate, and
-            // writes are serialised. The ON CONFLICT clause stays so a conflict can never turn into
-            // a thrown constraint error or a silent overwrite.
-            guard db.changesCount > 0 else {
-                throw RingStoreError.corruptRow("content hash conflict that the duplicate check did not see")
-            }
-            let id = db.lastInsertedRowID
-            try db.execute(sql: Self.pruneSupersededSQL, arguments: [ringID.uuidString, kindCode, data.count, data])
-            return .inserted(id: id, pruned: db.changesCount)
+        try Self.requireRing(db, ringID)
+        try db.execute(
+            sql: Self.insertObservationSQL,
+            arguments: [
+                ringID.uuidString, kindCode, data.count, Data(transfer.header),
+                HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),
+            ])
+        if let existing = try Int64.fetchOne(
+            db, sql: "SELECT id FROM history_transfer WHERE content_hash = ?", arguments: [Data(hash)])
+        {
+            return .duplicate(existingID: existing)
         }
+        if let superseder = try Int64.fetchOne(
+            db, sql: Self.findSupersederSQL,
+            arguments: [ringID.uuidString, kindCode, data.count, data.count, data])
+        {
+            return .supersededByExisting(existingID: superseder)
+        }
+        try db.execute(
+            sql: Self.insertTransferSQL,
+            arguments: [
+                ringID.uuidString, kindCode, Data(transfer.header), data,
+                HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),
+            ])
+        // Unreachable in practice: the hash lookup above already returned for a duplicate, and
+        // writes are serialised. The ON CONFLICT clause stays so a conflict can never turn into
+        // a thrown constraint error or a silent overwrite.
+        guard db.changesCount > 0 else {
+            throw RingStoreError.corruptRow("content hash conflict that the duplicate check did not see")
+        }
+        let id = db.lastInsertedRowID
+        try db.execute(sql: Self.pruneSupersededSQL, arguments: [ringID.uuidString, kindCode, data.count, data])
+        return .inserted(id: id, pruned: db.changesCount)
     }
 
     /// One transfer by row id. Throws `corruptRow` if the row's kind code is not one this version
     /// knows (for example written by a newer version).
     public func transfer(id: Int64) throws -> StoredTransfer? {
-        try writer.read { db in
-            guard let row = try Row.fetchOne(db, sql: "SELECT * FROM history_transfer WHERE id = ?", arguments: [id])
-            else { return nil }
-            guard let stored = try Self.storedTransfer(row) else { throw RingStoreError.corruptRow("unknown history kind") }
-            return stored
-        }
+        try writer.read { db in try Self.transfer(db, id: id) }
+    }
+
+    public func transfer(id: Int64) async throws -> StoredTransfer? {
+        try await writer.read { db in try Self.transfer(db, id: id) }
+    }
+
+    private static func transfer(_ db: Database, id: Int64) throws -> StoredTransfer? {
+        guard let row = try Row.fetchOne(db, sql: "SELECT * FROM history_transfer WHERE id = ?", arguments: [id])
+        else { return nil }
+        guard let stored = try Self.storedTransfer(row) else { throw RingStoreError.corruptRow("unknown history kind") }
+        return stored
     }
 
     /// The fetch log for a ring, optionally of one kind: one entry per distinct fetch (same data
@@ -217,6 +291,10 @@ public final class RingStore: Sendable {
     /// fetch". (With `kind` given, no unknown row can match, so the count is 0.)
     public func observations(ringID: UUID, kind: HistoryKind? = nil) throws -> ObservationListing {
         try writer.read { db in try Self.observations(db, ringID: ringID, kind: kind) }
+    }
+
+    public func observations(ringID: UUID, kind: HistoryKind? = nil) async throws -> ObservationListing {
+        try await writer.read { db in try Self.observations(db, ringID: ringID, kind: kind) }
     }
 
     static func observations(_ db: Database, ringID: UUID, kind: HistoryKind?) throws -> ObservationListing {
@@ -260,6 +338,12 @@ public final class RingStore: Sendable {
         try writer.read { db in try Self.transfers(db, ringID: ringID, kind: kind, fetchedWithin: range) }
     }
 
+    public func transfers(
+        ringID: UUID, kind: HistoryKind? = nil, fetchedWithin range: ClosedRange<Date>? = nil
+    ) async throws -> TransferListing {
+        try await writer.read { db in try Self.transfers(db, ringID: ringID, kind: kind, fetchedWithin: range) }
+    }
+
     static func transfers(
         _ db: Database, ringID: UUID, kind: HistoryKind?, fetchedWithin range: ClosedRange<Date>?
     ) throws -> TransferListing {
@@ -289,20 +373,30 @@ public final class RingStore: Sendable {
     // MARK: Clock sets
 
     public func recordClockSet(_ event: ClockSetEvent) throws {
-        try writer.write { db in
-            try Self.requireRing(db, event.ringID)
-            try db.execute(
-                sql: "INSERT INTO clock_set (ring_id, instant, time_zone_identifier, utc_offset_seconds) VALUES (?, ?, ?, ?)",
-                arguments: [
-                    event.ringID.uuidString, HistoryTransfer.millisecondsSince1970(event.instant),
-                    event.timeZoneIdentifier, event.utcOffsetSeconds,
-                ])
-        }
+        try writer.write { db in try Self.recordClockSet(db, event) }
+    }
+
+    public func recordClockSet(_ event: ClockSetEvent) async throws {
+        try await writer.write { db in try Self.recordClockSet(db, event) }
+    }
+
+    private static func recordClockSet(_ db: Database, _ event: ClockSetEvent) throws {
+        try Self.requireRing(db, event.ringID)
+        try db.execute(
+            sql: "INSERT INTO clock_set (ring_id, instant, time_zone_identifier, utc_offset_seconds) VALUES (?, ?, ?, ?)",
+            arguments: [
+                event.ringID.uuidString, HistoryTransfer.millisecondsSince1970(event.instant),
+                event.timeZoneIdentifier, event.utcOffsetSeconds,
+            ])
     }
 
     /// Clock-set events for a ring in time order (ties in the order recorded).
     public func clockSets(ringID: UUID) throws -> [ClockSetEvent] {
         try writer.read { db in try Self.clockSets(db, ringID: ringID) }
+    }
+
+    public func clockSets(ringID: UUID) async throws -> [ClockSetEvent] {
+        try await writer.read { db in try Self.clockSets(db, ringID: ringID) }
     }
 
     static func clockSets(_ db: Database, ringID: UUID) throws -> [ClockSetEvent] {
@@ -469,6 +563,12 @@ public final class RingStore: Sendable {
                 ) STRICT;
                 """)
         }
+        // Registered under its own name so it can sit beside other v4 migrations: GRDB tracks
+        // applied migrations by name and runs unapplied ones in registration order, so a database
+        // that has one already still gets the other.
+        migrator.registerMigration("v4-ring-peripheral") { db in
+            try db.execute(sql: "ALTER TABLE ring ADD COLUMN peripheral_identifier TEXT")
+        }
         return migrator
     }
 
@@ -533,7 +633,11 @@ public final class RingStore: Sendable {
         StoredRing(
             id: try uuid(try column(row, "id")), protocolFamily: try column(row, "protocol_family"),
             model: try column(row, "model"), firmware: try column(row, "firmware"),
-            firstSeenAt: HistoryTransfer.date(millisecondsSince1970: try column(row, "first_seen_at")))
+            firstSeenAt: HistoryTransfer.date(millisecondsSince1970: try column(row, "first_seen_at")),
+            peripheralIdentifier: try (column(row, "peripheral_identifier") as String?).map { text in
+                guard let id = UUID(uuidString: text) else { throw RingStoreError.corruptRow("peripheral identifier") }
+                return id
+            })
     }
 
     /// Nil when the row's kind code is not known to this version.

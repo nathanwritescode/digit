@@ -11,6 +11,11 @@ public struct StoredRing: Equatable, Sendable {
     public var firmware: String?
     /// Whole milliseconds.
     public var firstSeenAt: Date
+    /// What CoreBluetooth calls this ring on this phone (`CBPeripheral.identifier`), used to
+    /// reconnect without scanning; `nil` until the app has connected. Meaningless off this device:
+    /// not the Bluetooth address, never to be exported or sent anywhere. Set with
+    /// `RingStore.setPeripheralIdentifier(_:forRing:)`.
+    public var peripheralIdentifier: UUID? = nil
 }
 
 /// A history transfer as saved, with its row id and owning ring.
