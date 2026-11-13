@@ -13,6 +13,16 @@ private func at(_ seconds: Double) -> Date { t0.addingTimeInterval(seconds) }
 /// A record's bytes for the pure tests (the resolver never decodes them, it only hashes prefixes).
 private func filler(_ byte: UInt8) -> [UInt8] { [UInt8](repeating: byte, count: 6) }
 
+extension TimeResolver {
+    /// Resolves the record at `offset` of the data `sightings` came from. Test-side convenience; the
+    /// app resolves by window.
+    func resolve(
+        sightings: [Sighting], offset: Int, length: Int, reference: Date, start: Date? = nil
+    ) throws -> ResolvedOffset {
+        resolve(window: try window(sightings: sightings, offset: offset, length: length), reference: reference, start: start)
+    }
+}
+
 struct TimeResolutionTests {
     private let ring = UUID()
 
@@ -47,7 +57,13 @@ struct TimeResolutionTests {
         reference: Date, kind: HistoryKind = .heartRate, start: Date? = nil, anchored: Bool = true
     ) throws -> ResolvedOffset {
         var log = clocks
-        if anchored, let first = clocks.first { log.insert(clock(-200_000, first.utcOffsetSeconds), at: 0) }
+        if anchored, let first = clocks.first {
+            log.insert(
+                ClockSetEvent(
+                    ringID: ring, instant: first.instant.addingTimeInterval(-200_000),
+                    timeZoneIdentifier: first.timeZoneIdentifier, utcOffsetSeconds: first.utcOffsetSeconds),
+                at: 0)
+        }
         let r = TimeResolver(ringID: ring, kind: kind, observations: observations(fetches, kind: kind), clockSets: log)
         return try r.resolve(
             sightings: r.sightings(in: data), offset: offset, length: 6, reference: reference, start: start)
@@ -500,7 +516,7 @@ struct TimeResolutionTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             try f.fetch(.heartRate, hrBytes(wall(at(1800), offset: 3600), bpm: 60), at: at(3600))
             let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
             #expect(result.inserted == 1 && result.rowsByTimeSource == [.resolved: 1])
@@ -513,7 +529,7 @@ struct TimeResolutionTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)  // London
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)  // London
             let r0 = hrBytes(wall(at(1800), offset: 3600), bpm: 60)
             try f.fetch(.heartRate, r0, at: at(3600))
             try f.setClock(at: at(3610), offset: -18000, zone: "America/New_York")  // flew west
@@ -534,7 +550,7 @@ struct TimeResolutionTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             let before = hrBytes(wall(at(1800), offset: 3600), bpm: 60)
             try f.fetch(.heartRate, before, at: at(3600))
             try f.fetch(.heartRate, before, at: at(7200))  // unchanged duplicate at the clock change
@@ -554,7 +570,7 @@ struct TimeResolutionTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 0)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 0)
             let before = hrBytes(wall(at(1800), offset: 0), bpm: 60)
             try f.fetch(.heartRate, before, at: at(3600))
             try f.setClock(at: at(3610), offset: 3600)  // clock forward an hour
@@ -572,7 +588,7 @@ struct TimeResolutionTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             try f.setClock(at: at(7200), offset: 0)  // the sync between failed to fetch
             try f.fetch(.heartRate, hrBytes(wall(at(9000), offset: 0), bpm: 60), at: at(14400))
             let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
@@ -585,7 +601,7 @@ struct TimeResolutionTests {
     @Test func aRecordNoClockSetFitsIsAssumedThroughIngestion() throws {
         try onEachStore { store in
             let f = try Fixture(store)
-            try f.setFirstClock(at: at(0), offset: 3600)
+            try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
             try f.setClock(at: at(1000), offset: 7200)
             try f.fetch(.heartRate, hrBytes(wall(at(40000), offset: 3600), bpm: 60), at: at(3600))
             let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
@@ -612,7 +628,7 @@ struct TimeResolutionTests {
         try onEachStore { store in
             let f = try Fixture(store)
             func instant(_ text: String) -> Date { ISO8601DateFormatter().date(from: text)! }
-            func ringSeconds(_ text: String) -> UInt32 { UInt32(instant(text).timeIntervalSince1970 - 946_684_800) }
+            func ringSeconds(_ text: String) -> UInt32 { UInt32(RingTime.ringSeconds(fromWallClock: instant(text))) }
             // London moved to summer time on 2027-03-28. Both records were stamped by one clock.
             let data = hrBytes(ringSeconds("2027-03-27T12:00:00Z"), bpm: 60) + hrBytes(ringSeconds("2027-03-29T12:00:00Z"), bpm: 61)
             try f.fetch(.heartRate, data, at: instant("2027-03-30T12:00:00Z"), zone: "Europe/London")
@@ -629,7 +645,7 @@ struct TimeResolutionTests {
     private func sleepSession(endingAtReal end: Double, _ store: RingStore) throws -> SleepSessionRecord {
         let f = try Fixture(store)
         try f.fetch(.sleep, [], at: at(-10))
-        try f.setFirstClock(at: at(0), offset: 3600)
+        try f.setEarlierAndFirstClocks(at: at(0), offset: 3600)
         try f.fetch(.sleep, [], at: at(7200))
         try f.setClock(at: at(7210), offset: 0)
         let start = wall(at(end - 900), offset: 3600)

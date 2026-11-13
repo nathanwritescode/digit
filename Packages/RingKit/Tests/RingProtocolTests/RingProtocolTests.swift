@@ -111,6 +111,14 @@ private let utc = TimeZone(identifier: "UTC")!
     #expect(RingTime.date(fromRingSeconds: raw, timeZone: sixHoursBehind) == Date(timeIntervalSince1970: 1_767_225_600 + 6 * 3600))
 }
 
+@Test func ringSecondsFromWallClockInvertsTheAsIfUTCStep() {
+    // Synthetic values. 2000-01-01 00:00:00 is raw 0; 2026-01-01 00:00:00 is 9497 days later.
+    #expect(RingTime.ringSeconds(fromWallClock: Date(timeIntervalSince1970: 946_684_800)) == 0)
+    #expect(RingTime.ringSeconds(fromWallClock: Date(timeIntervalSince1970: 1_767_225_600)) == 9497 * 86400)
+    // A decoded record time in UTC round-trips back to the raw value.
+    #expect(RingTime.ringSeconds(fromWallClock: RingTime.date(fromRingSeconds: 123_456_789, timeZone: utc)) == 123_456_789)
+}
+
 // Synthetic records built from the documented layouts; replace with real captures once the ring has history.
 @Test func decodesActivityAndHeartRecords() {
     let activity = ActivityRecord.decode(hex("00000000 08070000 e803 bc02 2800"), timeZone: utc)
@@ -150,6 +158,20 @@ private let utc = TimeZone(identifier: "UTC")!
 
     #expect(SleepSession.decode(hex(normal + "0102030405060708090a0b0c0d0e0f1011121314"), timeZone: utc).count == 1)
     #expect(SleepSession.decode(hex("affa 1c00 00000000"), timeZone: utc).isEmpty)
+}
+
+@Test func sleepDecodingCountsStagesItSkips() {
+    // Synthetic bytes. One session with a valid light stage, an unknown kind (0x01), a zero-duration
+    // deep stage and a valid REM stage: the valid ones decode, two entries are reported as skipped.
+    let skipping = "affa 3400 00000000 08070000 ffff 0000 0000 0000"
+        + "f2 00000000 080700" + "01 08070000 080700" + "f1 10070000 000000" + "f3 18070000 080700"
+    let clean = "affa 1c00 a08c0000 a8930000 ffff 0807 0000 0000" + "f3 a08c0000 080700"
+    let sessions = SleepSession.decode(hex(skipping + clean), timeZone: utc)
+    #expect(sessions.count == 2)
+    #expect(sessions[0].stages.map(\.kind) == [.light, .rem])
+    #expect(sessions[0].skippedStages == 2)
+    #expect(sessions[1].skippedStages == 0)
+    #expect(SleepSession.decodeLocated(hex(skipping), timeZone: utc).first?.record.skippedStages == 2)
 }
 
 @Test func hexRoundTripsAndRejectsBadInput() {

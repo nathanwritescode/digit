@@ -4,6 +4,14 @@ import Foundation
 public enum RingTime {
     private static let epochOffset: TimeInterval = 946_684_800
 
+    /// Seconds since 2000-01-01 of a wall-clock reading held as a `Date` as if it were UTC (what
+    /// the record decoders return before any time zone is applied). The inverse of the first step
+    /// of `date(fromRingSeconds:timeZone:)`. Pure arithmetic, no I/O. The result is negative for dates before 2000 and can exceed
+    /// `UInt32.max` for dates far past the ring's range, so a caller that narrows it must check.
+    public static func ringSeconds(fromWallClock asIfUTC: Date) -> Int {
+        Int(asIfUTC.timeIntervalSince1970 - epochOffset)
+    }
+
     public static func date(fromRingSeconds raw: UInt32, timeZone: TimeZone) -> Date {
         let asIfUTC = Date(timeIntervalSince1970: TimeInterval(raw) + epochOffset)
         // Two passes so the offset is taken at the real instant, not the wall-clock one.
@@ -157,11 +165,16 @@ public struct SleepStage: Equatable, Sendable {
 /// Quirks seen on that ring, all passed through unchanged: stages start one second after the
 /// previous one ends (see `SleepStage.isContiguous`); no awake stages were reported; one night
 /// arrived as two sessions a few minutes apart, so a brief wake-up can be a gap between sessions.
+/// Stage entries with an unknown kind or zero duration are dropped and counted in `skippedStages`.
 /// Verified against one real night; test fixtures are synthetic.
 public struct SleepSession: Equatable, Sendable {
     public var start: Date
     public var end: Date
     public var stages: [SleepStage]
+    /// How many 8-byte stage entries in this session were not decoded because their kind byte is
+    /// unknown or their duration is zero. None has been seen from an R99; counted so a gap in the
+    /// night is not unaccounted for. The skipped entries are not kept anywhere in decoded form.
+    public var skippedStages = 0
 
     public func total(_ kind: SleepStageKind) -> TimeInterval {
         stages.lazy.filter { $0.kind == kind }.reduce(0) { $0 + $1.duration }
@@ -184,6 +197,7 @@ public struct SleepSession: Equatable, Sendable {
             guard b[i] == 0xAF, b[i + 1] == 0xFA, recordLength >= headerSize else { break }
             let recordEnd = min(i + recordLength, b.count)
             var stages: [SleepStage] = []
+            var skipped = 0
             var j = i + headerSize
             while j + stageSize <= recordEnd {
                 if let kind = SleepStageKind(rawValue: b[j]), b.u24(j + 5) > 0 {
@@ -191,6 +205,8 @@ public struct SleepSession: Equatable, Sendable {
                         kind: kind,
                         start: RingTime.date(fromRingSeconds: b.u32(j + 1), timeZone: timeZone),
                         duration: TimeInterval(b.u24(j + 5))))
+                } else {
+                    skipped += 1
                 }
                 j += stageSize
             }
@@ -199,7 +215,7 @@ public struct SleepSession: Equatable, Sendable {
                 record: SleepSession(
                     start: RingTime.date(fromRingSeconds: b.u32(i + 4), timeZone: timeZone),
                     end: RingTime.date(fromRingSeconds: b.u32(i + 8), timeZone: timeZone),
-                    stages: stages),
+                    stages: stages, skippedStages: skipped),
                 offset: i, length: recordLength))
             i += recordLength
         }

@@ -16,7 +16,7 @@ let plus1 = 3600
 func clockedFixture(_ store: RingStore, kinds: [HistoryKind] = [.heartRate]) throws -> Fixture {
     let f = try Fixture(store)
     for kind in kinds { try f.fetch(kind, [], at: at(-10)) }
-    try f.setFirstClock(at: at(0), offset: plus1)
+    try f.setEarlierAndFirstClocks(at: at(0), offset: plus1)
     return f
 }
 

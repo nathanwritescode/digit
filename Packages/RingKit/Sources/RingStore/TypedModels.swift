@@ -18,10 +18,10 @@ public struct HeartRateReading: Equatable, Sendable {
     /// Raw mode byte; it does not tell scheduled and on-demand readings apart on the R99.
     public var mode: Int
     public var utcOffsetSeconds: Int
-    /// The record's raw ring time (seconds since 2000-01-01 by the ring's clock; the start for
-    /// activity and sleep). Unlike the resolved instant it never changes, but it is not unique
-    /// either: the hour repeated after the clock goes back, or two readings in one ring second,
-    /// share it. Part of what identifies a record, not all of it (#12, #14 decide the exact key).
+    /// The record's raw ring time (seconds since 2000-01-01 by the ring's clock). Unlike the
+    /// resolved instant it never changes, but it is not unique either: the hour repeated after the
+    /// clock goes back, or two readings in one ring second, share it. Part of what identifies a
+    /// record, not all of it (#12, #14 decide the exact key).
     public var ringLocalSeconds: Int
     public var timeSource: TimeSource
 }
@@ -33,10 +33,7 @@ public struct ActivityInterval: Equatable, Sendable {
     public var distanceMeters: Int
     public var kilocalories: Int
     public var utcOffsetSeconds: Int
-    /// The record's raw ring time (seconds since 2000-01-01 by the ring's clock; the start for
-    /// activity and sleep). Unlike the resolved instant it never changes, but it is not unique
-    /// either: the hour repeated after the clock goes back, or two readings in one ring second,
-    /// share it. Part of what identifies a record, not all of it (#12, #14 decide the exact key).
+    /// The start's raw ring time (seconds since 2000-01-01 by the ring's clock); see `HeartRateReading.ringLocalSeconds`.
     public var ringLocalSeconds: Int
     public var timeSource: TimeSource
 }
@@ -51,10 +48,7 @@ public struct SleepSessionRecord: Equatable, Sendable {
     public var start: Date
     public var end: Date
     public var utcOffsetSeconds: Int
-    /// The record's raw ring time (seconds since 2000-01-01 by the ring's clock; the start for
-    /// activity and sleep). Unlike the resolved instant it never changes, but it is not unique
-    /// either: the hour repeated after the clock goes back, or two readings in one ring second,
-    /// share it. Part of what identifies a record, not all of it (#12, #14 decide the exact key).
+    /// The start's raw ring time (seconds since 2000-01-01 by the ring's clock); see `HeartRateReading.ringLocalSeconds`.
     public var ringLocalSeconds: Int
     public var timeSource: TimeSource
     /// In the order the decoder returned them; the table keeps that order as `ordinal`.
@@ -89,13 +83,17 @@ public struct IngestionResult: Equatable, Sendable {
     /// Records dated more than 24 hours after the fetch that first showed them (a record cannot be
     /// written after it was fetched; this also catches bytes such as FF FF FF FF).
     public var rejectedFuture = 0
+    /// Sleep only: the sum of `SleepSession.skippedStages` over every sleep row in the desired set
+    /// after this ingest, unchanged rows included (not rejected or superseded copies; a session in
+    /// several transfers counts once). A repeat ingest reports the same number again, so callers must
+    /// not add it up across syncs. Those stages (unknown kind byte or zero duration) are not stored; the raw bytes are.
+    /// Always 0 for heart rate and activity.
+    public var skippedSleepStages = 0
 }
 
 /// The strings stored in `sleep_stage.kind`. NEVER CHANGE an existing code; no default, so a new
 /// `SleepStageKind` case fails to compile until it gets a new code.
 enum StageCode {
-
-
     static func code(for kind: SleepStageKind) -> String {
         switch kind {
         case .deep: "deep"

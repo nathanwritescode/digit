@@ -7,7 +7,7 @@ import RingProtocol
 
 /// Ring seconds (wall clock since 2000-01-01) for a real instant under a UTC offset.
 func wall(_ real: Date, offset: Int) -> UInt32 {
-    UInt32(real.timeIntervalSince1970 + Double(offset) - 946_684_800)
+    UInt32(RingTime.ringSeconds(fromWallClock: real.addingTimeInterval(TimeInterval(offset))))
 }
 
 func le32(_ v: UInt32) -> [UInt8] { (0..<4).map { UInt8((v >> (8 * UInt32($0))) & 0xFF) } }
@@ -46,12 +46,13 @@ struct Fixture {
         try store.insert(transfer(kind, data: data, header: [UInt8(data.count & 0xFF)], at: date, zone: zone), ringID: ring.id)
     }
 
-    /// The first clock-set the app logs. A record whose window reaches back before the log cannot be
+    /// Records two clock-sets with the same offset: an earlier one 200000 s before `instant`, then the
+    /// first one the app logs, at `instant`. A record whose window reaches back before the log cannot be
     /// `resolved` within 26 hours of the first clock-set (the ring's earlier clock is unknown), so
     /// tests that want ordinary results put an earlier clock-set with the same offset ahead of it,
     /// as a ring that has been synced for more than a day has.
-    func setFirstClock(at instant: Date, offset: Int, zone: String = "Europe/London") throws {
-        try setClock(at: t0.addingTimeInterval(-200_000), offset: offset, zone: zone)
+    func setEarlierAndFirstClocks(at instant: Date, offset: Int, zone: String = "Europe/London") throws {
+        try setClock(at: instant.addingTimeInterval(-200_000), offset: offset, zone: zone)
         try setClock(at: instant, offset: offset, zone: zone)
     }
 
