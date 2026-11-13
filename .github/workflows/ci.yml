@@ -83,4 +83,4 @@ jobs:
         run: |
           xcodebuild -project App/Digit.xcodeproj -scheme Digit \
             -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO build
+            -disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO build
