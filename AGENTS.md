@@ -54,7 +54,7 @@ swift run ringprobe raw 0200:4743   # send a known read-only frame
 Build the app for the simulator from the repository root (needs Xcode, no signing):
 
 ```
-xcodebuild -project App/Digit.xcodeproj -scheme Digit -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+xcodebuild -project App/Digit.xcodeproj -scheme Digit -destination 'generic/platform=iOS Simulator' -disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO build
 ```
 
 To run on a device, copy `App/Config/Local.xcconfig.example` to `App/Config/Local.xcconfig`, uncomment the `DEVELOPMENT_TEAM` line and set it there. Never choose a team in Xcode's Signing & Capabilities pane: Xcode writes it into `project.pbxproj`, and CI fails if `DEVELOPMENT_TEAM` appears there.
@@ -140,7 +140,7 @@ Built for the command-line tool; these must be closed before the app relies on i
 - **Layering.** `RingProtocol` stays free of CoreBluetooth and of I/O so it is testable anywhere. Bluetooth code lives in `RingTransport`. UI code never parses bytes.
 - **Tests.** Every decoder gets a test. Prefer bytes captured from the real ring over synthetic ones, and say in the test which they are. Run `swift test` before committing.
 - **Unverified code.** If something is implemented from documentation and not confirmed on hardware, say so in a comment or in the table above. Do not present it as working.
-- **Dependencies.** Keep them few. Ask the owner before adding one.
+- **Dependencies.** Keep them few. Ask the owner before adding one. When a dependency changes, update both lockfiles together: `Packages/RingKit/Package.resolved` and `App/Digit.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved` (the app's own resolution, committed so CI and clean clones pin the same revisions). The app build passes `-disableAutomaticPackageResolution` to stop Xcode resolving packages on its own. Unverified: whether this makes a stale app lockfile fail the build; a test with a tampered `originHash` and with an empty pin list both still built.
 - **Comments.** Explain why, and record protocol quirks; don't restate the code.
 
 ## Workflow
