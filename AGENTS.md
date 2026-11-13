@@ -45,8 +45,9 @@ Run from `Packages/RingKit`:
 swift build
 swift test
 swift run ringprobe                 # usage
-swift run ringprobe scan
+swift run ringprobe scan            # prints each device's identifier; keep identifiers out of the repo, issues and PRs
 swift run ringprobe info
+swift run ringprobe info --id <uuid>   # --id on any connecting command: connect by identifier instead of by name
 swift run ringprobe history all --save ../../captures   # --save is required; one JSON file per kind (hex bytes, header, fetch time, time zone)
 swift run ringprobe raw 0200:4743   # send a known read-only frame
 ```
@@ -129,7 +130,8 @@ Built for the command-line tool; these must be closed before the app relies on i
 - A conversation can overrun its deadline by up to about `writeTimeout + replyTimeout` for a final write (the write backstop, derived from the link's own `writeTimeout`).
 - A late reply to a timed-out request can be accepted by a retry of the same kind of request; for history it fails safe through the checksum.
 - Ring-initiated events are acknowledged only while a request is in flight; there is no continuous reader and no way to subscribe to uploads.
-- Connecting scans for all devices and matches by name. iOS needs scanning by service, reconnecting by stored identifier, and state restoration for background sync.
+- Discovery and reconnecting (#49): `RingConnection.discoverRings` lists devices that advertise the YCBT service or whose name starts with a caller-supplied prefix (`R99`), strongest first, and `connect(identifier:)` reconnects by CoreBluetooth identifier, without scanning when the system knows it and otherwise by a scan that accepts only that identifier, under the same single deadline as `connect(matching:)`. Both scan unfiltered, because whether the R99 advertises the YCBT service is unknown. Unverified on hardware: whether the R99 advertises the service, and connecting by identifier without a scan (Mac and iPhone). Identifiers are assigned by each phone's or Mac's Bluetooth stack, so one stored on one device is useless on another. A timed-out identifier connect reports `notFound` unless the link connected. Not built: storing the chosen identifier (the store), background scanning and state restoration (out of scope for foreground-only v1 sync).
+- `scan(for:)`, `discoverRings` and a connect that is scanning share one CoreBluetooth scan: running two at once lets one stop or reset the other's scan. The app must not overlap them.
 - No task cancellation support. `RingSession` (an actor over the `RingLink` protocol) queues conversations, but `RingConnection` itself still assumes one conversation at a time, so the app must use it only through a session (`ringprobe raw` uses it directly, which is fine for a single-task command-line tool).
 - When a continuous reader is added, `discardPendingFrames` must not drop ring-initiated events (group `0x04`), which still need acknowledging.
 - Time: the ring's clock does not follow daylight saving or travel, so it must be set on every sync; records from a ring whose clock was never set decode as dates in 2000 and must be rejected downstream.

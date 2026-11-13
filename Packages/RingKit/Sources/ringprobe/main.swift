@@ -5,7 +5,7 @@ import RingTransport
 let usage = """
 ringprobe: talk to a YCBT smart ring from a Mac.
 
-  ringprobe scan [seconds]              list nearby Bluetooth devices
+  ringprobe scan [seconds]              list nearby Bluetooth devices with their identifiers
   ringprobe info                        firmware and battery (device id and today's activity with --show)
   ringprobe settime                     set the ring's clock to this Mac's local time
   ringprobe history <kind>|all --save <dir>
@@ -14,6 +14,9 @@ ringprobe: talk to a YCBT smart ring from a Mac.
 
 Options:
   --name <text>     match rings whose advertised name contains <text> (default "R99")
+  --id <uuid>       connect to the device with this identifier (as printed by scan) instead
+                    of matching by name, without scanning if this Mac already knows it.
+                    Identifiers are specific to this Mac. Do not paste them into issues.
   --save <dir>      required with history: write each transfer (raw bytes as hex,
                     plus header, fetch time and time zone) to <dir>/<kind>-<timestamp>.json.
                     The bytes are written before the transfer is acknowledged to the ring.
@@ -52,7 +55,13 @@ let trace = flag("--trace")
 let show = flag("--show")
 let allowUnknown = flag("--allow-unknown")
 
-let ringName = option("--name") ?? "R99"
+let nameOption = option("--name")
+let ringName = nameOption ?? "R99"
+let ringID: UUID? = option("--id").map { text in
+    guard let id = UUID(uuidString: text) else { fail("--id needs a UUID, as printed by scan") }
+    return id
+}
+if ringID != nil, nameOption != nil { fail("use either --id or --name, not both") }
 let saveDirectory = option("--save")
 
 guard let command = arguments.first else { print(usage); exit(0) }
@@ -64,7 +73,11 @@ let operands = Array(arguments.dropFirst())
 let connection = trace ? RingConnection(onRawBytes: traceBytes) : RingConnection()
 
 func connect() async throws -> RingSession {
-    try await connection.connect { ($0.name ?? "").localizedCaseInsensitiveContains(ringName) }
+    if let ringID {
+        try await connection.connect(identifier: ringID)
+    } else {
+        try await connection.connect { ($0.name ?? "").localizedCaseInsensitiveContains(ringName) }
+    }
     return RingSession(link: connection)
 }
 
@@ -131,7 +144,9 @@ do {
             // they are shown only with --show.
             let matches = (device.name ?? "").localizedCaseInsensitiveContains(ringName)
             let label = show ? (device.name ?? "(unnamed)") : (matches ? "\(ringName) (matching ring)" : "(other device)")
-            print("\(String(format: "%4d", device.rssi)) dBm  \(label)\(services)")
+            // The identifier is what --id takes. It is assigned by this Mac's Bluetooth stack, but
+            // still identifies the device here: keep it out of issues and pull requests.
+            print("\(String(format: "%4d", device.rssi)) dBm  \(device.identifier.uuidString)  \(label)\(services)")
         }
 
     case "info":

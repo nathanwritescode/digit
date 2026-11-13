@@ -19,7 +19,7 @@ public enum RingError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case .bluetoothUnavailable(let state): "Bluetooth is unavailable (state \(state.rawValue))"
-        case .notFound: "no matching ring found"
+        case .notFound: "no matching ring was found in range"
         case .connectionFailed(let why): "connection failed: \(why)"
         case .missingService: "the device does not expose the YCBT service"
         case .notConnected: "not connected"
@@ -108,7 +108,7 @@ public final class RingConnection: NSObject, @unchecked Sendable {
 
     // MARK: Scanning
 
-    /// Lists every device heard advertising during `duration`.
+    /// Lists every device heard advertising during `duration`, strongest signal first.
     public func scan(for duration: TimeInterval) async throws -> [DiscoveredDevice] {
         try await waitUntilPoweredOn()
         return await withCheckedContinuation { continuation in
@@ -118,16 +118,58 @@ public final class RingConnection: NSObject, @unchecked Sendable {
                 self.central.scanForPeripherals(withServices: nil)
                 self.queue.asyncAfter(deadline: .now() + duration) {
                     self.central.stopScan()
-                    continuation.resume(returning: self.scanResults.values.sorted { $0.rssi > $1.rssi })
+                    continuation.resume(returning: RingDiscovery.ordered(Array(self.scanResults.values)))
                 }
             }
         }
     }
 
+    /// Lists the devices heard during `duration` that look like a supported ring, strongest first:
+    /// those advertising the YCBT service, or whose advertised name starts with one of
+    /// `namePrefixes` (ignoring case). Each result carries the identifier for `connect(identifier:)`.
+    ///
+    /// The scan is unfiltered and the results are filtered afterwards. A scan filtered by service
+    /// reports only peripherals advertising one of the listed services, and it is not yet known
+    /// whether the R99 puts the YCBT service in its advertisement, so a filtered scan could miss it.
+    /// Unverified on hardware: the R99's advertisement has not been checked for the service.
+    public func discoverRings(for duration: TimeInterval, namePrefixes: [String]) async throws -> [DiscoveredDevice] {
+        let devices = try await scan(for: duration)
+        return RingDiscovery.candidates(in: devices, service: YCBT.service.uuidString, namePrefixes: namePrefixes)
+    }
+
     // MARK: Connecting
 
     /// Scans for the first device accepted by `matching`, connects, and subscribes to the YCBT channels.
+    ///
+    /// Throws `RingError.notFound` if no device matched in time, and `RingError.timeout` if one
+    /// matched but setup did not finish in time.
     public func connect(timeout: TimeInterval = 20, matching: @escaping @Sendable (DiscoveredDevice) -> Bool) async throws {
+        try await connect(to: .matching(matching), timeout: timeout)
+    }
+
+    /// Connects to the ring with this CoreBluetooth identifier and subscribes to the YCBT channels.
+    ///
+    /// If the system knows the identifier (`retrievePeripherals(withIdentifiers:)`), this connects
+    /// without scanning; otherwise it scans and accepts only a device with this identifier. A
+    /// connection attempt never times out on its own (it stays pending while the ring is out of
+    /// range), so the same single deadline covers this case and cancels the pending attempt.
+    ///
+    /// Throws `RingError.notFound` if the ring was not reached in time (not known and not heard,
+    /// or known but never connected), and `RingError.timeout` if it connected but setup did not
+    /// finish in time. Identifiers are assigned by the local Bluetooth stack: one taken on another
+    /// phone or Mac will not be found.
+    ///
+    /// Unverified on hardware: connecting without a scan has not yet been tried with the R99.
+    public func connect(identifier: UUID, timeout: TimeInterval = 20) async throws {
+        try await connect(to: .identifier(identifier), timeout: timeout)
+    }
+
+    private enum ConnectTarget: Sendable {
+        case matching(@Sendable (DiscoveredDevice) -> Bool)
+        case identifier(UUID)
+    }
+
+    private func connect(to target: ConnectTarget, timeout: TimeInterval) async throws {
         try await waitUntilPoweredOn()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async {
@@ -135,21 +177,45 @@ public final class RingConnection: NSObject, @unchecked Sendable {
                     continuation.resume(throwing: RingError.busy("another connection attempt is in progress"))
                     return
                 }
+                // Bluetooth may have gone away since `waitUntilPoweredOn` returned. That state change
+                // was handled before this waiter was stored, so only the deadline would fail it.
+                guard self.central.state == .poweredOn else {
+                    continuation.resume(throwing: RingError.bluetoothUnavailable(self.central.state))
+                    return
+                }
                 // Drop whatever an earlier attempt left behind so this one starts clean.
                 self.resetLink(cancelling: true)
                 self.connectWaiter = continuation
                 self.connectAttempt += 1
                 let attempt = self.connectAttempt
-                self.scanMatch = matching
-                self.central.scanForPeripherals(withServices: nil)
+                switch target {
+                case .matching(let matching):
+                    self.scanMatch = matching
+                    self.central.scanForPeripherals(withServices: nil)
+                case .identifier(let identifier):
+                    if let known = self.central.retrievePeripherals(withIdentifiers: [identifier]).first {
+                        self.scanMatch = nil
+                        self.attach(known)
+                    } else {
+                        self.scanMatch = { $0.identifier == identifier }
+                        self.central.scanForPeripherals(withServices: nil)
+                    }
+                }
                 // One deadline covers scanning, connecting, discovery and subscribing.
                 self.queue.asyncAfter(deadline: .now() + timeout) {
                     // A timer left over from an earlier attempt must not fail a later one.
                     guard self.connectWaiter != nil, self.connectAttempt == attempt else { return }
                     self.central.stopScan()
-                    let found = self.peripheral != nil
+                    let reached: Bool
+                    switch target {
+                    // Found by scanning: the device was heard, so it was in range.
+                    case .matching: reached = self.peripheral != nil
+                    // A retrieved peripheral is set before the ring is in range, so only a
+                    // completed connection shows it was reached.
+                    case .identifier: reached = self.didConnectCurrent
+                    }
                     self.resetLink(cancelling: true)
-                    self.finishConnect(.failure(found ? RingError.timeout("connection setup") : RingError.notFound))
+                    self.finishConnect(.failure(reached ? RingError.timeout("connection setup") : RingError.notFound))
                 }
             }
         }
@@ -233,6 +299,16 @@ public final class RingConnection: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Makes `peripheral` the current link and starts connecting to it. The attempt never times
+    /// out on its own; the connect deadline cancels it through `resetLink`. Holding it in
+    /// `self.peripheral` also keeps it alive, which a pending connection needs (CoreBluetooth
+    /// cancels the attempt if the peripheral is deallocated).
+    private func attach(_ peripheral: CBPeripheral) {
+        self.peripheral = peripheral
+        peripheral.delegate = self
+        central.connect(peripheral)
+    }
+
     private func finishConnect(_ result: Result<Void, Error>) {
         guard let waiter = connectWaiter else { return }
         connectWaiter = nil
@@ -297,18 +373,18 @@ extension RingConnection: CBCentralManagerDelegate {
     public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                                advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let services = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
-        let device = DiscoveredDevice(
+        let sighting = DiscoveredDevice(
             identifier: peripheral.identifier,
             name: (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? peripheral.name,
             rssi: RSSI.intValue,
             serviceUUIDs: services.map(\.uuidString))
+        // A later report of the same device may leave out what an earlier one carried.
+        let device = scanResults[sighting.identifier].map { $0.merging(sighting) } ?? sighting
         scanResults[device.identifier] = device
 
         guard connectWaiter != nil, self.peripheral == nil, scanMatch?(device) == true else { return }
         central.stopScan()
-        self.peripheral = peripheral
-        peripheral.delegate = self
-        central.connect(peripheral)
+        attach(peripheral)
     }
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
