@@ -15,6 +15,7 @@
 		A10000000000000000000002 /* Digit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Digit.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000003 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A10000000000000000000004 /* Digit.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Digit.entitlements; sourceTree = "<group>"; };
+		A10000000000000000000050 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Signing.xcconfig; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -52,6 +53,7 @@
 			children = (
 				A10000000000000000000003 /* Info.plist */,
 				A10000000000000000000004 /* Digit.entitlements */,
+				A10000000000000000000050 /* Signing.xcconfig */,
 			);
 			path = Config;
 			sourceTree = "<group>";
@@ -269,6 +271,7 @@
 		};
 		A10000000000000000000042 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = A10000000000000000000050 /* Signing.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = Config/Digit.entitlements;
 				CODE_SIGN_STYLE = Automatic;
@@ -301,6 +304,7 @@
 		};
 		A10000000000000000000043 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = A10000000000000000000050 /* Signing.xcconfig */;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = Config/Digit.entitlements;
 				CODE_SIGN_STYLE = Automatic;

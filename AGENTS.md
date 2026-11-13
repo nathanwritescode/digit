@@ -31,7 +31,7 @@ Packages/RingKit/
 App/
   Digit.xcodeproj          iOS app project (SwiftUI, iOS 26, Swift 6, iPhone only); depends on RingKit
   Digit/                   app sources (file-system-synchronised: new files are picked up automatically)
-  Config/                  Info.plist (usage strings, background mode) and Digit.entitlements (HealthKit)
+  Config/                  Info.plist (usage strings, background mode), Digit.entitlements (HealthKit, App Group), Signing.xcconfig and Local.xcconfig.example (signing team; Local.xcconfig is git-ignored)
 captures/                  raw ring captures (git-ignored, private)
 ```
 
@@ -56,6 +56,8 @@ Build the app for the simulator from the repository root (needs Xcode, no signin
 ```
 xcodebuild -project App/Digit.xcodeproj -scheme Digit -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 ```
+
+To run on a device, copy `App/Config/Local.xcconfig.example` to `App/Config/Local.xcconfig` and set `DEVELOPMENT_TEAM` there. Never choose a team in Xcode's Signing & Capabilities pane: Xcode writes it into `project.pbxproj`, and CI fails if `DEVELOPMENT_TEAM` appears there.
 
 Continuous integration (`.github/workflows/ci.yml`) runs `swift build` and `swift test` for RingKit, and the `xcodebuild` command above for the app, on every pull request and every push to `main`, using the newest released Xcode on GitHub's macOS runner. That toolchain can be older than a developer's local one, so a feature that builds locally may still fail there; the CI result is the one that counts.
 
@@ -206,10 +208,12 @@ The planner starts at most one hardware-check implementer at a time, and never w
 - **Minimum iOS version:** iOS 26.
 - **Concurrency defaults:** the app target defaults to main-actor isolation (`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`); the RingKit package does not.
 - **Bundle identifier:** `com.nathantalley.digit`.
+- **Signing:** automatic signing with the owner's paid developer team. The team ID is never committed: `App/Config/Signing.xcconfig` is the app target's base configuration and includes the git-ignored `App/Config/Local.xcconfig`, which sets `DEVELOPMENT_TEAM`. Do not write a team ID in the repository, issues or pull requests, and never sign a device build with a free Personal Team, so the bundle identifier is not registered to the wrong team. Signing on a device with the paid team is unverified until the owner's first device run (#45).
+- **App Group:** `group.com.nathantalley.digit`, declared in the app's entitlements. The store's database will live in this group's container; the app does not open it yet (#13).
 - **Vendor estimates:** raw ring records are stored exactly as received, but values the ring cannot measure (blood pressure, and the temperature field on the R99) are never exposed as measurements in derived tables, the app, exports of typed data, or Apple Health.
 - **One monitoring interval:** for YCBT rings like the R99 the app offers a single setting (off, 1, 5, 10, 15, 20, 30 or 60 minutes; default 10) that controls heart rate, SpO2, respiration and HRV together. This is a capability of the ring, not a rule for every device, and there is no separate SpO2 setting. The ring cannot report its settings, so the choice is stored per paired ring and re-sent to that ring on every sync. 15, 20, 30 and 60 minutes are unverified until each has been sent once.
 - **Sleep nights (`SleepQueries.swift`, read-only, async):** a *night* is a maximal run of a ring's sessions, ordered by start, in which each starts no more than 60 minutes (inclusive; `SleepNightSummary.maximumGapSeconds`) after the latest end seen so far in the night; overlapping, contained or touching sessions join. Grouping uses stored instants only and always covers all of the ring's sessions, so a range query never cuts a night. A night belongs to the *day* on which it ends on the ring's own clock: the night's end (the latest end among its sessions) plus the `utc_offset_seconds` of the session with that end (on a tie, the later in start order), read as a Gregorian date in GMT (`SleepDay`; never the device's time zone). Of a day's nights the one with the most time asleep (deep, light, rem, nap stages) is the *main sleep*, the later-ending one on a tie, and the rest are naps; this is unrelated to the `nap` stage kind. A night carries the least certain `time_source` of its sessions (resolved, ambiguous, assumed) and no session is left out because of it. Interruptions are the stretches inside the night covered by no session (not gaps between stages); overlapping or contained sessions add none. Stage sums are as stored, not clipped, so overlapping sessions count twice. A night carries the offset of the session that supplies its day (`utcOffsetSeconds`); show its times on that clock, not the device's zone. `sleepNightDetail(ringID:startingAt:)` finds a night by its start and returns `nil` whenever ingestion has moved that start since the summary was read (an offset re-resolved, or an earlier session joining), so callers re-query. The observation yields only changes (de-duplicated, newest value kept). Known limits tracked in #44: no minimum length for main sleep, grouping when a session's offset is uncertain, no stable night identifier, no windowed grouping.
 
 ## Open decisions
 
-- **Apple Developer account:** the owner is moving to a paid developer team. Until that team is available in Xcode, do not run the app on a device signed with the free Personal Team, so the bundle identifier is not registered to the wrong team. No signing team is committed to the project.
+None.
