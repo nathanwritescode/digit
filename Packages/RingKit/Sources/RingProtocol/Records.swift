@@ -157,6 +157,7 @@ public struct SleepStage: Equatable, Sendable {
 /// Quirks seen on that ring, all passed through unchanged: stages start one second after the
 /// previous one ends (see `SleepStage.isContiguous`); no awake stages were reported; one night
 /// arrived as two sessions a few minutes apart, so a brief wake-up can be a gap between sessions.
+/// Stage entries with an unknown kind or zero duration are dropped and counted in `skippedStages`.
 /// Verified against one real night; test fixtures are synthetic.
 public struct SleepSession: Equatable, Sendable {
     public var start: Date

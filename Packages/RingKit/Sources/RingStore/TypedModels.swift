@@ -89,9 +89,10 @@ public struct IngestionResult: Equatable, Sendable {
     /// Records dated more than 24 hours after the fetch that first showed them (a record cannot be
     /// written after it was fetched; this also catches bytes such as FF FF FF FF).
     public var rejectedFuture = 0
-    /// Sleep only: the sum of `SleepSession.skippedStages` over the distinct sessions that became
-    /// rows in this ingest (not rejected or superseded copies; a session in several transfers counts
-    /// once). Those stages (unknown kind byte or zero duration) are not stored; the raw bytes are.
+    /// Sleep only: the sum of `SleepSession.skippedStages` over every sleep row in the desired set
+    /// after this ingest, unchanged rows included (not rejected or superseded copies; a session in
+    /// several transfers counts once). A repeat ingest reports the same number again, so callers must
+    /// not add it up across syncs. Those stages (unknown kind byte or zero duration) are not stored; the raw bytes are.
     /// Always 0 for heart rate and activity.
     public var skippedSleepStages = 0
 }
