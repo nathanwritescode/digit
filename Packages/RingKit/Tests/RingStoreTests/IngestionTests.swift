@@ -65,7 +65,7 @@ struct IngestionTests {
             let activity = try #require(try store.activityIntervals(ringID: f.ring.id).first).value
             #expect(activity == ActivityInterval(
                 start: at(0), end: at(1800), steps: 100, distanceMeters: 70, kilocalories: 4,
-                utcOffsetSeconds: plus1, timeSource: .resolved))
+                utcOffsetSeconds: plus1, ringLocalSeconds: Int(wall(at(0), offset: plus1)), timeSource: .resolved))
             #expect(try (store.heartRateReadings(ringID: f.ring.id).map(\.value),
                          store.activityIntervals(ringID: f.ring.id).map(\.value),
                          store.sleepSessions(ringID: f.ring.id).map(\.value)) == before)
@@ -125,6 +125,8 @@ struct IngestionTests {
             try f.fetch(.sleep, closed, at: at(7200))
             let r = try store.ingest(ringID: f.ring.id, kind: .sleep)
             #expect(r.updated == 1 && r.inserted == 0 && r.deleted == 0)
+            // Different bytes under one key: a counted collision, the later copy kept.
+            #expect(r.collisions == 1)
             let row = try #require(try store.sleepSessions(ringID: f.ring.id).first)
             #expect(row.id == id)
             #expect(row.value.end == at(1300))

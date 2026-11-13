@@ -71,6 +71,7 @@ extension RingStore {
         var rows: [Int64: Value] = [:]
         var rejected = 0
         var unusableBytes = 0
+        var collisions = 0
     }
 
     private static func ingest(_ db: Database, ringID: UUID, kind: HistoryKind) throws -> IngestionResult {
@@ -82,31 +83,44 @@ extension RingStore {
         var result = IngestionResult()
         switch kind {
         case .heartRate:
-            let derived = derive(transfers, resolver, HeartRateRecord.decodeLocated, { $0.time }) { r, o in
+            let derived = try derive(
+                transfers, resolver, HeartRateRecord.decodeLocated, reference: { $0.time }, plausible: { _ in true }
+            ) { r, o in
                 let instant = r.time.addingTimeInterval(-TimeInterval(o.seconds))
                 return (instant, HeartRateReading(
-                    time: instant, bpm: r.bpm, mode: Int(r.mode), utcOffsetSeconds: o.seconds, timeSource: o.source))
+                    time: instant, bpm: r.bpm, mode: Int(r.mode), utcOffsetSeconds: o.seconds,
+                    ringLocalSeconds: ringSeconds(r.time), timeSource: o.source))
             }
             try applyHeartRate(db, ringID, derived.rows, &result)
             record(derived, rows: derived.rows.values.map(\.timeSource), into: &result)
         case .activity:
-            let derived = derive(transfers, resolver, ActivityRecord.decodeLocated, { $0.end }) { r, o in
+            let derived = try derive(
+                transfers, resolver, ActivityRecord.decodeLocated, reference: { $0.end }, plausible: { _ in true }
+            ) { r, o in
                 let shift = -TimeInterval(o.seconds)
                 let start = r.start.addingTimeInterval(shift)
                 return (start, ActivityInterval(
                     start: start, end: r.end.addingTimeInterval(shift), steps: r.steps,
                     distanceMeters: r.distanceMeters, kilocalories: r.kilocalories,
-                    utcOffsetSeconds: o.seconds, timeSource: o.source))
+                    utcOffsetSeconds: o.seconds, ringLocalSeconds: ringSeconds(r.start), timeSource: o.source))
             }
             try applyActivity(db, ringID, derived.rows, &result)
             record(derived, rows: derived.rows.values.map(\.timeSource), into: &result)
         case .sleep:
-            let derived = derive(transfers, resolver, SleepSession.decodeLocated, { $0.end }) { r, o in
+            let derived = try derive(
+                transfers, resolver, SleepSession.decodeLocated, reference: { $0.end },
+                // A session that starts after it ends, or has a stage before 2020, is garbage even
+                // though its end may look plausible.
+                plausible: { r in
+                    r.start >= earliestPlausibleRingTime && r.start <= r.end
+                        && r.stages.allSatisfy { $0.start >= earliestPlausibleRingTime }
+                }
+            ) { r, o in
                 let shift = -TimeInterval(o.seconds)
                 let start = r.start.addingTimeInterval(shift)
                 return (start, SleepSessionRecord(
                     start: start, end: r.end.addingTimeInterval(shift),
-                    utcOffsetSeconds: o.seconds, timeSource: o.source,
+                    utcOffsetSeconds: o.seconds, ringLocalSeconds: ringSeconds(r.start), timeSource: o.source,
                     stages: r.stages.map {
                         SleepStageEntry(
                             kind: $0.kind, start: $0.start.addingTimeInterval(shift), durationSeconds: Int($0.duration))
@@ -123,43 +137,86 @@ extension RingStore {
     private static func record<V>(_ derived: Derived<V>, rows sources: [TimeSource], into result: inout IngestionResult) {
         result.rejectedBefore2020 = derived.rejected
         result.unusableBytes = derived.unusableBytes
+        result.collisions = derived.collisions
         for source in sources { result.rowsByTimeSource[source, default: 0] += 1 }
     }
 
-    /// Decodes every transfer (as wall-clock-as-UTC, which `TimeResolver` expects), resolves each
-    /// whole record's offset and keys the result by its real start instant. A record that appears
-    /// in several transfers resolves to one key; the latest transfer's copy wins.
+    /// Seconds since 2000-01-01 of a ring-local reading decoded as if UTC.
+    private static func ringSeconds(_ asIfUTC: Date) -> Int { Int(asIfUTC.timeIntervalSince1970 - 946_684_800) }
+
+    /// One place a record's bytes were found.
+    private struct Occurrence {
+        var transfer: Int
+        var offset: Int
+        var window: TimeResolver.Window
+    }
+
+    private struct Identity<R> {
+        var record: R
+        var occurrences: [Occurrence]
+    }
+
+    /// Decodes every transfer as wall-clock-as-UTC (what `TimeResolver` expects), then resolves
+    /// each distinct record once. A record's identity is its bytes (kind, ring-local times and
+    /// content), which can appear in several transfers; it is resolved from the occurrence with the
+    /// earliest first sighting (on a tie, one that has a last-absent fetch, then the latest), so the
+    /// same record never gets two instants. Two distinct records that still land on one key are a
+    /// collision: the one later in the buffer (later transfer, then later offset) is kept.
     private static func derive<R: Sendable, V>(
         _ transfers: [StoredTransfer], _ resolver: TimeResolver,
         _ decode: ([UInt8], TimeZone) -> [Located<R>],
-        _ reference: (R) -> Date,
+        reference: (R) -> Date,
+        plausible: (R) -> Bool,
         _ build: (R, ResolvedOffset) -> (instant: Date, value: V)
-    ) -> Derived<V> {
+    ) throws -> Derived<V> {
         var derived = Derived<V>()
-        let utc = TimeZone(secondsFromGMT: 0)!
-        for stored in transfers {
+        var identities: [[UInt8]: Identity<R>] = [:]
+        var rejected: Set<[UInt8]> = []
+        for (index, stored) in transfers.enumerated() {
             let data = stored.transfer.data
-            let sightings = resolver.sightings(
-                in: data, fetchedAt: stored.transfer.fetchedAt, timeZoneIdentifier: stored.transfer.timeZoneIdentifier)
+            let sightings = resolver.sightings(in: data)
             var consumed = 0
-            for located in decode(data, utc) where located.offset + located.length <= data.count {
+            for located in decode(data, .gmt) where located.offset + located.length <= data.count {
                 consumed += located.length
-                let ref = reference(located.record)
-                if ref < earliestPlausibleRingTime {
-                    derived.rejected += 1
+                let bytes = Array(data[located.offset..<located.offset + located.length])
+                if rejected.contains(bytes) { continue }
+                if reference(located.record) < earliestPlausibleRingTime || !plausible(located.record) {
+                    rejected.insert(bytes)
                     continue
                 }
-                let offset = resolver.resolve(
-                    sightings: sightings, offset: located.offset, length: located.length, reference: ref)
-                let (instant, value) = build(located.record, offset)
-                let key = ms(instant)
-                // Transfers are in fetch order, so the latest copy wins. Copies are normally
-                // identical; they differ when a record changed in place (an open sleep session).
-                derived.rows[key] = value
+                let window = try resolver.window(sightings: sightings, offset: located.offset, length: located.length)
+                identities[bytes, default: Identity(record: located.record, occurrences: [])]
+                    .occurrences.append(Occurrence(transfer: index, offset: located.offset, window: window))
             }
             derived.unusableBytes += data.count - consumed
         }
+        derived.rejected = rejected.count
+
+        // Keyed in buffer order (later transfer, then later offset) of each identity's last
+        // occurrence, so the later one wins a collision.
+        func lastPosition(_ i: Identity<R>) -> (Int, Int) {
+            guard let last = i.occurrences.max(by: { ($0.transfer, $0.offset) < ($1.transfer, $1.offset) }) else { return (0, 0) }
+            return (last.transfer, last.offset)
+        }
+        for identity in identities.values.sorted(by: { lastPosition($0) < lastPosition($1) }) {
+            guard let chosen = identity.occurrences.min(by: { earlierEvidence($0.window, $1.window) }) else { continue }
+            let (instant, value) = build(identity.record, resolver.resolve(window: chosen.window, reference: reference(identity.record)))
+            let key = ms(instant)
+            if derived.rows[key] != nil { derived.collisions += 1 }
+            derived.rows[key] = value
+        }
         return derived
+    }
+
+    /// Whether `a` is better evidence than `b`: earlier first sighting; on a tie one with a
+    /// last-absent fetch, then the later last-absent.
+    private static func earlierEvidence(_ a: TimeResolver.Window, _ b: TimeResolver.Window) -> Bool {
+        if a.firstSeen != b.firstSeen { return a.firstSeen < b.firstSeen }
+        switch (a.lastAbsent, b.lastAbsent) {
+        case let (x?, y?): return x > y
+        case (_?, nil): return true
+        default: return false
+        }
     }
 
     // MARK: Applying the desired set
@@ -167,19 +224,27 @@ extension RingStore {
     private static func applyHeartRate(
         _ db: Database, _ ringID: UUID, _ desired: [Int64: HeartRateReading], _ result: inout IngestionResult
     ) throws {
-        var existing = Dictionary(uniqueKeysWithValues: try heartRateRows(db, ringID: ringID).map { (ms($0.value.time), $0) })
-        for key in desired.keys.sorted() {
-            let value = desired[key]!
-            let args: StatementArguments = [value.bpm, value.mode, value.utcOffsetSeconds, TimeSourceCode.code(for: value.timeSource)]
+        var existing = Dictionary(
+            try heartRateRows(db, ringID: ringID).map { (ms($0.value.time), $0) }, uniquingKeysWith: { a, _ in a })
+        for (key, value) in desired.sorted(by: { $0.key < $1.key }) {
+            let args: StatementArguments = [
+                value.bpm, value.mode, value.utcOffsetSeconds, value.ringLocalSeconds, TimeSourceCode.code(for: value.timeSource),
+            ]
             if let row = existing.removeValue(forKey: key) {
                 if row.value == value { result.unchanged += 1; continue }
                 try db.execute(
-                    sql: "UPDATE heart_rate_reading SET bpm = ?, mode = ?, utc_offset_seconds = ?, time_source = ? WHERE id = ?",
+                    sql: """
+                        UPDATE heart_rate_reading SET bpm = ?, mode = ?, utc_offset_seconds = ?, ring_local_seconds = ?,
+                        time_source = ? WHERE id = ?
+                        """,
                     arguments: args + [row.id])
                 result.updated += 1
             } else {
                 try db.execute(
-                    sql: "INSERT INTO heart_rate_reading (bpm, mode, utc_offset_seconds, time_source, ring_id, time) VALUES (?, ?, ?, ?, ?, ?)",
+                    sql: """
+                        INSERT INTO heart_rate_reading (bpm, mode, utc_offset_seconds, ring_local_seconds, time_source,
+                        ring_id, time) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
                     arguments: args + [ringID.uuidString, key])
                 result.inserted += 1
             }
@@ -193,19 +258,19 @@ extension RingStore {
     private static func applyActivity(
         _ db: Database, _ ringID: UUID, _ desired: [Int64: ActivityInterval], _ result: inout IngestionResult
     ) throws {
-        var existing = Dictionary(uniqueKeysWithValues: try activityRows(db, ringID: ringID).map { (ms($0.value.start), $0) })
-        for key in desired.keys.sorted() {
-            let value = desired[key]!
+        var existing = Dictionary(
+            try activityRows(db, ringID: ringID).map { (ms($0.value.start), $0) }, uniquingKeysWith: { a, _ in a })
+        for (key, value) in desired.sorted(by: { $0.key < $1.key }) {
             let args: StatementArguments = [
                 ms(value.end), value.steps, value.distanceMeters, value.kilocalories, value.utcOffsetSeconds,
-                TimeSourceCode.code(for: value.timeSource),
+                value.ringLocalSeconds, TimeSourceCode.code(for: value.timeSource),
             ]
             if let row = existing.removeValue(forKey: key) {
                 if row.value == value { result.unchanged += 1; continue }
                 try db.execute(
                     sql: """
                         UPDATE activity_interval SET "end" = ?, steps = ?, distance_meters = ?, kilocalories = ?,
-                        utc_offset_seconds = ?, time_source = ? WHERE id = ?
+                        utc_offset_seconds = ?, ring_local_seconds = ?, time_source = ? WHERE id = ?
                         """,
                     arguments: args + [row.id])
                 result.updated += 1
@@ -213,7 +278,7 @@ extension RingStore {
                 try db.execute(
                     sql: """
                         INSERT INTO activity_interval ("end", steps, distance_meters, kilocalories, utc_offset_seconds,
-                        time_source, ring_id, start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ring_local_seconds, time_source, ring_id, start) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                     arguments: args + [ringID.uuidString, key])
                 result.inserted += 1
@@ -228,23 +293,32 @@ extension RingStore {
     private static func applySleep(
         _ db: Database, _ ringID: UUID, _ desired: [Int64: SleepSessionRecord], _ result: inout IngestionResult
     ) throws {
-        var existing = Dictionary(uniqueKeysWithValues: try sleepRows(db, ringID: ringID).map { (ms($0.value.start), $0) })
-        for key in desired.keys.sorted() {
-            let value = desired[key]!
-            var sessionID: Int64
+        var existing = Dictionary(
+            try sleepRows(db, ringID: ringID).map { (ms($0.value.start), $0) }, uniquingKeysWith: { a, _ in a })
+        for (key, value) in desired.sorted(by: { $0.key < $1.key }) {
+            let sessionID: Int64
             if let row = existing.removeValue(forKey: key) {
                 if row.value == value { result.unchanged += 1; continue }
                 try db.execute(
-                    sql: "UPDATE sleep_session SET \"end\" = ?, utc_offset_seconds = ?, time_source = ? WHERE id = ?",
-                    arguments: [ms(value.end), value.utcOffsetSeconds, TimeSourceCode.code(for: value.timeSource), row.id])
+                    sql: """
+                        UPDATE sleep_session SET "end" = ?, utc_offset_seconds = ?, ring_local_seconds = ?,
+                        time_source = ? WHERE id = ?
+                        """,
+                    arguments: [
+                        ms(value.end), value.utcOffsetSeconds, value.ringLocalSeconds,
+                        TimeSourceCode.code(for: value.timeSource), row.id,
+                    ])
                 try db.execute(sql: "DELETE FROM sleep_stage WHERE session_id = ?", arguments: [row.id])
                 sessionID = row.id
                 result.updated += 1
             } else {
                 try db.execute(
-                    sql: "INSERT INTO sleep_session (ring_id, start, \"end\", utc_offset_seconds, time_source) VALUES (?, ?, ?, ?, ?)",
+                    sql: """
+                        INSERT INTO sleep_session (ring_id, start, "end", utc_offset_seconds, ring_local_seconds,
+                        time_source) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
                     arguments: [
-                        ringID.uuidString, key, ms(value.end), value.utcOffsetSeconds,
+                        ringID.uuidString, key, ms(value.end), value.utcOffsetSeconds, value.ringLocalSeconds,
                         TimeSourceCode.code(for: value.timeSource),
                     ])
                 sessionID = db.lastInsertedRowID
@@ -291,7 +365,8 @@ extension RingStore {
                 id: try column(row, "id"),
                 value: HeartRateReading(
                     time: date(try column(row, "time")), bpm: try column(row, "bpm"), mode: try column(row, "mode"),
-                    utcOffsetSeconds: try column(row, "utc_offset_seconds"), timeSource: try source(row)))
+                    utcOffsetSeconds: try column(row, "utc_offset_seconds"),
+                    ringLocalSeconds: try column(row, "ring_local_seconds"), timeSource: try source(row)))
         }
     }
 
@@ -305,7 +380,8 @@ extension RingStore {
                     start: date(try column(row, "start")), end: date(try column(row, "end")),
                     steps: try column(row, "steps"), distanceMeters: try column(row, "distance_meters"),
                     kilocalories: try column(row, "kilocalories"),
-                    utcOffsetSeconds: try column(row, "utc_offset_seconds"), timeSource: try source(row)))
+                    utcOffsetSeconds: try column(row, "utc_offset_seconds"),
+                    ringLocalSeconds: try column(row, "ring_local_seconds"), timeSource: try source(row)))
         }
     }
 
@@ -333,7 +409,8 @@ extension RingStore {
                 id: id,
                 value: SleepSessionRecord(
                     start: date(try column(row, "start")), end: date(try column(row, "end")),
-                    utcOffsetSeconds: try column(row, "utc_offset_seconds"), timeSource: try source(row),
+                    utcOffsetSeconds: try column(row, "utc_offset_seconds"),
+                    ringLocalSeconds: try column(row, "ring_local_seconds"), timeSource: try source(row),
                     stages: stages[id] ?? []))
         }
     }

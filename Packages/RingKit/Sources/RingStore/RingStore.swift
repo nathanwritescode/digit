@@ -428,6 +428,7 @@ public final class RingStore: Sendable {
                     bpm INTEGER NOT NULL,
                     mode INTEGER NOT NULL,
                     utc_offset_seconds INTEGER NOT NULL,
+                    ring_local_seconds INTEGER NOT NULL,
                     time_source TEXT NOT NULL,
                     UNIQUE (ring_id, time)
                 ) STRICT;
@@ -441,6 +442,7 @@ public final class RingStore: Sendable {
                     distance_meters INTEGER NOT NULL,
                     kilocalories INTEGER NOT NULL,
                     utc_offset_seconds INTEGER NOT NULL,
+                    ring_local_seconds INTEGER NOT NULL,
                     time_source TEXT NOT NULL,
                     UNIQUE (ring_id, start)
                 ) STRICT;
@@ -451,6 +453,7 @@ public final class RingStore: Sendable {
                     start INTEGER NOT NULL,
                     "end" INTEGER NOT NULL,
                     utc_offset_seconds INTEGER NOT NULL,
+                    ring_local_seconds INTEGER NOT NULL,
                     time_source TEXT NOT NULL,
                     UNIQUE (ring_id, start)
                 ) STRICT;

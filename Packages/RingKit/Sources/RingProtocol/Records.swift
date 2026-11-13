@@ -49,9 +49,9 @@ public struct CurrentActivity: Equatable, Sendable {
 /// session `length` is the record's declared length, which can run past the end of the data when
 /// the data is cut short; callers that need whole records check `offset + length <= data.count`.
 public struct Located<Record: Sendable>: Sendable {
-    public var record: Record
-    public var offset: Int
-    public var length: Int
+    public let record: Record
+    public let offset: Int
+    public let length: Int
 
     public init(record: Record, offset: Int, length: Int) {
         self.record = record
@@ -121,7 +121,7 @@ public struct HeartRateRecord: Equatable, Sendable {
     }
 }
 
-public enum SleepStageKind: UInt8, Sendable {
+public enum SleepStageKind: UInt8, CaseIterable, Sendable {
     case deep = 241
     case light = 242
     case rem = 243
