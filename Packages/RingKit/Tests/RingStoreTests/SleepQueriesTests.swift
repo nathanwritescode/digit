@@ -362,7 +362,8 @@ struct SleepQueriesTests {
 
         try ingest(g, [Session(5 * hour, 6 * hour)])  // another ring: must not yield
         try ingest(f, [Session(0, hour)])  // a real change to this ring
-        // Had the other ring's change yielded, the next value would be an unchanged `nil`.
+        // Had the other ring's change yielded, the next value would in practice be an unchanged `nil`
+        // (a buffer of one could in principle drop it, so this is evidence, not proof).
         let next = try #require(await values.next())
         #expect(next?.summary.start == at(0))
         task.cancel()

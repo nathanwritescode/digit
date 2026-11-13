@@ -7,9 +7,9 @@ import RingProtocol
 //
 // Grouping is computed over every session of the ring on each call, never over a window, so a
 // night is the same whichever query asks for it (rule 6). A ring has on the order of a thousand
-// sessions a year; the query reads every session row and one summed row per session and kind
-// (the totals), not the stage rows themselves, so this stays cheap. Stage rows are read only for
-// the night whose detail is asked for. Windowed grouping is tracked in #44.
+// sessions a year; each call reads every session row, and SQLite sums every stage row of the ring,
+// returning one row per session and kind (the totals). The stage rows themselves are fetched only
+// for a night's detail. Windowed grouping is tracked in #44.
 
 /// A calendar day on the ring's own clock. Not a `Date`: it carries no time zone.
 public struct SleepDay: Comparable, Hashable, Sendable {
@@ -134,7 +134,9 @@ extension RingStore {
     /// The night that starts at `start`, with its stages, recomputed from the current rows. Returns
     /// `nil` whenever no night starts at that instant, which includes the case where ingestion has
     /// moved the night's start since the summary was read (an offset re-resolved, or an earlier
-    /// session joined it), so callers must re-query. A stable night identifier is tracked separately.
+    /// session joined it), so callers must re-query. `start` must be exactly a night's start as returned
+    /// in a summary; a value that has lost precision (for example after a round trip through text)
+    /// will not match. A stable night identifier is tracked separately.
     public func sleepNightDetail(ringID: UUID, startingAt start: Date) async throws -> SleepNightDetail? {
         try await writer.read { db in
             guard let night = try Self.sleepNightGroups(db, ringID: ringID).first(where: { $0.summary.start == start })
@@ -143,9 +145,11 @@ extension RingStore {
         }
     }
 
-    /// Yields `latestSleepNight` now and again whenever it changes (a change to another ring's
-    /// sessions, or one that leaves this value the same, yields nothing). Only the newest
-    /// undelivered value is kept. Observing stops when the consumer stops iterating or its task
+    /// Yields `latestSleepNight` now and again when it changes. An unchanged value is normally not
+    /// repeated (a change to another ring's sessions yields nothing), but a repeat is possible:
+    /// de-duplication compares with the last value fetched, not the last delivered, so if the
+    /// state goes A, B, A before the consumer reads, A can be delivered twice. Only the newest
+    /// undelivered value is kept, so the consumer always ends on the latest state. Observing stops when the consumer stops iterating or its task
     /// is cancelled. Errors end the stream.
     public func observeLatestSleepNight(ringID: UUID) -> AsyncThrowingStream<SleepNightDetail?, Error> {
         let writer = self.writer
