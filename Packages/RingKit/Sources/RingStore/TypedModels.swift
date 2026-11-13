@@ -18,9 +18,10 @@ public struct HeartRateReading: Equatable, Sendable {
     /// Raw mode byte; it does not tell scheduled and on-demand readings apart on the R99.
     public var mode: Int
     public var utcOffsetSeconds: Int
-    /// The record's raw ring time (seconds since 2000-01-01 by the ring's clock). Unlike the resolved instant it never
-    /// changes, but it is not unique either: the hour repeated after the clock goes back, or two readings in one ring second,
-    /// share it. Part of what identifies a record, not all of it (#12, #14 decide the exact key).
+    /// The record's raw ring time (seconds since 2000-01-01 by the ring's clock). Unlike the
+    /// resolved instant it never changes, but it is not unique either: the hour repeated after the
+    /// clock goes back, or two readings in one ring second, share it. Part of what identifies a
+    /// record, not all of it (#12, #14 decide the exact key).
     public var ringLocalSeconds: Int
     public var timeSource: TimeSource
 }

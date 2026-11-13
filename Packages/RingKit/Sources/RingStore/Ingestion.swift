@@ -94,7 +94,7 @@ extension RingStore {
                 let instant = r.time.addingTimeInterval(-TimeInterval(o.seconds))
                 return (instant, HeartRateReading(
                     time: instant, bpm: r.bpm, mode: Int(r.mode), utcOffsetSeconds: o.seconds,
-                    ringLocalSeconds: ringSeconds(r.time), timeSource: o.source))
+                    ringLocalSeconds: RingTime.ringSeconds(fromWallClock: r.time), timeSource: o.source))
             }
             try applyHeartRate(db, ringID, derived.rows, &result)
             record(derived, rows: derived.rows.values.map(\.timeSource), into: &result)
@@ -113,7 +113,8 @@ extension RingStore {
                 return (start, ActivityInterval(
                     start: start, end: r.end.addingTimeInterval(shift), steps: r.steps,
                     distanceMeters: r.distanceMeters, kilocalories: r.kilocalories,
-                    utcOffsetSeconds: o.seconds, ringLocalSeconds: ringSeconds(r.start), timeSource: o.source))
+                    utcOffsetSeconds: o.seconds,
+                    ringLocalSeconds: RingTime.ringSeconds(fromWallClock: r.start), timeSource: o.source))
             }
             try applyActivity(db, ringID, derived.rows, &result)
             record(derived, rows: derived.rows.values.map(\.timeSource), into: &result)
@@ -135,13 +136,14 @@ extension RingStore {
                 },
                 startTime: { $0.start },
                 // Sessions with one ring-local start are one session the ring rewrote.
-                supersedeKey: { ringSeconds($0.start) }
+                supersedeKey: { RingTime.ringSeconds(fromWallClock: $0.start) }
             ) { r, o in
                 let shift = -TimeInterval(o.seconds)
                 let start = r.start.addingTimeInterval(shift)
                 return (start, SleepSessionRecord(
                     start: start, end: r.end.addingTimeInterval(shift),
-                    utcOffsetSeconds: o.seconds, ringLocalSeconds: ringSeconds(r.start), timeSource: o.source,
+                    utcOffsetSeconds: o.seconds,
+                    ringLocalSeconds: RingTime.ringSeconds(fromWallClock: r.start), timeSource: o.source,
                     stages: r.stages.map {
                         SleepStageEntry(
                             kind: $0.kind, start: $0.start.addingTimeInterval(shift), durationSeconds: Int($0.duration))
@@ -164,8 +166,6 @@ extension RingStore {
         for source in sources { result.rowsByTimeSource[source, default: 0] += 1 }
     }
 
-    /// Seconds since 2000-01-01 of a ring-local reading decoded as if UTC.
-    private static func ringSeconds(_ asIfUTC: Date) -> Int { RingTime.ringSeconds(fromWallClock: asIfUTC) }
 
     /// One place a record's bytes were found.
     private struct Occurrence {
