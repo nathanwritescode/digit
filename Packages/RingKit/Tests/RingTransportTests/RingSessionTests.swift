@@ -375,8 +375,9 @@ private let deviceReply = Frame(group: 0x02, key: 0x00, payload: [7])
 // different timers (a task sleep and a dispatch queue). With a margin of tens of milliseconds a
 // loaded machine could delay the link's timer past the backstop, and the test failed on CI with
 // `busy` although the code was right (#37). The reply timeouts are therefore large enough to
-// absorb scheduling delay; the test still fails if the backstop stops being later than the link's
-// deadline, because the margin would then be zero or negative whatever the load.
+// absorb scheduling delay. This is still a race between real timers, not a proof: the test fails
+// reliably if the backstop is earlier than the link's deadline, and usually (two runs in three
+// when tried) if the two are equal. A deterministic version is tracked in #39.
 @Test(.timeLimit(.minutes(1)), arguments: [0.5, 1.0], [0.05, 0.5, 2.0])
 func linkThatTimesOutItsOwnWriteLeavesTheSessionUsable(replyTimeout: Double, writeTimeout: Double) async throws {
     let link = FakeLink(guardWrites: true, writeTimeout: writeTimeout) { $0.type == 0x0200 ? [deviceReply] : [] }
