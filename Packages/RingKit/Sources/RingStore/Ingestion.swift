@@ -13,13 +13,13 @@ private func ms(_ date: Date) -> Int64 { HistoryTransfer.millisecondsSince1970(d
 private func date(_ ms: Int64) -> Date { HistoryTransfer.date(millisecondsSince1970: ms) }
 
 extension RingStore {
-    static let ingestibleKinds: [HistoryKind] = [.activity, .sleep, .heartRate]
+    static let ingestibleKinds: [HistoryKind] = [.activity, .sleep, .heartRate, .combined]
 
     // MARK: Public API
 
     /// Makes the typed table for `kind` match what the stored transfers say, in one write
-    /// transaction (a failure leaves the tables as they were). Throws `notIngestible` for the
-    /// combined record, which is out of scope here.
+    /// transaction (a failure leaves the tables as they were). Combined records yield
+    /// `VitalsReading`s only.
     ///
     /// Time resolution is described on `TimeResolver`. Unusable input never stops the run: bytes
     /// that do not form a whole record are counted in `unusableBytes` (activity and heart-rate
@@ -36,7 +36,7 @@ extension RingStore {
         }
     }
 
-    /// Deletes the ring's typed rows for activity, sleep and heart rate and derives them again from
+    /// Deletes the ring's typed rows for every ingestible kind and derives them again from
     /// the stored transfers, in one transaction. The result is what `ingest` would converge on.
     @discardableResult
     public func rebuild(ringID: UUID) throws -> [HistoryKind: IngestionResult] {
@@ -54,6 +54,11 @@ extension RingStore {
     /// All heart-rate readings for a ring, oldest first.
     public func heartRateReadings(ringID: UUID) throws -> [StoredRow<HeartRateReading>] {
         try writer.read { db in try Self.heartRateRows(db, ringID: ringID) }
+    }
+
+    /// All vitals readings (SpO2, respiration, HRV, CVRR) for a ring, oldest first.
+    public func vitalsReadings(ringID: UUID) throws -> [StoredRow<VitalsReading>] {
+        try writer.read { db in try Self.vitalsRows(db, ringID: ringID) }
     }
 
     /// All activity intervals for a ring, oldest first.
@@ -75,6 +80,7 @@ extension RingStore {
         var collisions = 0
         var superseded = 0
         var rejectedFuture = 0
+        var withoutRow = 0
     }
 
     private static func ingest(_ db: Database, ringID: UUID, kind: HistoryKind) throws -> IngestionResult {
@@ -158,7 +164,22 @@ extension RingStore {
             result.skippedSleepStages = derived.rows.keys.reduce(0) { $0 + (skippedByRow[$1] ?? 0) }
             record(derived, rows: derived.rows.values.map(\.timeSource), into: &result)
         case .combined:
-            throw RingStoreError.notIngestible(kind)
+            // Time is resolved like heart rate (the ring stamps it at the reading, not like a sleep
+            // session). Records with nothing to store are set aside before collisions are counted.
+            let derived = try derive(
+                transfers, resolver, CombinedRecord.decodeLocated, reference: { $0.time }, times: { [$0.time] },
+                plausible: { _ in true }, startTime: nil, supersedeKey: nil,
+                withoutRow: { $0.spo2 == nil && $0.respirationRate == nil && $0.hrv == nil && $0.cvrr == nil }
+            ) { r, o in
+                let instant = r.time.addingTimeInterval(-TimeInterval(o.seconds))
+                return (instant, VitalsReading(
+                    time: instant, spo2: r.spo2, respirationRate: r.respirationRate, hrv: r.hrv, cvrr: r.cvrr,
+                    utcOffsetSeconds: o.seconds,
+                    ringLocalSeconds: RingTime.ringSeconds(fromWallClock: r.time), timeSource: o.source))
+            }
+            try applyVitals(db, ringID, derived.rows, &result)
+            result.withoutVitals = derived.withoutRow
+            record(derived, rows: derived.rows.values.map(\.timeSource), into: &result)
         }
         return result
     }
@@ -221,6 +242,7 @@ extension RingStore {
         plausible: (R) -> Bool,
         startTime: ((R) -> Date)?,
         supersedeKey: ((R) -> Int)?,
+        withoutRow: ((R) -> Bool)? = nil,
         _ build: (R, ResolvedOffset) -> (instant: Date, value: V)
     ) throws -> Derived<V> {
         var derived = Derived<V>()
@@ -275,6 +297,12 @@ extension RingStore {
             survivors = survivors.enumerated().filter { kept.contains($0.offset) }.map(\.element)
         }
         for (identity, offset) in survivors {
+            // Counted per distinct record, before `build`, so one with nothing to store can never
+            // win a key over a real reading.
+            if let withoutRow, withoutRow(identity.record) {
+                derived.withoutRow += 1
+                continue
+            }
             let (instant, value) = build(identity.record, offset)
             let key = ms(instant)
             if derived.rows[key] != nil { derived.collisions += 1 }
@@ -315,6 +343,41 @@ extension RingStore {
         }
         for row in existing.values {
             try db.cachedStatement(sql: "DELETE FROM heart_rate_reading WHERE id = ?").execute(arguments: [row.id])
+            result.deleted += 1
+        }
+    }
+
+    private static func applyVitals(
+        _ db: Database, _ ringID: UUID, _ desired: [Int64: VitalsReading], _ result: inout IngestionResult
+    ) throws {
+        var existing = Dictionary(
+            try vitalsRows(db, ringID: ringID).map { (ms($0.value.time), $0) }, uniquingKeysWith: { a, _ in a })
+        for (key, value) in desired.sorted(by: { $0.key < $1.key }) {
+            let args: StatementArguments = [
+                value.spo2, value.respirationRate, value.hrv, value.cvrr, value.utcOffsetSeconds,
+                value.ringLocalSeconds, TimeSourceCode.code(for: value.timeSource),
+            ]
+            if let row = existing.removeValue(forKey: key) {
+                if row.value == value { result.unchanged += 1; continue }
+                try db.cachedStatement(
+                    sql: """
+                        UPDATE vitals_reading SET spo2 = ?, respiration_rate = ?, hrv = ?, cvrr = ?,
+                        utc_offset_seconds = ?, ring_local_seconds = ?, time_source = ? WHERE id = ?
+                        """
+                ).execute(arguments: args + [row.id])
+                result.updated += 1
+            } else {
+                try db.cachedStatement(
+                    sql: """
+                        INSERT INTO vitals_reading (spo2, respiration_rate, hrv, cvrr, utc_offset_seconds,
+                        ring_local_seconds, time_source, ring_id, time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """
+                ).execute(arguments: args + [ringID.uuidString, key])
+                result.inserted += 1
+            }
+        }
+        for row in existing.values {
+            try db.cachedStatement(sql: "DELETE FROM vitals_reading WHERE id = ?").execute(arguments: [row.id])
             result.deleted += 1
         }
     }
@@ -408,7 +471,7 @@ extension RingStore {
         case .heartRate: table = "heart_rate_reading"
         case .activity: table = "activity_interval"
         case .sleep: table = "sleep_session"  // stages cascade
-        case .combined: throw RingStoreError.notIngestible(kind)
+        case .combined: table = "vitals_reading"
         }
         try db.cachedStatement(sql: "DELETE FROM \(table) WHERE ring_id = ?").execute(arguments: [ringID.uuidString])
     }
@@ -431,6 +494,20 @@ extension RingStore {
                 value: HeartRateReading(
                     time: date(try column(row, "time")), bpm: try column(row, "bpm"), mode: try column(row, "mode"),
                     utcOffsetSeconds: try column(row, "utc_offset_seconds"),
+                    ringLocalSeconds: try column(row, "ring_local_seconds"), timeSource: try source(row)))
+        }
+    }
+
+    static func vitalsRows(_ db: Database, ringID: UUID) throws -> [StoredRow<VitalsReading>] {
+        try Row.fetchAll(
+            db, sql: "SELECT * FROM vitals_reading WHERE ring_id = ? ORDER BY time", arguments: [ringID.uuidString]
+        ).map { row in
+            StoredRow(
+                id: try column(row, "id"),
+                value: VitalsReading(
+                    time: date(try column(row, "time")), spo2: try column(row, "spo2"),
+                    respirationRate: try column(row, "respiration_rate"), hrv: try column(row, "hrv"),
+                    cvrr: try column(row, "cvrr"), utcOffsetSeconds: try column(row, "utc_offset_seconds"),
                     ringLocalSeconds: try column(row, "ring_local_seconds"), timeSource: try source(row)))
         }
     }
