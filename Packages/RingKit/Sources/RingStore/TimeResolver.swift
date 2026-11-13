@@ -133,9 +133,14 @@ struct TimeResolver {
         let tol = Self.tolerance
         let eligible = clockSets.indices.filter { clockSets[$0].instant < w.firstSeen }
         var candidates = eligible
-        if let lastAbsent = w.lastAbsent {
-            let atOrBefore = eligible.last { clockSets[$0].instant <= lastAbsent }
-            candidates = (atOrBefore.map { [$0] } ?? []) + eligible.filter { clockSets[$0].instant > lastAbsent }
+        // A sleep session is stamped during the night and written later, so the clock in force at its
+        // end can be older than the latest clock-set at or before `lastAbsent`: for sleep every
+        // clock-set before the first sighting is a candidate and the period test narrows them.
+        if let lastAbsent = w.lastAbsent, kind != .sleep {
+            // One split point: clock-sets after the last-absent fetch are the window, and the latest
+            // one at or before it (one made at that very instant included) was in force at its start.
+            let split = eligible.firstIndex { clockSets[$0].instant > lastAbsent } ?? eligible.count
+            candidates = Array(eligible[max(split - 1, 0)...])
         }
         guard let latest = candidates.last else {
             // One offset for the whole sighting: the ring's clock does not follow daylight saving.
@@ -143,9 +148,17 @@ struct TimeResolver {
             return ResolvedOffset(seconds: zone.secondsFromGMT(for: w.firstSeen), source: .assumed)
         }
         // Includes a retried clock-set (same offset a few seconds apart) and any sync where the
-        // offset did not change.
+        // offset did not change. The record must still postdate the earliest candidate: one written
+        // before the first clock-set the app ever logged (history from before the app, or after a
+        // reinstall) is not confirmed by it. Otherwise the fit test below decides (with one offset it
+        // is either `resolved` or `assumed`).
         if Set(candidates.map { clockSets[$0].utcOffsetSeconds }).count == 1 {
-            return ResolvedOffset(seconds: clockSets[latest].utcOffsetSeconds, source: .resolved)
+            let offset = clockSets[latest].utcOffsetSeconds
+            let proposed = reference.addingTimeInterval(-TimeInterval(offset))
+            let earliest = candidates.map { clockSets[$0].instant }.min() ?? w.firstSeen
+            if proposed >= earliest.addingTimeInterval(-tol) && proposed <= w.firstSeen.addingTimeInterval(tol) {
+                return ResolvedOffset(seconds: offset, source: .resolved)
+            }
         }
 
         let fitting = candidates.filter { k in

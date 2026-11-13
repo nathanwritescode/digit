@@ -192,7 +192,7 @@ struct IngestionAmendmentTests {
             try f.fetch(.sleep, v1, at: at(3500))
             try f.setClock(at: at(3510), offset: 0)
             let v2 = sleepBytes(
-                start: start, end: wall(at(5000), offset: 0), stages: [(242, start, 1000), (241, start + 1001, 500)])
+                start: start, end: wall(at(5000), offset: 0), stages: [(242, start, 1000), (241, start + 301, 500)])
             try f.fetch(.sleep, v2, at: at(7200))
             #expect(try store.transfers(ringID: f.ring.id, kind: .sleep).transfers.count == 2)
 
@@ -221,6 +221,91 @@ struct IngestionAmendmentTests {
             let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
             #expect(result.rejectedFuture == 2 && result.inserted == 1)
             #expect(try store.heartRateReadings(ringID: f.ring.id).map(\.value.bpm) == [50])
+        }
+    }
+
+    /// The edge is on the resolved instant, so it needs the offset: with no clock-set the zone's offset
+    /// (five hours behind in January) is applied before comparing with the fetch.
+    @Test func theTwentyFourHourBoundIsMeasuredOnTheResolvedInstantInANonUTCZone() throws {
+        try onEachStore { store in
+            let f = try Fixture(store)
+            let fetched = at(3600)
+            func ringSeconds(_ resolved: Date) -> UInt32 { UInt32(resolved.timeIntervalSince1970 - 18000 - 946_684_800) }
+            let inside = hrBytes(ringSeconds(fetched.addingTimeInterval(86_400)), bpm: 50)
+            let outside = hrBytes(ringSeconds(fetched.addingTimeInterval(86_401)), bpm: 51)
+            try f.fetch(.heartRate, inside + outside, at: fetched, zone: "America/New_York")
+            let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
+            #expect(result.rejectedFuture == 1 && result.inserted == 1)
+            #expect(try store.heartRateReadings(ringID: f.ring.id).map(\.value.bpm) == [50])
+        }
+    }
+
+    // MARK: Activity and sleep sanity
+
+    /// A bucket's row instant and key are its start, so the start is checked as well as the end.
+    @Test func implausibleActivityBucketStartsAreRejected() throws {
+        try onEachStore { store in
+            let f = try clockedFixture(store, kinds: [.activity])
+            let good = wall(at(1000), offset: 3600)
+            let validEnd = good + 1800
+            try f.fetch(.activity, [
+                activityBytes(start: good, end: validEnd, steps: 1),
+                activityBytes(start: 0xFFFF_FFFF, end: validEnd, steps: 2),  // start in 2136
+                activityBytes(start: 1000, end: validEnd, steps: 3),  // start in 2000, valid end
+                activityBytes(start: validEnd + 10, end: validEnd, steps: 4),  // starts after it ends
+                activityBytes(start: good + 5000, end: 0xFFFF_FFFF, steps: 5),  // end in 2136
+            ].flatMap { $0 }, at: at(3600))
+            let result = try store.ingest(ringID: f.ring.id, kind: .activity)
+            #expect(result.inserted == 1 && result.rejectedBefore2020 == 3 && result.rejectedFuture == 1)
+            #expect(try store.activityIntervals(ringID: f.ring.id).map(\.value.steps) == [1])
+        }
+    }
+
+    @Test func sleepStagesOutsideTheSessionAreRejected() throws {
+        try onEachStore { store in
+            let f = try clockedFixture(store, kinds: [.sleep])
+            let s = wall(at(1000), offset: 3600)
+            let good = sleepBytes(start: s, end: s + 600, stages: [(242, s, 600)])
+            let late = sleepBytes(start: s + 5000, end: s + 5600, stages: [(242, s + 5000, 300), (241, s + 5601, 300)])
+            let early = sleepBytes(start: s + 9000, end: s + 9600, stages: [(242, s + 8999, 300)])
+            let farFuture = sleepBytes(start: s + 12000, end: s + 12600, stages: [(242, s + 12000, 300), (241, 0xFFFF_FFFF, 300)])
+            try f.fetch(.sleep, good + late + early + farFuture, at: at(3600))
+            let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
+            #expect(result.inserted == 1 && result.rejectedBefore2020 == 3)
+        }
+    }
+
+    /// A garbage rewrite is judged before it can supersede: the valid copy stays.
+    @Test func aGarbageRewriteOfASleepSessionDoesNotSupersedeTheGoodCopy() throws {
+        try onEachStore { store in
+            let f = try clockedFixture(store, kinds: [.sleep])
+            let s = wall(at(1000), offset: 3600)
+            try f.fetch(.sleep, sleepBytes(start: s, end: s + 600, stages: [(242, s, 600)]), at: at(3600))
+            try f.fetch(.sleep, sleepBytes(start: s, end: 0xFFFF_FFFF, stages: [(242, s, 600)]), at: at(7200))
+            #expect(try store.transfers(ringID: f.ring.id, kind: .sleep).transfers.count == 2)
+            let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
+            #expect(result.inserted == 1 && result.superseded == 0 && result.rejectedFuture == 1)
+            let rows = try store.sleepSessions(ringID: f.ring.id).map(\.value)
+            #expect(rows.count == 1 && rows[0].end == at(1000 + 600))
+        }
+    }
+
+    // MARK: Which copy is later in the buffer
+
+    /// Y is in both transfers and Z only in the first, at a later offset than Y there; both land on
+    /// one key. Y's later copy is in the later transfer, so Y is later in the buffer and wins.
+    @Test func aRecordInALaterTransferIsLaterInTheBufferThanOneAtALaterOffsetOfAnEarlierTransfer() throws {
+        try onEachStore { store in
+            let f = try clockedFixture(store)
+            let t = wall(at(600), offset: plus1)
+            let y = hrBytes(t, bpm: 1), z = hrBytes(t, bpm: 2)
+            let q = hrBytes(wall(at(1200), offset: plus1), bpm: 3)
+            try f.fetch(.heartRate, y + z, at: at(3600))
+            try f.fetch(.heartRate, y + q, at: at(7200))
+            #expect(try store.transfers(ringID: f.ring.id, kind: .heartRate).transfers.count == 2)
+            let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
+            #expect(result.collisions == 1 && result.inserted == 2)
+            #expect(try store.heartRateReadings(ringID: f.ring.id).map(\.value.bpm) == [1, 3])
         }
     }
 

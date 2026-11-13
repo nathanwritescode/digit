@@ -112,7 +112,7 @@ struct TimeResolutionTests {
     @Test func aRetriedClockSetWithTheSameOffsetIsResolvedWhateverTheRecordsTime() throws {
         let rec = filler(1)
         let retried = [clock(0, 3600), clock(5, 3600)]
-        #expect(try resolve([obs([], -10, id: 1), obs(rec, 3600, id: 2)], retried, data: rec, reference: at(50000)) == resolved(3600))
+        #expect(try resolve([obs([], -10, id: 1), obs(rec, 3600, id: 2)], retried, data: rec, reference: at(1800 + 3600)) == resolved(3600))
     }
 
     @Test func withNoClockSetInTheWindowTheLatestEarlierOneIsUsed() throws {
@@ -120,7 +120,7 @@ struct TimeResolutionTests {
         let several = [clock(0, 3600), clock(100, 7200), clock(200, 0)]
         // Last absent at 300, after all three clock-sets: only the latest (offset 0) is a candidate.
         let observations = [obs([], 300, id: 1), obs(rec, 3600, id: 2)]
-        #expect(try resolve(observations, several, data: rec, reference: at(50000)) == resolved(0))
+        #expect(try resolve(observations, several, data: rec, reference: at(1000)) == resolved(0))
     }
 
     // MARK: Other rules
@@ -172,8 +172,8 @@ struct TimeResolutionTests {
         let result = try resolve(
             [obs(rec, 3600, id: 1)], [clock(0, 3600), clock(1000, 7200)], data: rec, reference: at(50000))
         #expect(result == assumed(7200))
-        // A single clock-set is certain whatever the record's time: every candidate shares its offset.
-        #expect(try resolve([obs(rec, 3600, id: 1)], [clock(0, 3600)], data: rec, reference: at(50000)) == resolved(3600))
+        // A single clock-set is certain when the record postdates it: every candidate shares its offset.
+        #expect(try resolve([obs(rec, 3600, id: 1)], [clock(0, 3600)], data: rec, reference: at(1800 + 3600)) == resolved(3600))
     }
 
     @Test func noClockSetAtAllIsAssumedWithTheZoneOffsetAtTheFirstSightingInstant() throws {
@@ -262,11 +262,68 @@ struct TimeResolutionTests {
         let observations = [
             obs(filler(1), 100, id: 1), obs(both, 200, id: 2), obs(filler(1), 300, id: 3),
         ]
-        // Correct: last absent 100, so the window holds two clock-sets and none fits a far
-        // reference: assumed. Taking the later fetch would leave one candidate, which is certain.
+        // Correct: last absent 100, so all three clock-sets are candidates and only the middle
+        // one fits this reference (real 100 under offset 7200): resolved. Taking the later fetch
+        // would leave only the last clock-set, which the record predates: assumed.
         let result = try resolve(
-            observations, [clock(0, 3600), clock(150, 7200), clock(160, 10800)], data: both, offset: 6, reference: at(100_000))
-        #expect(result == assumed(10800))
+            observations, [clock(0, 3600), clock(150, 7200), clock(160, 10800)], data: both, offset: 6, reference: at(7300))
+        #expect(result == resolved(7200))
+    }
+
+    // MARK: Sleep candidates and the same-offset case (J, K)
+
+    /// A record written before the first clock-set the app ever logged (history from before the app,
+    /// or after a reinstall) is not confirmed by that clock-set, even though it is the only one.
+    @Test func aRecordAWeekOlderThanTheOnlyClockSetIsAssumed() throws {
+        let rec = filler(1)
+        let week = 7.0 * 86400
+        #expect(try resolve([obs(rec, 3600, id: 1)], [clock(0, 3600)], data: rec, reference: at(-week + 3600)) == assumed(3600))
+        // Nor is one dated well after it was first seen.
+        #expect(try resolve([obs(rec, 3600, id: 1)], [clock(0, 3600)], data: rec, reference: at(50000)) == assumed(3600))
+        // The same record shortly after the clock-set is certain.
+        #expect(try resolve([obs(rec, 3600, id: 1)], [clock(0, 3600)], data: rec, reference: at(1800 + 3600)) == resolved(3600))
+    }
+
+    /// Seconds are relative to 02:00 on one day. c0 at 02:00 (-14400); the session ends 07:30 ring-local
+    /// (11:30 UTC = 34200); fetch 11:35 (34500) without it, then c1 at 34505 (-18000); fetch 11:50 (35400)
+    /// without it, then c2 at 35405 (-18000); the ring writes it at 12:00; the fetch at 13:00 (39600)
+    /// contains it. A clock that went back an hour: the session's wall clock fits both offsets.
+    @Test func aSleepSessionWrittenTwoSyncsAfterItEndedAcrossAClockGoingBackIsAmbiguous() throws {
+        let rec = filler(1)
+        let reference = at(34200 - 14400)  // 07:30 ring-local
+        let twoSyncs = [clock(0, -14400), clock(34505, -18000), clock(35405, -18000)]
+        let fetches = [obs([], 34500, id: 1), obs([], 35400, id: 2), obs(rec, 39600, id: 3)]
+        #expect(try resolve(fetches, twoSyncs, data: rec, reference: reference, kind: .sleep) == ambiguous(-18000))
+        // With only the first of the two syncs it is also ambiguous.
+        let oneSync = [clock(0, -14400), clock(34505, -18000)]
+        let fewer = [obs([], 34500, id: 1), obs(rec, 39600, id: 2)]
+        #expect(try resolve(fewer, oneSync, data: rec, reference: reference, kind: .sleep) == ambiguous(-18000))
+    }
+
+    @Test func anOrdinarySleepSessionWithNoOffsetChangeIsResolved() throws {
+        let rec = filler(1)
+        let result = try resolve(
+            [obs([], 3600, id: 1), obs(rec, 14400, id: 2)], [clock(0, 3600)], data: rec, reference: at(7000 + 3600), kind: .sleep)
+        #expect(result == resolved(3600))
+    }
+
+    /// Heart rate and activity keep the narrowing by the last-absent fetch: the older clock-set is
+    /// not a candidate, so the later one is certain. (A sleep session would test both.)
+    @Test func heartRateCandidatesAreNarrowedByTheLastAbsentFetch() throws {
+        let rec = filler(1)
+        let observations = [obs([], 3600, id: 1), obs(rec, 14400, id: 2)]
+        let two = [clock(0, 3600), clock(100, 0)]
+        #expect(try resolve(observations, two, data: rec, reference: at(100)) == resolved(0))
+        #expect(try resolve(observations, two, data: rec, reference: at(100), kind: .sleep) == resolved(0))
+    }
+
+    /// A clock-set made at exactly the last-absent instant counts as at or before it: it is the
+    /// clock in force, not one made in the window.
+    @Test func aClockSetAtExactlyTheLastAbsentInstantIsAtOrBeforeIt() throws {
+        let rec = filler(1)
+        let observations = [obs([], 3600, id: 1), obs(rec, 14400, id: 2)]
+        let result = try resolve(observations, [clock(0, 7200), clock(3600, 3600)], data: rec, reference: at(3500 + 7200))
+        #expect(result == resolved(3600))
     }
 
     // MARK: Through ingestion

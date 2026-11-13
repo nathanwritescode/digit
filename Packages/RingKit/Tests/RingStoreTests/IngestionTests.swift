@@ -9,11 +9,11 @@ import RingProtocol
 // unless a test says otherwise.
 
 private func at(_ seconds: Double) -> Date { t0.addingTimeInterval(seconds) }
-private let plus1 = 3600
+let plus1 = 3600
 
 /// A fixture whose clock was set at t0 and whose first (empty) fetch preceded it, so records
 /// written afterwards resolve with +1 hour.
-private func clockedFixture(_ store: RingStore, kinds: [HistoryKind] = [.heartRate]) throws -> Fixture {
+func clockedFixture(_ store: RingStore, kinds: [HistoryKind] = [.heartRate]) throws -> Fixture {
     let f = try Fixture(store)
     for kind in kinds { try f.fetch(kind, [], at: at(-10)) }
     try f.setClock(at: at(0), offset: plus1)

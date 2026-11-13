@@ -86,8 +86,8 @@ extension RingStore {
         switch kind {
         case .heartRate:
             let derived = try derive(
-                transfers, resolver, HeartRateRecord.decodeLocated, reference: { $0.time }, plausible: { _ in true },
-                supersedeKey: nil
+                transfers, resolver, HeartRateRecord.decodeLocated, reference: { $0.time }, times: { [$0.time] },
+                plausible: { _ in true }, supersedeKey: nil
             ) { r, o in
                 let instant = r.time.addingTimeInterval(-TimeInterval(o.seconds))
                 return (instant, HeartRateReading(
@@ -98,7 +98,9 @@ extension RingStore {
             record(derived, rows: derived.rows.values.map(\.timeSource), into: &result)
         case .activity:
             let derived = try derive(
-                transfers, resolver, ActivityRecord.decodeLocated, reference: { $0.end }, plausible: { _ in true },
+                transfers, resolver, ActivityRecord.decodeLocated, reference: { $0.end }, times: { [$0.start, $0.end] },
+                // The row's instant and unique key are the start, so it is checked like the end.
+                plausible: { $0.start >= earliestPlausibleRingTime && $0.start <= $0.end },
                 supersedeKey: nil
             ) { r, o in
                 let shift = -TimeInterval(o.seconds)
@@ -113,11 +115,13 @@ extension RingStore {
         case .sleep:
             let derived = try derive(
                 transfers, resolver, SleepSession.decodeLocated, reference: { $0.end },
-                // A session that starts after it ends, or has a stage before 2020, is garbage even
-                // though its end may look plausible.
+                times: { r in [r.start, r.end] + r.stages.map(\.start) },
+                // A session that starts after it ends, or has a stage outside [start, end] (so also
+                // before 2020 or in the far future), is garbage even though its end may look plausible.
+                // Exact bounds: a stage starts before the session ends on the ring seen so far.
                 plausible: { r in
                     r.start >= earliestPlausibleRingTime && r.start <= r.end
-                        && r.stages.allSatisfy { $0.start >= earliestPlausibleRingTime }
+                        && r.stages.allSatisfy { $0.start >= r.start && $0.start <= r.end }
                 },
                 // Sessions with one ring-local start are one session the ring rewrote.
                 supersedeKey: { ringSeconds($0.start) }
@@ -196,6 +200,7 @@ extension RingStore {
         _ transfers: [StoredTransfer], _ resolver: TimeResolver,
         _ decode: ([UInt8], TimeZone) -> [Located<R>],
         reference: (R) -> Date,
+        times: (R) -> [Date],
         plausible: (R) -> Bool,
         supersedeKey: ((R) -> Int)?,
         _ build: (R, ResolvedOffset) -> (instant: Date, value: V)
@@ -226,24 +231,32 @@ extension RingStore {
         }
         derived.rejected = rejected.count
 
-        var ordered = identities.values.sorted { $0.lastPosition < $1.lastPosition }
+        // Resolve every copy and drop the future ones first, so a garbage rewrite of a sleep
+        // session cannot supersede a good copy.
+        var survivors: [(identity: Identity<R>, offset: ResolvedOffset)] = []
+        for identity in identities.values.sorted(by: { $0.lastPosition < $1.lastPosition }) {
+            guard let chosen = identity.occurrences.min(by: { $0.window.firstSeen < $1.window.firstSeen }) else { continue }
+            let offset = resolver.resolve(window: chosen.window, reference: reference(identity.record))
+            // A record cannot have been written after it was fetched (this also catches FF FF FF FF).
+            // Every time in it counts, not only the one the offset was resolved from.
+            let future = times(identity.record).contains {
+                $0.addingTimeInterval(-TimeInterval(offset.seconds)).timeIntervalSince(chosen.window.firstSeen) > 86_400
+            }
+            if future {
+                derived.rejectedFuture += 1
+            } else {
+                survivors.append((identity, offset))
+            }
+        }
         if let supersedeKey {
             // Keep the copy latest in the buffer; the others were rewritten by it.
             var latestByKey: [Int: Int] = [:]
-            for (i, identity) in ordered.enumerated() { latestByKey[supersedeKey(identity.record)] = i }
+            for (i, survivor) in survivors.enumerated() { latestByKey[supersedeKey(survivor.identity.record)] = i }
             let kept = Set(latestByKey.values)
-            derived.superseded = ordered.count - kept.count
-            ordered = ordered.enumerated().filter { kept.contains($0.offset) }.map(\.element)
+            derived.superseded = survivors.count - kept.count
+            survivors = survivors.enumerated().filter { kept.contains($0.offset) }.map(\.element)
         }
-        for identity in ordered {
-            guard let chosen = identity.occurrences.min(by: { $0.window.firstSeen < $1.window.firstSeen }) else { continue }
-            let ref = reference(identity.record)
-            let offset = resolver.resolve(window: chosen.window, reference: ref)
-            // A record cannot have been written after it was fetched (this also catches FF FF FF FF).
-            if ref.addingTimeInterval(-TimeInterval(offset.seconds)).timeIntervalSince(chosen.window.firstSeen) > 86_400 {
-                derived.rejectedFuture += 1
-                continue
-            }
+        for (identity, offset) in survivors {
             let (instant, value) = build(identity.record, offset)
             let key = ms(instant)
             if derived.rows[key] != nil { derived.collisions += 1 }
