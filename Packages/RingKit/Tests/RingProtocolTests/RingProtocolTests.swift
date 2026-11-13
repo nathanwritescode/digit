@@ -160,6 +160,20 @@ private let utc = TimeZone(identifier: "UTC")!
     #expect(SleepSession.decode(hex("affa 1c00 00000000"), timeZone: utc).isEmpty)
 }
 
+@Test func sleepDecodingCountsStagesItSkips() {
+    // Synthetic bytes. One session with a valid light stage, an unknown kind (0x01), a zero-duration
+    // deep stage and a valid REM stage: the valid ones decode, two entries are reported as skipped.
+    let skipping = "affa 3400 00000000 08070000 ffff 0000 0000 0000"
+        + "f2 00000000 080700" + "01 08070000 080700" + "f1 10070000 000000" + "f3 18070000 080700"
+    let clean = "affa 1c00 a08c0000 a8930000 ffff 0807 0000 0000" + "f3 a08c0000 080700"
+    let sessions = SleepSession.decode(hex(skipping + clean), timeZone: utc)
+    #expect(sessions.count == 2)
+    #expect(sessions[0].stages.map(\.kind) == [.light, .rem])
+    #expect(sessions[0].skippedStages == 2)
+    #expect(sessions[1].skippedStages == 0)
+    #expect(SleepSession.decodeLocated(hex(skipping), timeZone: utc).first?.record.skippedStages == 2)
+}
+
 @Test func hexRoundTripsAndRejectsBadInput() {
     #expect(Hex.encode([0x00, 0x0A, 0xFF]) == "000aff")
     #expect(Hex.encode([]) == "")
