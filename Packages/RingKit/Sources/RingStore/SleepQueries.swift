@@ -49,20 +49,20 @@ public struct SleepInterruption: Equatable, Sendable {
     public var seconds: Int { Int(end.timeIntervalSince(start).rounded(.down)) }
 }
 
-/// One night: a maximal run of sessions each starting at most `sleepNightMaximumGapSeconds`
-/// after the previous one ends. See `RingStore.sleepNights` for the rules.
+/// One night: a maximal run of sessions, in start order, each starting at most
+/// `sleepNightMaximumGapSeconds` after the latest end seen so far in the night. See `RingStore.sleepNights` for the rules.
 public struct SleepNightSummary: Equatable, Sendable {
-    /// The calendar day the night ends on, by the last session's own offset.
+    /// The calendar day the night ends on, by the own offset of the session with the latest end (the later in start order on a tie).
     public var day: SleepDay
     /// First session's start.
     public var start: Date
-    /// Last session's end.
+    /// Latest end among the night's sessions.
     public var end: Date
     /// Sum of stage durations as stored (not clipped), for every kind, including those at zero.
     public var secondsByKind: [SleepStageKind: Int]
     /// Sum over `deep`, `light`, `rem` and `nap` stages. `awake` is not counted.
     public var secondsAsleep: Int
-    /// Gaps between consecutive sessions of the night; overlaps are not listed.
+    /// Stretches inside the night covered by no session; overlapping or contained sessions add none.
     public var interruptions: [SleepInterruption]
     public var interruptionSeconds: Int
     /// The least certain `timeSource` among the night's sessions (resolved, ambiguous, assumed).
@@ -87,7 +87,7 @@ extension RingStore {
     }
 
     /// Every night whose day is in `first...last` (inclusive), naps included and flagged, ordered
-    /// by start. Days are read on the ring's clock (the last session's end plus its own offset,
+    /// by start. Days are read on the ring's clock (the latest session end plus that session's own offset,
     /// in GMT). A night is never cut by the range: it has the contents and main-sleep flag any
     /// other query gives it.
     public func sleepNights(ringID: UUID, from first: SleepDay, through last: SleepDay) async throws
@@ -209,13 +209,18 @@ extension RingStore {
             seconds[try column(row, "session_id"), default: [:]][kind] = try column(row, "total")
         }
 
-        // Rule 1: runs of consecutive sessions, each starting within the gap of the previous end.
+        // Rule 1: a session joins the current night when it starts within the gap of the latest end
+        // seen so far in that night (not of the previous session's end, which a contained session
+        // would make too early).
         var runs: [[SessionRow]] = []
+        var latestEnd: Int64 = 0
         for session in sessions {
-            if let previous = runs.last?.last, session.start - previous.end <= Int64(sleepNightMaximumGapSeconds) * 1000 {
+            if !runs.isEmpty, session.start - latestEnd <= Int64(sleepNightMaximumGapSeconds) * 1000 {
                 runs[runs.count - 1].append(session)
+                latestEnd = max(latestEnd, session.end)
             } else {
                 runs.append([session])
+                latestEnd = session.end
             }
         }
 
@@ -223,11 +228,18 @@ extension RingStore {
         var nights: [NightGroup] = runs.map { run in
             var byKind = Dictionary(uniqueKeysWithValues: SleepStageKind.allCases.map { ($0, 0) })
             for session in run { for (kind, total) in seconds[session.id] ?? [:] { byKind[kind, default: 0] += total } }
+            // Interruptions: stretches inside the night covered by no session.
             var interruptions: [SleepInterruption] = []
-            for (previous, next) in zip(run, run.dropFirst()) where next.start > previous.end {
-                interruptions.append(SleepInterruption(start: date(previous.end), end: date(next.start)))
+            var covered = run[0].end
+            // The session with the latest end, the later in start order on a tie, decides end and day.
+            var last = run[0]
+            for session in run.dropFirst() {
+                if session.start > covered {
+                    interruptions.append(SleepInterruption(start: date(covered), end: date(session.start)))
+                }
+                covered = max(covered, session.end)
+                if session.end >= last.end { last = session }
             }
-            let last = run[run.count - 1]
             let summary = SleepNightSummary(
                 day: SleepDay(instant: date(last.end), utcOffsetSeconds: last.offset),  // rule 2
                 start: date(run[0].start), end: date(last.end), secondsByKind: byKind,

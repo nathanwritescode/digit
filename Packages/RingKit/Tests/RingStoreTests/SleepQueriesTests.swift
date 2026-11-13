@@ -115,6 +115,30 @@ struct SleepQueriesTests {
         #expect(nights[0].secondsAsleep == 5 * 3600)
     }
 
+    @Test func aContainedSessionDoesNotHideTheLongerSessionsEnd() async throws {
+        let f = try fixture(RingStore())
+        // 0:00 to 3:00 with a contained 1:00 to 1:30, then a session 10 minutes after the long one ends.
+        try ingest(f, [Session(0, 3 * hour), Session(hour, 1.5 * hour), Session(3 * hour + 10 * minute, 4 * hour)])
+        let nights = try await allNights(f)
+        #expect(nights.count == 1)
+        #expect(nights[0].end == at(4 * hour))
+        #expect(nights[0].interruptions == [SleepInterruption(start: at(3 * hour), end: at(3 * hour + 10 * minute))])
+        #expect(nights[0].interruptionSeconds == 600)
+    }
+
+    @Test func nightEndAndDayComeFromTheSessionWithTheLatestEnd() async throws {
+        let f = try fixture(RingStore())
+        // The long session ends 23:30 UTC; the contained one starts later and ends earlier, so it is
+        // last in start order but not latest in time. The long one's offset (+1 h) puts it on day 1.
+        try ingest(f, [Session(20 * hour, 23.5 * hour), Session(21 * hour, 22 * hour)])
+        try setColumns(f, startingAt: 20 * hour, offset: 3600)
+        let nights = try await allNights(f)
+        #expect(nights.count == 1)
+        #expect(nights[0].end == at(23.5 * hour))
+        #expect(nights[0].day == day(1))
+        #expect(nights[0].interruptions.isEmpty)
+    }
+
     @Test func totalsPerKindAndTimeAsleep() async throws {
         let f = try fixture(RingStore())
         try ingest(f, [
@@ -241,6 +265,26 @@ struct SleepQueriesTests {
         #expect(try await allNights(f).count == 1)
         #expect(try await allNights(g).count == 2)
         #expect(try await store.latestSleepNight(ringID: f.ring.id)?.summary.start == at(0))
+    }
+
+    @Test func theConsumerBreakingOutOfTheLoopEndsItsIteration() async throws {
+        // Proves only that stopping iteration is clean. That the underlying GRDB observation is
+        // then cancelled (via `onTermination`) cannot be seen from outside without a hook, so it is
+        // not verified here.
+        let f = try fixture(RingStore())
+        let store = f.store
+        let ringID = f.ring.id
+        let task = Task { () -> Int in
+            var count = 0
+            for try await _ in store.observeLatestSleepNight(ringID: ringID) {
+                count += 1
+                break
+            }
+            return count
+        }
+        #expect(try await task.value == 1)
+        try ingest(f, [Session(0, hour)])  // a change after the consumer left must not disturb anything
+        #expect(try await f.store.latestSleepNight(ringID: f.ring.id) != nil)
     }
 
     @Test func observationYieldsNowAndAfterAChangeAndEndsOnCancel() async throws {
