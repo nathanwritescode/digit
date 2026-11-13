@@ -16,7 +16,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             let r1 = hrBytes(wall(at(1800), offset: 3600), bpm: 61)
             let r2 = hrBytes(wall(at(5400), offset: 3600), bpm: 62)
             try f.fetch(.heartRate, r1 + r2, at: at(7200))
@@ -40,7 +40,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.activity, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             func bucket(_ start: Double, _ offset: Int, steps: Int) -> [UInt8] {
                 activityBytes(start: wall(at(start), offset: offset), end: wall(at(start + 799), offset: offset), steps: steps)
             }
@@ -63,7 +63,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             let t = wall(at(1800), offset: 3600)
             try f.fetch(.heartRate, hrBytes(t, bpm: 60) + hrBytes(t, bpm: 61), at: at(3600))
             let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
@@ -79,7 +79,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.activity, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             try f.setClock(at: at(7200), offset: 0)  // clock back; that sync's fetch was missed
             // Both have the wall-clock start of real instant 9000 under offset 0: the first was
             // written under +3600 (real 5400), the second under 0.
@@ -105,7 +105,7 @@ struct IngestionAmendmentTests {
             let data = hrBytes(ring("2019-12-31T23:59:59Z"), bpm: 50) + hrBytes(ring("2020-01-01T00:00:00Z"), bpm: 51)
             try f.fetch(.heartRate, data, at: t0, zone: "UTC")
             let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
-            #expect(result.rejectedBefore2020 == 1 && result.inserted == 1)
+            #expect(result.rejectedImplausible == 1 && result.inserted == 1)
             let row = try #require(try store.heartRateReadings(ringID: f.ring.id).first).value
             #expect(row.bpm == 51 && row.time == ISO8601DateFormatter().date(from: "2020-01-01T00:00:00Z"))
         }
@@ -115,7 +115,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.sleep, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             let s = wall(at(1000), offset: 3600)
             let good = sleepBytes(start: s, end: s + 600, stages: [(242, s, 600)])
             // Starts in 2000 but ends in 2027.
@@ -126,7 +126,7 @@ struct IngestionAmendmentTests {
             let badStage = sleepBytes(start: s + 9000, end: s + 9600, stages: [(242, s + 9000, 300), (241, 2000, 300)])
             try f.fetch(.sleep, good + longAgo + backwards + badStage, at: at(3600))
             let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
-            #expect(result.rejectedBefore2020 == 3 && result.inserted == 1)
+            #expect(result.rejectedImplausible == 3 && result.inserted == 1)
             #expect(try store.sleepSessions(ringID: f.ring.id).map(\.value.start) == [at(1000)])
         }
     }
@@ -140,7 +140,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             let a = hrBytes(wall(at(5400), offset: 3600), bpm: 58)  // wall clock 9000
             try f.fetch(.heartRate, a, at: at(7200))
             try f.setClock(at: at(7210), offset: 0)
@@ -161,7 +161,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.activity, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             // The same wall-clock bucket twice: real 4800-5400 under +3600, then real 8400-9000 under 0.
             let a = activityBytes(start: wall(at(4800), offset: 3600), end: wall(at(5400), offset: 3600), steps: 0)
             try f.fetch(.activity, a, at: at(7200))
@@ -186,13 +186,13 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.sleep, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             let start = wall(at(1000), offset: 3600)
             let v1 = sleepBytes(start: start, end: wall(at(3000), offset: 3600), stages: [(242, start, 1000)])
             try f.fetch(.sleep, v1, at: at(3500))
             try f.setClock(at: at(3510), offset: 0)
             let v2 = sleepBytes(
-                start: start, end: wall(at(5000), offset: 0), stages: [(242, start, 1000), (241, start + 301, 500)])
+                start: start, end: wall(at(5000), offset: 0), stages: [(242, start, 300), (241, start + 301, 99)])
             try f.fetch(.sleep, v2, at: at(7200))
             #expect(try store.transfers(ringID: f.ring.id, kind: .sleep).transfers.count == 2)
 
@@ -216,10 +216,11 @@ struct IngestionAmendmentTests {
             func ringSeconds(_ d: Date) -> UInt32 { UInt32(d.timeIntervalSince1970 - 946_684_800) }
             let inside = hrBytes(ringSeconds(fetched.addingTimeInterval(86_400)), bpm: 50)
             let outside = hrBytes(ringSeconds(fetched.addingTimeInterval(86_401)), bpm: 51)
-            let allFF = [UInt8](repeating: 0xFF, count: 6)
-            try f.fetch(.heartRate, inside + outside + allFF, at: fetched, zone: "UTC")
+            let allFF = [UInt8](repeating: 0xFF, count: 6)  // 255 bpm: implausible, not future
+            let farFuture = hrBytes(0xFFFF_FFFF, bpm: 60)
+            try f.fetch(.heartRate, inside + outside + allFF + farFuture, at: fetched, zone: "UTC")
             let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
-            #expect(result.rejectedFuture == 2 && result.inserted == 1)
+            #expect(result.rejectedFuture == 2 && result.rejectedImplausible == 1 && result.inserted == 1)
             #expect(try store.heartRateReadings(ringID: f.ring.id).map(\.value.bpm) == [50])
         }
     }
@@ -253,10 +254,12 @@ struct IngestionAmendmentTests {
                 activityBytes(start: 0xFFFF_FFFF, end: validEnd, steps: 2),  // start in 2136
                 activityBytes(start: 1000, end: validEnd, steps: 3),  // start in 2000, valid end
                 activityBytes(start: validEnd + 10, end: validEnd, steps: 4),  // starts after it ends
-                activityBytes(start: good + 5000, end: 0xFFFF_FFFF, steps: 5),  // end in 2136
+                activityBytes(start: good + 5000, end: 0xFFFF_FFFF, steps: 5),  // end in 2136: longer than a day
+                // Well-formed but dated two days after the fetch that showed it: future.
+                activityBytes(start: good + 200_000, end: good + 201_800, steps: 6),
             ].flatMap { $0 }, at: at(3600))
             let result = try store.ingest(ringID: f.ring.id, kind: .activity)
-            #expect(result.inserted == 1 && result.rejectedBefore2020 == 3 && result.rejectedFuture == 1)
+            #expect(result.inserted == 1 && result.rejectedImplausible == 4 && result.rejectedFuture == 1)
             #expect(try store.activityIntervals(ringID: f.ring.id).map(\.value.steps) == [1])
         }
     }
@@ -271,7 +274,115 @@ struct IngestionAmendmentTests {
             let farFuture = sleepBytes(start: s + 12000, end: s + 12600, stages: [(242, s + 12000, 300), (241, 0xFFFF_FFFF, 300)])
             try f.fetch(.sleep, good + late + early + farFuture, at: at(3600))
             let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
-            #expect(result.inserted == 1 && result.rejectedBefore2020 == 3)
+            #expect(result.inserted == 1 && result.rejectedImplausible == 3)
+        }
+    }
+
+    // MARK: Sanity bounds (N)
+
+    /// Fetched long after the records so that even a 48-hour session is not "from the future".
+    private func sanityFixture(_ store: RingStore, _ kind: HistoryKind) throws -> Fixture {
+        try clockedFixture(store, kinds: [kind])
+    }
+
+    private let late = at(400_000)
+
+    @Test func aStageThatRunsFarPastTheSessionEndIsRejected() throws {
+        try onEachStore { store in
+            let f = try sanityFixture(store, .sleep)
+            let s = wall(at(1000), offset: plus1)
+            // One stage from the session start lasting 0xFFFFFF s (about 194 days).
+            let endless = sleepBytes(start: s, end: s + 600, stages: [(242, s, 0xFF_FFFF)])
+            // A stage starting exactly at the session end and lasting 50000 s.
+            let atEnd = sleepBytes(start: s + 5000, end: s + 5600, stages: [(242, s + 5600, 50000)])
+            try f.fetch(.sleep, endless + atEnd, at: late)
+            let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
+            #expect(result.inserted == 0 && result.rejectedImplausible == 2)
+        }
+    }
+
+    /// Exact edges: a stage may end up to 60 s after the session end, start exactly at the session
+    /// start or end, and the session may have zero length.
+    @Test func stageAndSessionBoundsHaveExactEdges() throws {
+        try onEachStore { store in
+            let f = try sanityFixture(store, .sleep)
+            let s = wall(at(1000), offset: plus1)
+            func session(_ n: UInt32, _ stages: [(kind: UInt8, start: UInt32, seconds: Int)], length: UInt32 = 600) -> [UInt8] {
+                sleepBytes(start: s + n * 10_000, end: s + n * 10_000 + length, stages: stages.map { ($0.kind, s + n * 10_000 + $0.start, $0.seconds) })
+            }
+            let accepted: [[UInt8]] = [
+                session(0, [(242, 0, 660)]),  // ends exactly 60 s after the session end
+                session(1, [(242, 600, 30)]),  // starts exactly at the session end
+                session(2, [(242, 0, 30)], length: 0),  // zero-length session
+                session(3, []),  // no stages
+            ]
+            let rejected: [[UInt8]] = [
+                session(4, [(242, 0, 661)]),  // ends 61 s after
+                session(5, [(242, 601, 30)]),  // starts one second after the session end
+                session(6, [(242, 0, 30)], length: 172_801),  // longer than 48 hours
+            ]
+            try f.fetch(.sleep, (accepted + rejected).flatMap { $0 }, at: late)
+            let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
+            #expect(result.inserted == 4 && result.rejectedImplausible == 3)
+            // Exactly 48 hours is allowed.
+            let exact = sleepBytes(start: s + 90_000, end: s + 90_000 + 172_800, stages: [(242, s + 90_000, 30)])
+            try f.fetch(.sleep, (accepted + rejected).flatMap { $0 } + exact, at: late.addingTimeInterval(1))
+            #expect(try store.ingest(ringID: f.ring.id, kind: .sleep).inserted == 1)
+        }
+    }
+
+    @Test func aStageStartingBeforeTheSessionStartIsRejected() throws {
+        try onEachStore { store in
+            let f = try sanityFixture(store, .sleep)
+            let s = wall(at(1000), offset: plus1)
+            let early = sleepBytes(start: s + 100, end: s + 700, stages: [(242, s + 99, 30)])
+            let exact = sleepBytes(start: s + 10_000, end: s + 10_600, stages: [(242, s + 10_000, 30)])
+            try f.fetch(.sleep, early + exact, at: late)
+            let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
+            #expect(result.inserted == 1 && result.rejectedImplausible == 1)
+        }
+    }
+
+    @Test func activityBucketLengthIsCappedAtADayAndAZeroLengthBucketIsAccepted() throws {
+        try onEachStore { store in
+            let f = try sanityFixture(store, .activity)
+            let s = wall(at(1000), offset: plus1)
+            try f.fetch(.activity, [
+                activityBytes(start: s, end: s + 86_400, steps: 1),  // exactly 24 hours
+                activityBytes(start: s + 100_000, end: s + 100_000 + 86_401, steps: 2),  // one second over
+                activityBytes(start: s + 200_000, end: s + 200_000, steps: 3),  // zero length
+            ].flatMap { $0 }, at: late)
+            let result = try store.ingest(ringID: f.ring.id, kind: .activity)
+            #expect(result.inserted == 2 && result.rejectedImplausible == 1)
+            #expect(try store.activityIntervals(ringID: f.ring.id).map(\.value.steps) == [1, 3])
+        }
+    }
+
+    @Test func heartRateReadingsOfZeroAndTwoHundredFiftyFiveAreRejected() throws {
+        try onEachStore { store in
+            let f = try sanityFixture(store, .heartRate)
+            try f.fetch(.heartRate, [0, 1, 254, 255].enumerated().flatMap { i, bpm in
+                hrBytes(wall(at(1000 + Double(i) * 600), offset: plus1), bpm: UInt8(bpm))
+            }, at: late)
+            let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
+            #expect(result.inserted == 2 && result.rejectedImplausible == 2)
+            #expect(try store.heartRateReadings(ringID: f.ring.id).map(\.value.bpm) == [1, 254])
+        }
+    }
+
+    /// A stage's end counts in the future check, not just its start. The session ends exactly 24 hours
+    /// after the fetch; a stage ending at the session end is fine, one ending 60 s later (still allowed
+    /// by the stage bound) is dated past 24 hours.
+    @Test func aStageEndingJustPastTheFutureBoundIsRejectedAsFuture() throws {
+        try onEachStore { store in
+            let f = try clockedFixture(store, kinds: [.sleep])
+            let s = wall(at(1000), offset: plus1)
+            let e = wall(at(3600 + 86_400), offset: plus1)
+            let fine = sleepBytes(start: s, end: e, stages: [(242, s, Int(e - s))])
+            let over = sleepBytes(start: s + 1000, end: e, stages: [(242, s + 1000, Int(e - s - 1000) + 60)])
+            try f.fetch(.sleep, fine + over, at: at(3600))
+            let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
+            #expect(result.inserted == 1 && result.rejectedFuture == 1 && result.rejectedImplausible == 0)
         }
     }
 
@@ -284,7 +395,7 @@ struct IngestionAmendmentTests {
             try f.fetch(.sleep, sleepBytes(start: s, end: 0xFFFF_FFFF, stages: [(242, s, 600)]), at: at(7200))
             #expect(try store.transfers(ringID: f.ring.id, kind: .sleep).transfers.count == 2)
             let result = try store.ingest(ringID: f.ring.id, kind: .sleep)
-            #expect(result.inserted == 1 && result.superseded == 0 && result.rejectedFuture == 1)
+            #expect(result.inserted == 1 && result.superseded == 0 && result.rejectedImplausible == 1)
             let rows = try store.sleepSessions(ringID: f.ring.id).map(\.value)
             #expect(rows.count == 1 && rows[0].end == at(1000 + 600))
         }
@@ -313,7 +424,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             for kind in [HistoryKind.heartRate, .activity, .sleep] { try f.fetch(kind, [], at: at(-10)) }
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             let w = wall(at(600), offset: 3600)
             try f.fetch(.heartRate, hrBytes(w, bpm: 60), at: at(3600))
             try f.fetch(.activity, activityBytes(start: w, end: w + 1799, steps: 1), at: at(3600))
@@ -333,7 +444,7 @@ struct IngestionAmendmentTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.sleep, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             let s = wall(at(1000), offset: 3600)
             let stages = SleepStageKind.allCases.enumerated().map { (i, kind) in
                 (kind: kind.rawValue, start: s + UInt32(i * 100), seconds: 99)

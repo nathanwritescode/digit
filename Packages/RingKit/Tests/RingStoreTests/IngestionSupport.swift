@@ -46,6 +46,15 @@ struct Fixture {
         try store.insert(transfer(kind, data: data, header: [UInt8(data.count & 0xFF)], at: date, zone: zone), ringID: ring.id)
     }
 
+    /// The first clock-set the app logs. A record whose window reaches back before the log cannot be
+    /// `resolved` within 26 hours of the first clock-set (the ring's earlier clock is unknown), so
+    /// tests that want ordinary results put an earlier clock-set with the same offset ahead of it,
+    /// as a ring that has been synced for more than a day has.
+    func setFirstClock(at instant: Date, offset: Int, zone: String = "Europe/London") throws {
+        try setClock(at: t0.addingTimeInterval(-200_000), offset: offset, zone: zone)
+        try setClock(at: instant, offset: offset, zone: zone)
+    }
+
     func setClock(at instant: Date, offset: Int, zone: String = "Europe/London") throws {
         try store.recordClockSet(ClockSetEvent(
             ringID: ring.id, instant: instant, timeZoneIdentifier: zone, utcOffsetSeconds: offset))

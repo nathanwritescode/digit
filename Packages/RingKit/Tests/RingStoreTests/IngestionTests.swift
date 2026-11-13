@@ -16,7 +16,7 @@ let plus1 = 3600
 func clockedFixture(_ store: RingStore, kinds: [HistoryKind] = [.heartRate]) throws -> Fixture {
     let f = try Fixture(store)
     for kind in kinds { try f.fetch(kind, [], at: at(-10)) }
-    try f.setClock(at: at(0), offset: plus1)
+    try f.setFirstClock(at: at(0), offset: plus1)
     return f
 }
 
@@ -143,7 +143,7 @@ struct IngestionTests {
             // Raw ring seconds 3600 and 7200 are in the year 2000.
             try f.fetch(.heartRate, hrBytes(3600, bpm: 50) + hr(600, 61) + hrBytes(7200, bpm: 51), at: at(3600))
             let r = try store.ingest(ringID: f.ring.id, kind: .heartRate)
-            #expect(r.rejectedBefore2020 == 2 && r.inserted == 1)
+            #expect(r.rejectedImplausible == 2 && r.inserted == 1)
             #expect(try store.heartRateReadings(ringID: f.ring.id).map(\.value.bpm) == [61])
         }
     }
@@ -276,8 +276,8 @@ struct IngestionTests {
                     sql: RingStore.insertObservationSQL,
                     arguments: [ringID.uuidString, "heartRate", data.count, Data([1]), 1_800_003_600_000, "Europe/London", Data(hash)])
                 try db.execute(
-                    sql: "INSERT INTO clock_set (ring_id, instant, time_zone_identifier, utc_offset_seconds) VALUES (?, 1800000000000, 'Europe/London', 3600)",
-                    arguments: [ringID.uuidString])
+                    sql: "INSERT INTO clock_set (ring_id, instant, time_zone_identifier, utc_offset_seconds) VALUES (?, 1800000000000, 'Europe/London', 3600), (?, 1799800000000, 'Europe/London', 3600)",
+                    arguments: [ringID.uuidString, ringID.uuidString])
                 let tables = try String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE name = 'heart_rate_reading'")
                 #expect(tables.isEmpty)
             }
@@ -285,7 +285,7 @@ struct IngestionTests {
         let store = try RingStore(url: url)
         #expect(try store.transfers(ringID: ringID).transfers.map(\.transfer.data) == [data])
         #expect(try store.observations(ringID: ringID).observations.count == 1)
-        #expect(try store.clockSets(ringID: ringID).count == 1)
+        #expect(try store.clockSets(ringID: ringID).count == 2)
         #expect(try store.heartRateReadings(ringID: ringID).isEmpty)
         let r = try store.ingest(ringID: ringID, kind: .heartRate)
         #expect(r.inserted == 1 && r.rowsByTimeSource == [.resolved: 1])

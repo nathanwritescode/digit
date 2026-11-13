@@ -67,10 +67,13 @@ public struct IngestionResult: Equatable, Sendable {
     public var updated = 0
     public var deleted = 0
     public var unchanged = 0
-    /// Distinct records (an identical record in several transfers counts once) whose ring-local time is before
-    /// 2020-01-01 (the ring's clock was never set), plus sleep sessions that start after they end or
-    /// have a stage starting before 2020.
-    public var rejectedBefore2020 = 0
+    /// Distinct records (an identical record in several transfers counts once) rejected as
+    /// implausible: a ring-local time before 2020-01-01 (the ring's clock was never set); an activity
+    /// bucket that starts after it ends or is longer than 24 hours; a sleep session that starts after
+    /// it ends, is longer than 48 hours, or has a stage that starts outside the session or ends more
+    /// than 60 seconds after it; a heart-rate reading of 0 or 255 bpm. Records dated far in the
+    /// future are counted separately in `rejectedFuture`.
+    public var rejectedImplausible = 0
     /// Rows that make up the desired set, by how their offset was chosen.
     public var rowsByTimeSource: [TimeSource: Int] = [:]
     /// Bytes in stored transfers that did not form a whole record (trailing or malformed bytes),

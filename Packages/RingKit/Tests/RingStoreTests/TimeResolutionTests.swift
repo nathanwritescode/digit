@@ -37,13 +37,20 @@ struct TimeResolutionTests {
     }
 
     /// Resolves the 6-byte record at `offset` of `data`; `reference` is the ring-local reading.
+    ///
+    /// By default an earlier clock-set with the first one's offset is put 200000 s ahead of the given
+    /// ones, as for a ring synced for more than a day: a record whose window reaches back before the
+    /// log is never `resolved` within 26 hours of the first clock-set (amendment L), and these tests
+    /// are about the other rules. Pass `anchored: false` to test the log exactly as given.
     private func resolve(
         _ fetches: [Fetch], _ clocks: [ClockSetEvent], data: [UInt8], offset: Int = 0,
-        reference: Date, kind: HistoryKind = .heartRate
+        reference: Date, kind: HistoryKind = .heartRate, start: Date? = nil, anchored: Bool = true
     ) throws -> ResolvedOffset {
-        let r = TimeResolver(
-            ringID: ring, kind: kind, observations: observations(fetches, kind: kind), clockSets: clocks)
-        return try r.resolve(sightings: r.sightings(in: data), offset: offset, length: 6, reference: reference)
+        var log = clocks
+        if anchored, let first = clocks.first { log.insert(clock(-200_000, first.utcOffsetSeconds), at: 0) }
+        let r = TimeResolver(ringID: ring, kind: kind, observations: observations(fetches, kind: kind), clockSets: log)
+        return try r.resolve(
+            sightings: r.sightings(in: data), offset: offset, length: 6, reference: reference, start: start)
     }
 
     private func resolved(_ seconds: Int) -> ResolvedOffset { ResolvedOffset(seconds: seconds, source: .resolved) }
@@ -182,7 +189,8 @@ struct TimeResolutionTests {
         #expect(try resolve([obs(rec, 3600, id: 1, zone: "America/New_York")], [], data: rec, reference: at(0))
             == assumed(-18000))
         // A clock-set that is only after the first sighting is not a candidate either.
-        #expect(try resolve([obs(rec, 3600, id: 1, zone: "America/New_York")], [clock(3700, 0)], data: rec, reference: at(0))
+        #expect(try resolve(
+            [obs(rec, 3600, id: 1, zone: "America/New_York")], [clock(3700, 0)], data: rec, reference: at(0), anchored: false)
             == assumed(-18000))
     }
 
@@ -314,7 +322,6 @@ struct TimeResolutionTests {
         let observations = [obs([], 3600, id: 1), obs(rec, 14400, id: 2)]
         let two = [clock(0, 3600), clock(100, 0)]
         #expect(try resolve(observations, two, data: rec, reference: at(100)) == resolved(0))
-        #expect(try resolve(observations, two, data: rec, reference: at(100), kind: .sleep) == resolved(0))
     }
 
     /// A clock-set made at exactly the last-absent instant counts as at or before it: it is the
@@ -326,13 +333,103 @@ struct TimeResolutionTests {
         #expect(result == resolved(3600))
     }
 
+    // MARK: Windows that reach before the log (L)
+
+    // Time zero is 12:00:00 UTC. Before the first logged clock-set the ring's offset is unknown: here it
+    // was -14400 (set by the vendor's app); the first-ever clock-set sets -18000.
+
+    /// Heart rate at 1-minute monitoring: the reading at 12:00:10 UTC is 08:00:10 on the old clock.
+    /// Under the first logged offset (-18000) that looks like 13:00:10 UTC, a valid time just after the
+    /// clock-set at 12:00:20, so the logs cannot confirm it.
+    @Test func aReadingTakenUnderTheUnknownClockJustBeforeTheFirstClockSetIsAmbiguous() throws {
+        let rec = filler(1)
+        let result = try resolve(
+            [obs([], 0, id: 1), obs(rec, 21600, id: 2)], [clock(20, -18000)], data: rec,
+            reference: at(10 - 14400), anchored: false)
+        #expect(result == ambiguous(-18000))
+    }
+
+    /// A sleep session that ended at 11:40 UTC (07:40 on the old clock), written at 12:10; the first-ever
+    /// clock-set is at 12:00:05 and the next fetch at 23:00.
+    @Test func aSleepSessionFromBeforeTheFirstClockSetIsAmbiguous() throws {
+        let rec = filler(1)
+        let result = try resolve(
+            [obs([], 0, id: 1), obs(rec, 39600, id: 2)], [clock(5, -18000)], data: rec,
+            reference: at(-1200 - 14400), kind: .sleep, anchored: false)
+        #expect(result == ambiguous(-18000))
+    }
+
+    /// The same ring two days later, nothing else changed: both are resolved.
+    @Test func theSameRingTwoDaysLaterIsResolved() throws {
+        let rec = filler(1)
+        let day2 = 172_800.0
+        #expect(try resolve(
+            [obs([], day2, id: 1), obs(rec, day2 + 21600, id: 2)], [clock(20, -18000)], data: rec,
+            reference: at(day2 + 10 - 18000), anchored: false) == resolved(-18000))
+        #expect(try resolve(
+            [obs([], day2, id: 1), obs(rec, day2 + 39600, id: 2)], [clock(5, -18000)], data: rec,
+            reference: at(day2 - 1200 - 18000), kind: .sleep, anchored: false) == resolved(-18000))
+    }
+
+    /// The edge of the 26-hour window, so the bound cannot move unnoticed.
+    @Test func theTwentySixHourWindowEdgeIsExactlyTwentySixHoursPlusTheTolerance() throws {
+        let rec = filler(1)
+        let edge = 26.0 * 3600 + 120
+        // Chosen instant exactly at the edge is not "earlier than" it: resolved. One second less: ambiguous.
+        func result(_ instant: Double) throws -> ResolvedOffset {
+            try resolve(
+                [obs(rec, 200_000, id: 1)], [clock(0, 0)], data: rec, reference: at(instant),
+                anchored: false)
+        }
+        #expect(try result(edge) == resolved(0))
+        #expect(try result(edge - 1) == ambiguous(0))
+    }
+
+    // MARK: A sleep session spanning an offset change (M)
+
+    /// The clock goes from -14400 to -18000 at 07:00 UTC (time zero). The session was stamped 23:00
+    /// ring-local at its start (03:00 UTC) and 07:00 ring-local at its end (12:00 UTC).
+    @Test func aSleepSessionThatSpansAnOffsetChangeIsAmbiguous() throws {
+        let rec = filler(1)
+        let log = [clock(-200_000, -14400), clock(0, -18000)]
+        let fetches = [obs([], -600, id: 1), obs(rec, 21600, id: 2)]
+        let spanning = try resolve(
+            fetches, log, data: rec, reference: at(0), kind: .sleep, start: at(-28800), anchored: false)
+        #expect(spanning == ambiguous(-18000))
+        // A session that started after the clock-set has nothing to span: resolved.
+        let after = try resolve(
+            fetches, log, data: rec, reference: at(0), kind: .sleep, start: at(-3600), anchored: false)
+        #expect(after == resolved(-18000))
+    }
+
+    // MARK: The same-offset bound (K)
+
+    /// Clock-sets at 0 and 1100 with one offset, last absent at 1000, first seen at 1200: the record
+    /// has to postdate the earliest candidate, not the latest, so 500 is resolved.
+    @Test func theSameOffsetBoundUsesTheEarliestCandidate() throws {
+        let rec = filler(1)
+        let result = try resolve(
+            [obs([], 1000, id: 1), obs(rec, 1200, id: 2)], [clock(0, 3600), clock(1100, 3600)], data: rec,
+            reference: at(500 + 3600))
+        #expect(result == resolved(3600))
+    }
+
+    /// The bound has the tolerance: 60 s before the clock-set is still confirmed, 121 s is not. (With a
+    /// last-absent fetch after the clock-set the fit test alone would refuse both.)
+    @Test func theSameOffsetBoundAllowsTheTolerance() throws {
+        let rec = filler(1)
+        let fetches = [obs([], 1000, id: 1), obs(rec, 1200, id: 2)]
+        #expect(try resolve(fetches, [clock(0, 3600)], data: rec, reference: at(-60 + 3600)) == resolved(3600))
+        #expect(try resolve(fetches, [clock(0, 3600)], data: rec, reference: at(-121 + 3600)) == assumed(3600))
+    }
+
     // MARK: Through ingestion
 
     @Test func ingestionUsesTheClockSetsOffset() throws {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             try f.fetch(.heartRate, hrBytes(wall(at(1800), offset: 3600), bpm: 60), at: at(3600))
             let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
             #expect(result.inserted == 1 && result.rowsByTimeSource == [.resolved: 1])
@@ -345,7 +442,7 @@ struct TimeResolutionTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)  // London
+            try f.setFirstClock(at: at(0), offset: 3600)  // London
             let r0 = hrBytes(wall(at(1800), offset: 3600), bpm: 60)
             try f.fetch(.heartRate, r0, at: at(3600))
             try f.setClock(at: at(3610), offset: -18000, zone: "America/New_York")  // flew west
@@ -366,7 +463,7 @@ struct TimeResolutionTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             let before = hrBytes(wall(at(1800), offset: 3600), bpm: 60)
             try f.fetch(.heartRate, before, at: at(3600))
             try f.fetch(.heartRate, before, at: at(7200))  // unchanged duplicate at the clock change
@@ -386,7 +483,7 @@ struct TimeResolutionTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 0)
+            try f.setFirstClock(at: at(0), offset: 0)
             let before = hrBytes(wall(at(1800), offset: 0), bpm: 60)
             try f.fetch(.heartRate, before, at: at(3600))
             try f.setClock(at: at(3610), offset: 3600)  // clock forward an hour
@@ -404,7 +501,7 @@ struct TimeResolutionTests {
         try onEachStore { store in
             let f = try Fixture(store)
             try f.fetch(.heartRate, [], at: at(-10))
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             try f.setClock(at: at(7200), offset: 0)  // the sync between failed to fetch
             try f.fetch(.heartRate, hrBytes(wall(at(9000), offset: 0), bpm: 60), at: at(14400))
             let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
@@ -417,7 +514,7 @@ struct TimeResolutionTests {
     @Test func aRecordNoClockSetFitsIsAssumedThroughIngestion() throws {
         try onEachStore { store in
             let f = try Fixture(store)
-            try f.setClock(at: at(0), offset: 3600)
+            try f.setFirstClock(at: at(0), offset: 3600)
             try f.setClock(at: at(1000), offset: 7200)
             try f.fetch(.heartRate, hrBytes(wall(at(40000), offset: 3600), bpm: 60), at: at(3600))
             let result = try store.ingest(ringID: f.ring.id, kind: .heartRate)
@@ -461,7 +558,7 @@ struct TimeResolutionTests {
     private func sleepSession(endingAtReal end: Double, _ store: RingStore) throws -> SleepSessionRecord {
         let f = try Fixture(store)
         try f.fetch(.sleep, [], at: at(-10))
-        try f.setClock(at: at(0), offset: 3600)
+        try f.setFirstClock(at: at(0), offset: 3600)
         try f.fetch(.sleep, [], at: at(7200))
         try f.setClock(at: at(7210), offset: 0)
         let start = wall(at(end - 900), offset: 3600)

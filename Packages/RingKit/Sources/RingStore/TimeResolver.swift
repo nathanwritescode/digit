@@ -115,8 +115,50 @@ struct TimeResolver {
         return Window(firstSeen: first.fetchedAt, firstSeenZone: first.timeZoneIdentifier, lastAbsent: lastAbsent)
     }
 
-    func resolve(sightings: [Sighting], offset: Int, length: Int, reference: Date) throws -> ResolvedOffset {
-        resolve(window: try window(sightings: sightings, offset: offset, length: length), reference: reference)
+    func resolve(
+        sightings: [Sighting], offset: Int, length: Int, reference: Date, start: Date? = nil
+    ) throws -> ResolvedOffset {
+        resolve(
+            window: try window(sightings: sightings, offset: offset, length: length), reference: reference, start: start)
+    }
+
+    /// The widest gap between two UTC offsets. A record stamped under the unknown clock the ring had
+    /// before the first logged clock-set cannot land further than this past that clock-set.
+    static let widestOffsetGap: TimeInterval = 26 * 3600
+
+    /// The offset rules (`baseOffset`), then two downgrades from `resolved` to `ambiguous`:
+    ///
+    /// - A record whose window reaches back before the log (a sleep session, one with no last-absent
+    ///   fetch, or one whose last-absent fetch is earlier than the first logged clock-set) may have
+    ///   been stamped under the ring's unknown earlier clock (the vendor's app set it, or the app was
+    ///   reinstalled). Near the first clock-set (within 26 hours plus the tolerance) its instant under
+    ///   the first logged offset can look valid, so it is not `resolved`.
+    /// - A sleep session whose resolved span holds a clock-set with a different offset from the one
+    ///   before it was stamped partly under each clock. `start` is the session's ring-local start.
+    ///
+    /// An `assumed` result stays `assumed`.
+    func resolve(window w: Window, reference: Date, start: Date? = nil) -> ResolvedOffset {
+        let base = baseOffset(window: w, reference: reference)
+        guard base.source == .resolved else { return base }
+        let end = reference.addingTimeInterval(-TimeInterval(base.seconds))
+        let downgraded = ResolvedOffset(seconds: base.seconds, source: .ambiguous)
+
+        if let first = clockSets.first,
+           kind == .sleep || w.lastAbsent == nil || w.lastAbsent.map({ $0 < first.instant }) == true,
+           end < first.instant.addingTimeInterval(Self.widestOffsetGap + Self.tolerance)
+        {
+            return downgraded
+        }
+        if kind == .sleep, let start {
+            let begin = start.addingTimeInterval(-TimeInterval(base.seconds))
+            for k in clockSets.indices.dropFirst()
+            where clockSets[k].instant > begin && clockSets[k].instant < end
+                && clockSets[k].utcOffsetSeconds != clockSets[k - 1].utcOffsetSeconds
+            {
+                return downgraded
+            }
+        }
+        return base
     }
 
     /// `reference` is the record's ring-local time (its wall-clock reading decoded as if UTC): the
@@ -129,7 +171,7 @@ struct TimeResolver {
     /// (both widened by the tolerance), and, for records written at about their reference time
     /// (heart rate and activity), not before `lastAbsent` (widened). A sleep session is written
     /// some time after it ends, so that last bound does not apply to it.
-    func resolve(window w: Window, reference: Date) -> ResolvedOffset {
+    func baseOffset(window w: Window, reference: Date) -> ResolvedOffset {
         let tol = Self.tolerance
         let eligible = clockSets.indices.filter { clockSets[$0].instant < w.firstSeen }
         var candidates = eligible
@@ -144,6 +186,7 @@ struct TimeResolver {
         }
         guard let latest = candidates.last else {
             // One offset for the whole sighting: the ring's clock does not follow daylight saving.
+            // A zone identifier this system does not know silently becomes GMT.
             let zone = TimeZone(identifier: w.firstSeenZone) ?? .gmt
             return ResolvedOffset(seconds: zone.secondsFromGMT(for: w.firstSeen), source: .assumed)
         }
