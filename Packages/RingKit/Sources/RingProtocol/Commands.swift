@@ -18,6 +18,12 @@ public enum HistoryKind: UInt8, CaseIterable, Sendable {
     }
 }
 
+extension Frame {
+    /// True for the monitoring-interval setting (`0x010C`), whatever its payload. Tools that send
+    /// arbitrary frames must refuse it and point to the validated builder instead.
+    public var isMonitoringSetting: Bool { type == 0x010C }
+}
+
 /// Builders for the frames the app sends.
 ///
 /// The `Health_Delete*` commands (`0x0540`–`0x0552`) are deliberately absent, and the transport
@@ -55,7 +61,8 @@ public enum Command {
     }
 
     /// Sets the ring's scheduled-reading interval. This changes a ring setting, so it is not on the
-    /// read-only list, and the only way to build it is through the validated `MonitoringInterval`.
+    /// read-only list. This is the only builder, and it takes the validated `MonitoringInterval`;
+    /// a hand-made `Frame` of this type passed to `RingSession.request` bypasses that validation.
     public static func setMonitoringInterval(_ interval: MonitoringInterval) -> Frame {
         Frame(group: 0x01, key: 0x0C, payload: interval.payload)
     }

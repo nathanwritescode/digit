@@ -20,43 +20,19 @@ public enum MonitoringInterval: Int, CaseIterable, Sendable {
     /// The minutes between readings, or nil when monitoring is off.
     public var minutes: Int? { self == .off ? nil : rawValue }
 
-    /// True for the values confirmed on hardware (R99, firmware 2.32).
-    public var isVerifiedOnHardware: Bool {
-        switch self {
-        case .off, .oneMinute, .fiveMinutes, .tenMinutes: true
-        default: false
-        }
-    }
-
-    /// Parses a command-line value: `off` or one of the allowed minute counts. Anything else,
-    /// including `0`, `7`, signs and padding, is nil.
-    public init?(argument: String) {
-        if argument == "off" { self = .off; return }
-        guard !argument.isEmpty, argument.utf8.allSatisfy({ (0x30...0x39).contains($0) }),
-              let value = Int(argument), value > 0, String(value) == argument, let interval = MonitoringInterval(rawValue: value) else { return nil }
+    /// An allowed number of minutes (1, 5, 10, 15, 20, 30 or 60); nil for anything else,
+    /// including 0, which is `.off` and is not a minute count.
+    public init?(minutes: Int) {
+        guard minutes > 0, let interval = MonitoringInterval(rawValue: minutes) else { return nil }
         self = interval
     }
 
-    /// The payload bytes: `[enabled, minutes]`. When off, the minutes byte is `0x0A`, the value
-    /// verified on the R99 (the ring ignores it).
+    /// The payload bytes: `[enabled, minutes]`. With off, the minutes byte is `0x0A`: the only
+    /// value ever sent with off (on the R99, where off worked). Its effect is assumed, not tested.
     var payload: [UInt8] {
         switch self {
         case .off: [0x00, 0x0A]
         default: [0x01, UInt8(rawValue)]
-        }
-    }
-
-    /// True only for an answer of exactly `yes` (any case, surrounding whitespace ignored). End of
-    /// input, an empty line or anything else is a refusal.
-    public static func isConfirmation(_ answer: String?) -> Bool {
-        answer?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "yes"
-    }
-
-    /// What is shown to the owner before this is sent to a ring.
-    public var summary: String {
-        switch self {
-        case .off: "turn scheduled readings off (heart rate, SpO2, respiration, HRV)"
-        default: "take scheduled readings every \(rawValue) minute\(rawValue == 1 ? "" : "s") (heart rate, SpO2, respiration, HRV)"
         }
     }
 }

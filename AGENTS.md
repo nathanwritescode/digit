@@ -28,6 +28,7 @@ Packages/RingKit/
   Tests/RingProtocolTests/ Swift Testing tests
   Tests/RingStoreTests/    store tests on in-memory and temporary-file databases
   Tests/RingTransportTests/ session tests against a scripted fake RingLink (no Bluetooth)
+  Tests/ringprobeTests/    tests of the tool's own helpers (`@testable import ringprobe`)
 App/
   Digit.xcodeproj          iOS app project (SwiftUI, iOS 26, Swift 6, iPhone only); depends on RingKit
   Digit/                   app sources (file-system-synchronised: new files are picked up automatically)
@@ -88,7 +89,7 @@ Continuous integration (`.github/workflows/ci.yml`) runs `swift build` and `swif
 | Acknowledging a transfer | Does not discard it: a second fetch right after returned identical bytes |
 | Activity, sleep and heart record decoders | Verified against one real night: the Swift decoders matched an independent decode for all three, and the owner confirmed the sleep times matched their night (recorded on #6). Test fixtures remain synthetic |
 | Combined record (`0x0509`, 20 bytes) | Layout matches documentation. `CombinedRecord` decodes it; the Swift decoder was run against a real R99 capture (36 records) and every exposed field matched an independent decode (test fixtures remain synthetic). Timestamp, steps, heart rate, SpO2, respiration, HRV and CVRR are plausible and agree with the other records |
-| Monitoring interval (`0x010C`, payload `[enabled, minutes]`) | Verified at 1, 5 and 10 minutes, off, and back on. 15, 20, 30 and 60 minutes have never been sent. Built only from `MonitoringInterval` (`Command.setMonitoringInterval`, `RingSession.setMonitoringInterval`, `ringprobe monitor`); tested against a scripted link only, not yet sent through them to a ring (#19 part 2). Not on the read-only list. Details below |
+| Monitoring interval (`0x010C`, payload `[enabled, minutes]`) | Verified at 1, 5 and 10 minutes, off, and back on. 15, 20, 30 and 60 minutes have never been sent. Builder, session method and `ringprobe monitor` tested against a scripted link only; not yet sent through them to a ring (#19 part 2). Details below |
 | Battery percentage (device info byte 5) | Unverified: it has read 100% at every check so far (#25). Do not show it in the app until settled |
 | `0x0220` live snapshot, `0x0533` body data | Ring replies unsupported |
 | `0x051A` SpO2 history, `0x051E` temperature history | No reply at all, before or after a night of wear: treat as unsupported. SpO2 is available only in the combined record |
@@ -129,6 +130,7 @@ Built for the command-line tool; these must be closed before the app relies on i
 - The 60 s conversation cap has not been tested against a large backlog and is longer than an iOS background window; the sync engine needs its own budget.
 - A conversation can overrun its deadline by up to about `writeTimeout + replyTimeout` for a final write (the write backstop, derived from the link's own `writeTimeout`).
 - A late reply to a timed-out request can be accepted by a retry of the same kind of request; for history it fails safe through the checksum.
+- `RingSession` does not yet refuse a hand-made `0x010C` frame passed to `request` (`ringprobe raw` does refuse it); the validated builder is `Command.setMonitoringInterval`.
 - Ring-initiated events are acknowledged only while a request is in flight; there is no continuous reader and no way to subscribe to uploads.
 - Connecting scans for all devices and matches by name. iOS needs scanning by service, reconnecting by stored identifier, and state restoration for background sync.
 - No task cancellation support. `RingSession` (an actor over the `RingLink` protocol) queues conversations, but `RingConnection` itself still assumes one conversation at a time, so the app must use it only through a session (`ringprobe raw` uses it directly, which is fine for a single-task command-line tool).

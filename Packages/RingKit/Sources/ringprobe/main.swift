@@ -64,6 +64,23 @@ let operands = Array(arguments.dropFirst())
     print("  \(outgoing ? ">>" : "<<") \(bytes.map { String(format: "%02x", $0) }.joined())")
 }
 
+// `monitor` changes a ring setting, so it validates and gets the owner's confirmation here, before
+// the connection object (and so any Bluetooth manager) exists. A refused run never touches Bluetooth.
+let monitorInterval: MonitoringInterval? = command == "monitor" ? confirmMonitor() : nil
+func confirmMonitor() -> MonitoringInterval {
+    guard operands.count == 1, let interval = MonitoringInterval(argument: operands[0]) else {
+        fail("monitor needs one of: 1, 5, 10, 15, 20, 30, 60, off")
+    }
+    // A piped answer must not be able to confirm.
+    guard isatty(STDIN_FILENO) != 0 else { fail("monitor needs a terminal on standard input to ask for confirmation; nothing sent") }
+    print("About to send 010C \(Hex.encode(Command.setMonitoringInterval(interval).payload)): \(interval.summary).")
+    if !interval.isVerifiedOnHardware { print("This value has not been tried on a ring before.") }
+    print("The ring cannot report this setting back. Type yes to send it: ", terminator: "")
+    fflush(stdout)
+    guard MonitoringInterval.isConfirmation(readLine()) else { fail("not confirmed; nothing sent") }
+    return interval
+}
+
 let connection = trace ? RingConnection(onRawBytes: traceBytes) : RingConnection()
 
 func connect() async throws -> RingSession {
@@ -153,16 +170,14 @@ do {
         print("ring clock set to \(timestamps.string(from: Date())) local time")
 
     case "monitor":
-        // A deliberate write: validate and confirm before connecting, so nothing is sent otherwise.
-        guard operands.count == 1, let interval = MonitoringInterval(argument: operands[0]) else {
-            fail("monitor needs one of: 1, 5, 10, 15, 20, 30, 60, off")
-        }
-        print("About to send 010C \(Hex.encode(Command.setMonitoringInterval(interval).payload)): \(interval.summary).")
-        if !interval.isVerifiedOnHardware { print("This value has not been tried on a ring before.") }
-        print("The ring cannot report this setting back. Type yes to send it: ", terminator: "")
-        guard MonitoringInterval.isConfirmation(readLine()) else { fail("not confirmed; nothing sent") }
+        // Validated and confirmed before the connection existed (see `monitorInterval`).
+        guard let interval = monitorInterval else { fail("internal error: monitor was not confirmed") }
         let session = try await connect()
-        try await session.setMonitoringInterval(interval)
+        do {
+            try await session.setMonitoringInterval(interval)
+        } catch RingError.timeout {
+            fail("the ring did not reply in time; it may still have applied the setting")
+        }
         print("ring accepted the setting")
 
     case "history":
@@ -207,6 +222,9 @@ do {
             let frame = Frame(group: type[0], key: type[1], payload: payload)
             if frame.erasesRingData {
                 fail("refusing to send \(first): that range deletes history from the ring")
+            }
+            if frame.isMonitoringSetting {
+                fail("refusing to send \(first): it changes the ring's monitoring interval. Use `ringprobe monitor`, which validates the value and asks for confirmation.")
             }
             if !Command.isKnownReadOnly(frame), !allowUnknown {
                 fail("refusing to send \(operand): not a known read-only command with its documented payload. Its effect is unknown; pass --allow-unknown to send it anyway.")
