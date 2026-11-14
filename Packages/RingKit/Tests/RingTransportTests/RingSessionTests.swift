@@ -484,3 +484,56 @@ private final class ParkedOperation: @unchecked Sendable {
     func park() async { await withCheckedContinuation { c in lock.withLock { continuation = c } } }
     func release() { lock.withLock { continuation.take() }?.resume() }
 }
+
+// Synthetic ring replies: `00` is the ack seen on the R99, `FC` the documented unsupported code.
+@Test(arguments: MonitoringInterval.allCases)
+func monitoringIntervalIsSentAndAckAccepted(interval: MonitoringInterval) async throws {
+    let link = FakeLink { $0.type == 0x010C ? [Frame(group: 0x01, key: 0x0C, payload: [0x00])] : [] }
+    try await session(link).setMonitoringInterval(interval)
+    #expect(link.sent == [Command.setMonitoringInterval(interval)])
+}
+
+@Test func monitoringIntervalUnsupportedReplyMapsToUnsupported() async throws {
+    let link = FakeLink { _ in [Frame(group: 0x01, key: 0x0C, payload: [0xFC])] }
+    await #expect(throws: MonitoringSettingError.unsupported) {
+        try await session(link).setMonitoringInterval(.tenMinutes)
+    }
+}
+
+private func monitoringReply(_ payload: [UInt8]) -> FakeLink {
+    FakeLink { _ in [Frame(group: 0x01, key: 0x0C, payload: payload)] }
+}
+
+@Test(arguments: [0xFB, 0xFD, 0xFE, 0xFF] as [UInt8])
+func monitoringIntervalOtherErrorCodesMapToRejected(code: UInt8) async throws {
+    await #expect(throws: MonitoringSettingError.rejected(code)) {
+        try await session(monitoringReply([code])).setMonitoringInterval(.fiveMinutes)
+    }
+}
+
+@Test func monitoringIntervalNonAckOneByteReplyIsUnexpected() async throws {
+    await #expect(throws: MonitoringSettingError.unexpectedReply(0x01)) {
+        try await session(monitoringReply([0x01])).setMonitoringInterval(.fiveMinutes)
+    }
+}
+
+@Test func monitoringIntervalEmptyReplyIsUnexpected() async throws {
+    await #expect(throws: MonitoringSettingError.unexpectedReply(nil)) {
+        try await session(monitoringReply([])).setMonitoringInterval(.fiveMinutes)
+    }
+}
+
+// A reply that merely starts with 00 is not the ack.
+@Test func monitoringIntervalLongerReplyStartingWithZeroIsUnexpected() async throws {
+    await #expect(throws: MonitoringSettingError.unexpectedReply(nil)) {
+        try await session(monitoringReply([0x00, 0x01])).setMonitoringInterval(.fiveMinutes)
+    }
+}
+
+@Test func monitoringIntervalWithNoReplyTimesOut() async throws {
+    let link = FakeLink()
+    do {
+        try await session(link).setMonitoringInterval(.off)
+        Issue.record("expected an error")
+    } catch RingError.timeout {}
+}

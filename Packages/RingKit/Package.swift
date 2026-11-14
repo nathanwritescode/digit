@@ -36,6 +36,8 @@ let package = Package(
             dependencies: ["RingProtocol", "RingTransport"]
         ),
         .testTarget(name: "RingProtocolTests", dependencies: ["RingProtocol"]),
+        // Tests the tool's own helpers through `@testable import ringprobe`.
+        .testTarget(name: "ringprobeTests", dependencies: ["ringprobe", "RingProtocol"]),
         .testTarget(
             name: "RingStoreTests",
             dependencies: ["RingProtocol", "RingStore", .product(name: "GRDB", package: "GRDB.swift")]
