@@ -4,8 +4,9 @@ import RingProtocol
 @testable import RingTransport
 
 /// A scripted stand-in for the ring. `onSend` returns the frames the "ring" delivers in answer to
-/// each frame the session writes; frames are delivered strictly in order and `nextFrame` returns
-/// `nil` immediately when none are queued, so a missing reply costs no wall-clock time.
+/// each frame the session writes, and `deliver` sends frames unprompted. Frames are handed to the
+/// session's reader strictly in order; a reader waiting for a frame is woken as soon as one is
+/// delivered, and with a zero timeout `nextFrame` returns at once.
 /// `@unchecked Sendable` because all state is guarded by `lock`.
 private final class FakeLink: RingLink, @unchecked Sendable {
     private let lock = NSLock()
@@ -13,11 +14,9 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     private var log: [String] = []
     private var sentFrames: [Frame] = []
     private let onSend: @Sendable (Frame) -> [Frame]
-    // Gate: when armed, the first nextFrame call suspends until `releaseGate()`, so a test can
-    // hold one conversation open and check what a second one does meanwhile.
-    private var gateArmed = false
-    private var gateReached = false
-    private var gateContinuation: CheckedContinuation<Void, Never>?
+    private var reader: (id: Int, continuation: CheckedContinuation<Frame?, Never>)?
+    private var lastReaderID = 0
+    private var sentWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
 
     init(stale: [Frame] = [], guardWrites: Bool = false, writeTimeout: TimeInterval = 0.02, onSend: @escaping @Sendable (Frame) -> [Frame] = { _ in [] }) {
         inbox = stale
@@ -36,8 +35,9 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     // at the end. `timeOutNextSend` models a compliant link like the real connection: it holds the
     // write in flight for its own `writeTimeout`, ignoring cancellation, then clears the in-flight
     // state and throws.
-    // With `guardWrites`, a send while an earlier one is still in flight throws `busy`, as the real
-    // connection does. `trickle` is returned by `nextFrame` whenever nothing else is queued.
+    // With `guardWrites`, a send while an earlier one is still in flight throws `busy` (and is
+    // logged), as the real connection does. `trickle` is returned by `nextFrame` whenever nothing
+    // else is queued; `setTrickleOnNextSend` turns it on once the next frame has been written.
     private enum SendFault { case park, ownTimeout }
     let writeTimeout: TimeInterval
     private var faults: [SendFault] = []
@@ -45,9 +45,12 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     private var inFlight = false
     private let guardWrites: Bool
     private var trickleFrame: Frame?
+    private var trickleAfterSend: Frame?
     func parkNextSend() { lock.withLock { faults.append(.park) } }
     func timeOutNextSend() { lock.withLock { faults.append(.ownTimeout) } }
     func setTrickle(_ frame: Frame?) { lock.withLock { trickleFrame = frame } }
+    func setTrickleOnNextSend(_ frame: Frame) { lock.withLock { trickleAfterSend = frame } }
+    var hasParkedSend: Bool { lock.withLock { !parked.isEmpty } }
     func releaseParked() {
         let all = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
             defer { parked = [] }
@@ -58,12 +61,15 @@ private final class FakeLink: RingLink, @unchecked Sendable {
 
     func send(_ frame: Frame) async throws {
         let fault = try lock.withLock { () -> SendFault? in
-            if guardWrites && inFlight { throw RingError.busy("another write is in progress") }
+            if guardWrites && inFlight {
+                log.append("busy \(String(format: "%04X", frame.type))")
+                throw RingError.busy("another write is in progress")
+            }
+            inFlight = true
             return faults.isEmpty ? nil : faults.removeFirst()
         }
         switch fault {
         case .ownTimeout:
-            lock.withLock { inFlight = true }
             await withCheckedContinuation { continuation in
                 DispatchQueue.global().asyncAfter(deadline: .now() + writeTimeout) {
                     // The link clears its own in-flight state before reporting, so the next send is
@@ -75,49 +81,71 @@ private final class FakeLink: RingLink, @unchecked Sendable {
             }
             throw RingError.timeout("write confirmation")
         case .park:
-            lock.withLock { inFlight = true }
             await withCheckedContinuation { continuation in lock.withLock { parked.append(continuation) } }
-            lock.withLock { inFlight = false }
         case nil:
             break
         }
         let replies = onSend(frame)
-        lock.withLock {
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
             sentFrames.append(frame)
             log.append("send \(String(format: "%04X", frame.type))")
-            inbox += replies
+            inFlight = false
+            if let next = trickleAfterSend {
+                trickleFrame = next
+                trickleAfterSend = nil
+            }
+            let count = sentFrames.count
+            defer { sentWaiters.removeAll { $0.count <= count } }
+            return sentWaiters.filter { $0.count <= count }.map(\.continuation)
+        }
+        deliver(replies)
+        for continuation in ready { continuation.resume() }
+    }
+
+    /// The ring sends `frames`, as if unprompted.
+    func deliver(_ frames: [Frame]) {
+        guard !frames.isEmpty else { return }
+        let woken = lock.withLock { () -> (CheckedContinuation<Frame?, Never>, Frame)? in
+            inbox += frames
+            guard let current = reader else { return nil }
+            reader = nil
+            return (current.continuation, inbox.removeFirst())
+        }
+        if let (continuation, frame) = woken { continuation.resume(returning: frame) }
+    }
+
+    /// Returns once at least `count` frames have been written.
+    func waitUntilSent(_ count: Int) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let done = lock.withLock { () -> Bool in
+                if sentFrames.count >= count { return true }
+                sentWaiters.append((count, continuation))
+                return false
+            }
+            if done { continuation.resume() }
         }
     }
 
     func nextFrame(timeout: TimeInterval) async -> Frame? {
-        let hold = lock.withLock { () -> Bool in
-            defer { gateArmed = false }
-            if gateArmed { gateReached = true }
-            return gateArmed
-        }
-        if hold {
-            await withCheckedContinuation { continuation in
-                // Runs synchronously, before suspension, so releaseGate cannot miss it.
-                lock.withLock { gateContinuation = continuation }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Frame?, Never>) in
+            let waitID = lock.withLock { () -> Int? in
+                if !inbox.isEmpty || trickleFrame != nil || timeout <= 0 { return nil }
+                lastReaderID += 1
+                reader = (lastReaderID, continuation)
+                return lastReaderID
             }
-        }
-        return lock.withLock { inbox.isEmpty ? trickleFrame : inbox.removeFirst() }
-    }
-
-    func armGate() { lock.withLock { gateArmed = true } }
-    var isHeldAtGate: Bool { lock.withLock { gateReached && gateContinuation != nil } }
-    func releaseGate() {
-        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
-            defer { gateContinuation = nil }
-            return gateContinuation
-        }
-        continuation?.resume()
-    }
-
-    func discardPendingFrames() async {
-        lock.withLock {
-            inbox.removeAll()
-            log.append("discard")
+            guard let waitID else {
+                continuation.resume(returning: lock.withLock { inbox.isEmpty ? trickleFrame : inbox.removeFirst() })
+                return
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                let expired = self.lock.withLock { () -> CheckedContinuation<Frame?, Never>? in
+                    guard let current = self.reader, current.id == waitID else { return nil }
+                    self.reader = nil
+                    return current.continuation
+                }
+                expired?.resume(returning: nil)
+            }
         }
     }
 }
@@ -292,31 +320,38 @@ private final class ZoneBox: @unchecked Sendable {
 
 @Test func staleFramesAreDiscardedBeforeANewRequest() async throws {
     // A leftover frame with the same type as the reply must not be mistaken for the new reply.
+    // The session no longer asks the link to discard; its reader drains the link before the
+    // request is written, so the leftover is read and dropped first.
     let stale = Frame(group: 0x02, key: 0x00, payload: [0xAA])
     let fresh = Frame(group: 0x02, key: 0x00, payload: [0xBB])
     let link = FakeLink(stale: [stale]) { $0.type == 0x0200 ? [fresh] : [] }
     #expect(try await session(link).request(Command.deviceInfo) == fresh)
-    #expect(link.events.first == "discard")
+    #expect(link.sent == [Command.deviceInfo])
 }
 
 // The time limit turns a future regression that never reaches the gate into a failure, not a hung CI job.
 @Test(.timeLimit(.minutes(1))) func overlappingConversationsRunOneAtATime() async throws {
-    let link = FakeLink { frame in [Frame(group: frame.group, key: frame.key, payload: [frame.key])] }
-    link.armGate()
+    let link = FakeLink { frame in
+        if frame.type == Command.history(kind).type {
+            return [header(12), dataFrame([1]), endFrame(checksum: CRC16.ccittFalse([1]))]
+        }
+        return [Frame(group: frame.group, key: frame.key, payload: [frame.key])]
+    }
     let s = session(link)
-    let first = Task { try await s.request(Frame(group: 0x02, key: 0x00)) }
-    // Hold the first conversation mid-flight, inside nextFrame.
-    while !link.isHeldAtGate { await Task.yield() }
+    // Hold the first conversation mid-flight, inside its persist step (the turn is held there).
+    let gate = Gate()
+    let first = Task { try await s.fetchHistory(kind) { _ in await gate.park() } }
+    await waitUntil { gate.isParked }
     let second = Task { try await s.request(Frame(group: 0x02, key: 0x0C)) }
     // Give the second request ample time to (wrongly) start. If conversations could interleave
-    // it would discard and send now.
+    // it would send now.
     try await Task.sleep(for: .milliseconds(100))
-    #expect(link.events == ["discard", "send 0200"])
-    link.releaseGate()
+    #expect(link.sent == [Command.history(kind)])
+    gate.release()
     let (ra, rb) = try await (first.value, second.value)
-    #expect(ra.payload == [0x00])
+    #expect(ra.data == [1])
     #expect(rb.payload == [0x0C])
-    #expect(link.events == ["discard", "send 0200", "discard", "send 020C"])
+    #expect(link.sent == [Command.history(kind), Command.historyTransferOK, Frame(group: 0x02, key: 0x0C)])
 }
 
 @Test func sessionRefusesDeleteRangeFramesEvenIfTheLinkWouldSendThem() async throws {
@@ -360,6 +395,18 @@ private func expectTimeout(_ body: () async throws -> Void) async {
         try await body()
         Issue.record("expected a timeout")
     } catch RingError.timeout {
+    } catch {
+        Issue.record("expected a timeout, got \(error)")
+    }
+}
+
+/// Like `expectTimeout`, but also checks what timed out, so a test can tell which wait ended it.
+private func expectTimeout(waitingFor expected: String, _ body: () async throws -> Void) async {
+    do {
+        try await body()
+        Issue.record("expected a timeout")
+    } catch RingError.timeout(let what) {
+        #expect(what == expected)
     } catch {
         Issue.record("expected a timeout, got \(error)")
     }
@@ -445,12 +492,224 @@ private final class Flag: @unchecked Sendable {
     #expect(try await s.request(Command.deviceInfo) == deviceReply)
 }
 
+// The trickle in the test above is already running before the request, so the link never drains
+// and the deadline ends the conversation before it writes. These two start the trickle once the
+// command is written, so the deadline has to end the conversation while frames keep coming.
+@Test(.timeLimit(.minutes(1))) func transferThatKeepsTricklingAfterItsHeaderTimesOut() async throws {
+    let link = FakeLink { frame in
+        frame.type == 0x0200 ? [deviceReply] : [header(12)]
+    }
+    link.setTrickleOnNextSend(dataFrame([1]))
+    let clock = SteppingClock()
+    let s = RingSession(link: link, replyTimeout: 0.05, conversationTimeout: 5, monotonicNow: { clock.now() })
+    await expectTimeout(waitingFor: "\(kind.name) history transfer") { _ = try await s.fetchHistory(kind) { _ in } }
+    #expect(link.sent == [Command.history(kind)])
+    link.setTrickle(nil)
+    #expect(try await s.request(Command.deviceInfo) == deviceReply)
+}
+
+@Test(.timeLimit(.minutes(1))) func unrelatedFramesAfterTheCommandCannotKeepARequestWaiting() async throws {
+    let link = FakeLink()
+    link.setTrickleOnNextSend(Frame(group: 0x02, key: 0x0C, payload: [1]))
+    let clock = SteppingClock()
+    let s = RingSession(link: link, replyTimeout: 0.05, conversationTimeout: 5, monotonicNow: { clock.now() })
+    await expectTimeout(waitingFor: "reply to 0200") { _ = try await s.request(Command.deviceInfo) }
+    link.setTrickle(nil)
+}
+
 @Test(.timeLimit(.minutes(1))) func unrelatedFramesCannotKeepARequestWaitingPastTheDeadline() async throws {
     let link = FakeLink()
     link.setTrickle(Frame(group: 0x02, key: 0x0C, payload: [1]))
     let clock = SteppingClock()
     let s = RingSession(link: link, replyTimeout: 0.05, conversationTimeout: 5, monotonicNow: { clock.now() })
     await expectTimeout { _ = try await s.request(Command.deviceInfo) }
+}
+
+// MARK: Continuous reader
+
+/// Yields until `condition` holds. Stops when the test is cancelled (its time limit), so a
+/// regression fails instead of spinning forever.
+private func waitUntil(_ condition: () async -> Bool) async {
+    while await !condition(), !Task.isCancelled { await Task.yield() }
+}
+
+private let event = Frame(group: 0x04, key: 0x0E, payload: [0x00, 0x01])
+private let otherEvent = Frame(group: 0x04, key: 0x0A, payload: [0x02])
+private func acknowledgement(of event: Frame) -> Frame { Frame(group: 0x04, key: event.key, payload: [0x00]) }
+
+@Test(.timeLimit(.minutes(1))) func eventWhileIdleIsAcknowledged() async throws {
+    let link = FakeLink()
+    let s = session(link)
+    await s.start()
+    link.deliver([event])
+    await link.waitUntilSent(1)
+    #expect(link.sent == [acknowledgement(of: event)])
+}
+
+@Test(.timeLimit(.minutes(1))) func eventBetweenTwoRequestsIsAcknowledgedOnceAndTheSecondGetsItsReply() async throws {
+    let replies = CallCounter()
+    let link = FakeLink { frame in
+        frame.type == 0x0200 ? [Frame(group: 0x02, key: 0x00, payload: [UInt8(replies.next())])] : []
+    }
+    let s = session(link)
+    #expect(try await s.request(Command.deviceInfo).payload == [1])
+    // Not waited for: the event may be read while idle or while the second request drains the
+    // link. Either way it is acknowledged before the second request is written.
+    link.deliver([event])
+    #expect(try await s.request(Command.deviceInfo).payload == [2])
+    #expect(link.sent == [Command.deviceInfo, acknowledgement(of: event), Command.deviceInfo])
+}
+
+@Test(.timeLimit(.minutes(1))) func eventDuringAHistoryTransferLeavesTheDataAndChecksumIntact() async throws {
+    let link = FakeLink { frame in
+        guard frame.type == Command.history(kind).type else { return [] }
+        return [header(12), dataFrame([1, 2]), event, dataFrame([3]), endFrame(checksum: CRC16.ccittFalse([1, 2, 3]))]
+    }
+    let persisted = PersistRecorder()
+    let transfer = try await session(link).fetchHistory(kind) { await persisted.add($0) }
+    #expect(transfer.data == [1, 2, 3])
+    #expect(await persisted.calls.map(\.data) == [[1, 2, 3]])
+    // The event was read before the end frame, so it is acknowledged before the transfer is.
+    #expect(link.sent == [Command.history(kind), acknowledgement(of: event), Command.historyTransferOK])
+}
+
+@Test(.timeLimit(.minutes(1))) func staleReplyFromATimedOutRequestIsNotAcceptedByTheNextConversation() async throws {
+    let late = Frame(group: 0x02, key: 0x00, payload: [0xAA])
+    let activity = Frame(group: 0x02, key: 0x0C, payload: [1])
+    let deviceCalls = CallCounter()
+    let link = FakeLink { frame in
+        switch frame.type {
+        // The first device-info request gets no reply in time.
+        case 0x0200: return deviceCalls.next() == 1 ? [] : [deviceReply]
+        // The late reply turns up again inside the next conversation, ahead of its own reply.
+        case 0x020C: return [late, activity]
+        case Command.history(kind).type:
+            return [late, header(12), dataFrame([1]), late, endFrame(checksum: CRC16.ccittFalse([1]))]
+        default: return []
+        }
+    }
+    let s = session(link)
+    await expectTimeout { _ = try await s.request(Command.deviceInfo) }
+    link.deliver([late])
+    #expect(try await s.request(Command.currentActivity) == activity)
+    #expect(try await s.fetchHistory(kind) { _ in }.data == [1])
+    // Delivered just before a request of the same kind: the drain drops it first.
+    link.deliver([late])
+    #expect(try await s.request(Command.deviceInfo) == deviceReply)
+}
+
+@Test(.timeLimit(.minutes(1))) func subscribersReceiveEventsAndLiveValuesInOrder() async throws {
+    let link = FakeLink()
+    let s = session(link)
+    let first = await s.uploads()
+    let second = await s.uploads()
+    let live1 = Frame(group: 0x06, key: 0x01, payload: [60])
+    let live2 = Frame(group: 0x06, key: 0x01, payload: [61])
+    // The 0x0200 frame has no conversation to go to, so it is dropped.
+    link.deliver([event, live1, Frame(group: 0x02, key: 0x00, payload: [1]), otherEvent, live2])
+    let expected: [RingUpload] = [.event(event), .live(live1), .event(otherEvent), .live(live2)]
+    for stream in [first, second] {
+        var received: [RingUpload] = []
+        for await upload in stream {
+            received.append(upload)
+            if received.count == expected.count { break }
+        }
+        #expect(received == expected)
+    }
+    await link.waitUntilSent(2)
+    #expect(link.sent == [acknowledgement(of: event), acknowledgement(of: otherEvent)])
+}
+
+@Test(.timeLimit(.minutes(1))) func liveValuesDuringARequestGoToSubscribersNotTheConversation() async throws {
+    let live = Frame(group: 0x06, key: 0x01, payload: [60])
+    let link = FakeLink { $0.type == 0x0200 ? [live, deviceReply] : [] }
+    let s = session(link)
+    let stream = await s.uploads()
+    #expect(try await s.request(Command.deviceInfo) == deviceReply)
+    var iterator = stream.makeAsyncIterator()
+    #expect(await iterator.next() == .live(live))
+}
+
+@Test(.timeLimit(.minutes(1))) func stopEndsTheStreamAndFailsAWaitingRequest() async throws {
+    let link = FakeLink()
+    // A reply timeout far beyond the time limit: only `stop` can end this request in time.
+    let s = RingSession(link: link, replyTimeout: 600)
+    let stream = await s.uploads()
+    let pending = Task { try await s.request(Command.deviceInfo) }
+    await link.waitUntilSent(1)
+    await s.stop()
+    do {
+        _ = try await pending.value
+        Issue.record("expected the request to fail")
+    } catch RingError.notConnected {
+    }
+    var iterator = stream.makeAsyncIterator()
+    #expect(await iterator.next() == nil)
+    // Stays stopped: later requests fail at once, and new streams are already finished.
+    do {
+        _ = try await s.request(Command.deviceInfo)
+        Issue.record("expected the request to fail")
+    } catch RingError.notConnected {
+    }
+    var late = await s.uploads().makeAsyncIterator()
+    #expect(await late.next() == nil)
+    #expect(link.sent == [Command.deviceInfo])
+}
+
+@Test(.timeLimit(.minutes(1))) func eventsThatArriveWhileStoppedAreAcknowledgedAfterARestart() async throws {
+    let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
+    let s = session(link)
+    await s.start()
+    await s.stop()
+    link.deliver([event])
+    #expect(link.sent.isEmpty)
+    await s.start()
+    await link.waitUntilSent(1)
+    #expect(try await s.request(Command.deviceInfo) == deviceReply)
+    #expect(link.sent == [acknowledgement(of: event), Command.deviceInfo])
+}
+
+@Test(.timeLimit(.minutes(1))) func acknowledgementWaitsForTheConversationsWriteInFlight() async throws {
+    // The link refuses a second write while one is in flight, as the real connection does.
+    let link = FakeLink(guardWrites: true) { $0.type == 0x0200 ? [deviceReply] : [] }
+    // Long enough that the backstop cannot cut off the parked write during the test.
+    let s = RingSession(link: link, replyTimeout: 30)
+    link.parkNextSend()
+    let pending = Task { try await s.request(Command.deviceInfo) }
+    await waitUntil { link.hasParkedSend }
+    // The event arrives while the request's own write is still in progress.
+    link.deliver([event])
+    // Ends early on a refused write, so a session that does not queue the acknowledgement fails
+    // the assertions below instead of spinning here.
+    await waitUntil { await s.queuedWrites > 0 || link.events.contains { $0.hasPrefix("busy") } }
+    link.releaseParked()
+    #expect(try await pending.value == deviceReply)
+    #expect(link.sent == [Command.deviceInfo, acknowledgement(of: event)])
+    #expect(!link.events.contains { $0.hasPrefix("busy") })
+}
+
+@Test(.timeLimit(.minutes(1))) func backstopEndsAStuckAcknowledgementAndTheNextRequestWorks() async throws {
+    // The write backstop covers acknowledgements too: a stuck one must not hold up the next request.
+    let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
+    let s = session(link)
+    await s.start()
+    link.parkNextSend()
+    link.deliver([event])
+    await waitUntil { link.hasParkedSend }
+    // Independent watchdog, as in `backstopEndsAWriteOnALinkThatNeverReturns`: without the
+    // backstop the request would wait on the parked acknowledgement for ever.
+    let watchdogFired = Flag()
+    let watchdog = Task {
+        try? await Task.sleep(for: .seconds(3))
+        guard !Task.isCancelled else { return }
+        watchdogFired.set()
+        link.releaseParked()
+    }
+    #expect(try await s.request(Command.deviceInfo) == deviceReply)
+    watchdog.cancel()
+    #expect(!watchdogFired.isSet, "the session did not give up on the acknowledgement by itself")
+    #expect(link.sent == [Command.deviceInfo])
+    link.releaseParked()
 }
 
 // MARK: withDeadline
@@ -483,4 +742,29 @@ private final class ParkedOperation: @unchecked Sendable {
     private var continuation: CheckedContinuation<Void, Never>?
     func park() async { await withCheckedContinuation { c in lock.withLock { continuation = c } } }
     func release() { lock.withLock { continuation.take() }?.resume() }
+}
+
+/// Holds a caller until `release()`; a release that comes first lets the caller straight through.
+// @unchecked Sendable: all state is guarded by `lock`.
+private final class Gate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    var isParked: Bool { lock.withLock { continuation != nil } }
+    func park() async {
+        await withCheckedContinuation { c in
+            let open = lock.withLock { () -> Bool in
+                if !released { continuation = c }
+                return released
+            }
+            if open { c.resume() }
+        }
+    }
+    func release() {
+        let waiting = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            released = true
+            return continuation.take()
+        }
+        waiting?.resume()
+    }
 }
