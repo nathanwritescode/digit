@@ -106,7 +106,9 @@ public struct IngestionResult: Equatable, Sendable {
     public var skippedSleepStages = 0
     /// Combined records only: distinct records in which SpO2, respiration, HRV and CVRR were all
     /// absent. They produce no row and are not rejected (the ring logged a reading with nothing
-    /// measured, such as heart rate only). Always 0 for other kinds.
+    /// measured, such as heart rate only). Records dated before 2020 or in the future are checked
+    /// first and counted in `rejectedImplausible` or `rejectedFuture` instead, even if all four
+    /// values are absent. Always 0 for other kinds.
     public var withoutVitals = 0
 }
 

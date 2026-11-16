@@ -87,6 +87,7 @@ public enum RingStoreError: Error, Equatable, Sendable {
     case fileAccess(path: String, errno: Int32)
     /// A stored value could not be read back (for example an unknown history kind name).
     case corruptRow(String)
-    /// `ingest` does not handle this kind (the combined record is tracked separately).
+    /// `ingest` does not handle this kind. Reserved for a future kind that has no typed table yet;
+    /// every kind is ingestible today, so it cannot be thrown now.
     case notIngestible(HistoryKind)
 }

@@ -287,6 +287,8 @@ private let combinedB = "100e0000 0a00 50 00 00 62 11 26 1f 2a05 0000 00 ccdd"
 @Test func combinedValueOf255IsAbsentInTheFourVitals() throws {
     let r = try #require(CombinedRecord.decode(hex("3c000000 0000 ff 00 00 ff ff ff ff 0000 0000 00 0000"), timeZone: utc).first)
     #expect(r.spo2 == nil && r.respirationRate == nil && r.hrv == nil && r.cvrr == nil)
+    // Deliberate only because heart rate is out of scope for #33 (the heart-rate record is its
+    // source and the combined one's is not stored); this is not the intended meaning of 255.
     #expect(r.heartRate == 255)
     let mixed = try #require(CombinedRecord.decode(hex("3c000000 0000 00 00 00 61 ff 25 ff 0000 0000 00 0000"), timeZone: utc).first)
     #expect(mixed.spo2 == 97 && mixed.respirationRate == nil && mixed.hrv == 37 && mixed.cvrr == nil)

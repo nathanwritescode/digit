@@ -235,6 +235,9 @@ struct IngestionTests {
             #expect(throws: RingStoreError.unknownRing(missing)) {
                 try store.ingest(ringID: missing, kind: .heartRate)
             }
+            #expect(throws: RingStoreError.unknownRing(missing)) {
+                try store.ingest(ringID: missing, kind: .combined)
+            }
         }
     }
 

@@ -168,8 +168,10 @@ extension RingStore {
             // session). Records with nothing to store are set aside before collisions are counted.
             let derived = try derive(
                 transfers, resolver, CombinedRecord.decodeLocated, reference: { $0.time }, times: { [$0.time] },
+                // No per-value plausibility rejection: a record carries four values, so a filler in
+                // one is already nil in the decoder and must not discard the others.
                 plausible: { _ in true }, startTime: nil, supersedeKey: nil,
-                withoutRow: { $0.spo2 == nil && $0.respirationRate == nil && $0.hrv == nil && $0.cvrr == nil }
+                yieldsNoRow: { $0.spo2 == nil && $0.respirationRate == nil && $0.hrv == nil && $0.cvrr == nil }
             ) { r, o in
                 let instant = r.time.addingTimeInterval(-TimeInterval(o.seconds))
                 return (instant, VitalsReading(
@@ -242,7 +244,7 @@ extension RingStore {
         plausible: (R) -> Bool,
         startTime: ((R) -> Date)?,
         supersedeKey: ((R) -> Int)?,
-        withoutRow: ((R) -> Bool)? = nil,
+        yieldsNoRow: ((R) -> Bool)? = nil,
         _ build: (R, ResolvedOffset) -> (instant: Date, value: V)
     ) throws -> Derived<V> {
         var derived = Derived<V>()
@@ -299,7 +301,7 @@ extension RingStore {
         for (identity, offset) in survivors {
             // Counted per distinct record, before `build`, so one with nothing to store can never
             // win a key over a real reading.
-            if let withoutRow, withoutRow(identity.record) {
+            if let yieldsNoRow, yieldsNoRow(identity.record) {
                 derived.withoutRow += 1
                 continue
             }

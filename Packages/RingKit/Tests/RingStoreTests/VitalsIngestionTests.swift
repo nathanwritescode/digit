@@ -57,7 +57,7 @@ struct VitalsIngestionTests {
         }
     }
 
-    @Test func aRecordWithAllFourAbsentGivesNoRowAndCountsOnce() throws {
+    @Test func aRecordWithAllFourAbsentGivesNoRowAndCountsOncePerDistinctRecord() throws {
         try onEachStore { store in
             let f = try clocked(store)
             // Heart rate and steps alone are not vitals; the same bytes twice are one distinct record.
@@ -65,12 +65,108 @@ struct VitalsIngestionTests {
             try f.fetch(.combined, empty + vitals(1200, spo2: 98), at: at(3600))
             try f.fetch(.combined, empty + vitals(1200, spo2: 98) + empty, at: at(7200))
             let r = try store.ingest(ringID: f.ring.id, kind: .combined)
-            // `empty` appears as occurrence 0 in both fetches and as occurrence 1 in the second: two records.
+            // The first fetch is a strict prefix of the second and is pruned, so one transfer is stored.
+            // In it `empty` is occurrence 0 and occurrence 1: two distinct records, each counted once.
             #expect(r.withoutVitals == 2)
             #expect(r.inserted == 1 && r.rejectedImplausible == 0 && r.rejectedFuture == 0 && r.collisions == 0)
             #expect(try store.vitalsReadings(ringID: f.ring.id).map(\.value.spo2) == [98])
             let again = try store.ingest(ringID: f.ring.id, kind: .combined)
             #expect(again.withoutVitals == 2 && again.inserted == 0 && again.unchanged == 1)
+        }
+    }
+
+    @Test func theSameEmptyRecordInTwoUnrelatedTransfersCountsOnce() throws {
+        try onEachStore { store in
+            let f = try clocked(store)
+            let empty = combinedBytes(wall(at(600), offset: plus1), steps: 50, hr: 70)
+            // Neither buffer is a prefix of the other, so both transfers stay stored.
+            try f.fetch(.combined, empty + vitals(1200, spo2: 98), at: at(3600))
+            try f.fetch(.combined, empty + vitals(1800, spo2: 99), at: at(7200))
+            #expect(try store.transfers(ringID: f.ring.id, kind: .combined).transfers.count == 2)
+            let first = try store.ingest(ringID: f.ring.id, kind: .combined)
+            #expect(first.withoutVitals == 1 && first.inserted == 2)
+            let again = try store.ingest(ringID: f.ring.id, kind: .combined)
+            #expect(again.withoutVitals == 1 && again.unchanged == 2)
+            let rebuilt = try store.rebuild(ringID: f.ring.id)
+            #expect(rebuilt[.combined]?.withoutVitals == 1)
+        }
+    }
+
+    @Test func aRowWhoseValuesWereChangedIsUpdatedBackWithEachColumnInPlace() throws {
+        try onEachStore { store in
+            let f = try clocked(store)
+            try f.fetch(.combined, vitals(600, spo2: 97, resp: 16, hrv: 37, cvrr: 30), at: at(3600))
+            try store.ingest(ringID: f.ring.id, kind: .combined)
+            let good = try store.vitalsReadings(ringID: f.ring.id)
+            // hrv and cvrr are swapped relative to the record, so an UPDATE that crossed them
+            // would not restore the original.
+            try store.writer.write { db in
+                try db.execute(sql: "UPDATE vitals_reading SET spo2 = 1, respiration_rate = 2, hrv = 30, cvrr = 37, time_source = 'assumed'")
+            }
+            let r = try store.ingest(ringID: f.ring.id, kind: .combined)
+            #expect(r.updated == 1 && r.inserted == 0 && r.deleted == 0 && r.unchanged == 0)
+            #expect(try store.vitalsReadings(ringID: f.ring.id) == good)
+        }
+    }
+
+    @Test func aRowWithNoBackingRecordIsDeleted() throws {
+        try onEachStore { store in
+            let f = try clocked(store)
+            try f.fetch(.combined, vitals(600, spo2: 97), at: at(3600))
+            try store.ingest(ringID: f.ring.id, kind: .combined)
+            try store.writer.write { db in
+                try db.execute(
+                    sql: """
+                        INSERT INTO vitals_reading (ring_id, time, spo2, utc_offset_seconds, ring_local_seconds, time_source)
+                        VALUES (?, 1, 90, 0, 0, 'resolved')
+                        """, arguments: [f.ring.id.uuidString])
+            }
+            #expect(try store.vitalsReadings(ringID: f.ring.id).count == 2)
+            let r = try store.ingest(ringID: f.ring.id, kind: .combined)
+            #expect(r.deleted == 1 && r.unchanged == 1 && r.inserted == 0)
+            #expect(try store.vitalsReadings(ringID: f.ring.id).map(\.value.spo2) == [97])
+        }
+    }
+
+    @Test func aRecordWithOnlyRespirationOrOnlyCVRRGivesARow() throws {
+        try onEachStore { store in
+            let f = try clocked(store)
+            try f.fetch(.combined, vitals(600, resp: 15) + vitals(1200, cvrr: 28), at: at(3600))
+            let r = try store.ingest(ringID: f.ring.id, kind: .combined)
+            #expect(r.inserted == 2 && r.withoutVitals == 0)
+            let rows = try store.vitalsReadings(ringID: f.ring.id).map(\.value)
+            #expect(rows.map(\.respirationRate) == [15, nil])
+            #expect(rows.map(\.cvrr) == [nil, 28])
+            #expect(rows.map(\.spo2) == [nil, nil] && rows.map(\.hrv) == [nil, nil])
+        }
+    }
+
+    @Test func emptyRecordsThatAreFutureOrBeforeTheClockAreRejectedNotCountedAsWithoutVitals() throws {
+        try onEachStore { store in
+            let f = try clocked(store)
+            // SYNTHETIC. Both have all four absent (heart rate only); the checks run before that test.
+            try f.fetch(
+                .combined,
+                combinedBytes(3600, hr: 70) + combinedBytes(wall(at(3600 + 2 * 86_400), offset: plus1), hr: 70), at: at(3600))
+            let r = try store.ingest(ringID: f.ring.id, kind: .combined)
+            #expect(r.rejectedImplausible == 1 && r.rejectedFuture == 1 && r.withoutVitals == 0 && r.inserted == 0)
+        }
+    }
+
+    @Test func theTableRefusesASecondRowForTheSameRingAndTime() throws {
+        try onEachStore { store in
+            let f = try clocked(store)
+            try f.fetch(.combined, vitals(600, spo2: 97), at: at(3600))
+            try store.ingest(ringID: f.ring.id, kind: .combined)
+            let row = try #require(try store.vitalsReadings(ringID: f.ring.id).first)
+            let ms = Int64((row.value.time.timeIntervalSince1970 * 1000).rounded())
+            #expect(throws: DatabaseError.self) {
+                try store.writer.write { db in
+                    try db.execute(
+                        sql: "INSERT INTO vitals_reading (ring_id, time, utc_offset_seconds, ring_local_seconds, time_source) VALUES (?, ?, 0, 0, 'resolved')",
+                        arguments: [f.ring.id.uuidString, ms])
+                }
+            }
         }
     }
 
@@ -116,7 +212,8 @@ struct VitalsIngestionTests {
                 "id", "ring_id", "time", "spo2", "respiration_rate", "hrv", "cvrr", "utc_offset_seconds",
                 "ring_local_seconds", "time_source",
             ])
-            // None of the values that are not stored can be found in the row either.
+            // The column list above is what proves the unstored values are absent; this only checks
+            // that the four stored columns hold the expected values.
             let stored = try store.writer.read { db in
                 try Row.fetchOne(db, sql: "SELECT spo2, respiration_rate, hrv, cvrr FROM vitals_reading")
             }
@@ -213,18 +310,42 @@ struct VitalsIngestionTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let url = dir.appendingPathComponent("ring.sqlite")
+        let ringID = UUID()
+        let data = vitals(600, spo2: 97)
         do {
             let pool = try DatabasePool(path: url.path)
             try RingStore.migrator.migrate(pool, upTo: "v3")
-            let tables = try pool.read { db in
-                try String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE name = 'vitals_reading'")
+            try pool.write { db in
+                try db.execute(
+                    sql: "INSERT INTO ring (id, protocol_family, first_seen_at) VALUES (?, 'ycbt', 0)", arguments: [ringID.uuidString])
+                let hash = RingStore.contentHash(ringID: ringID, kind: .combined, data: data)
+                try db.execute(
+                    sql: RingStore.insertTransferSQL,
+                    arguments: [ringID.uuidString, "combined", Data([1]), Data(data), 1_800_003_600_000, "Europe/London", Data(hash)])
+                try db.execute(
+                    sql: RingStore.insertObservationSQL,
+                    arguments: [ringID.uuidString, "combined", data.count, Data([1]), 1_800_003_600_000, "Europe/London", Data(hash)])
+                try db.execute(
+                    sql: """
+                        INSERT INTO heart_rate_reading (ring_id, time, bpm, mode, utc_offset_seconds, ring_local_seconds, time_source)
+                        VALUES (?, 1800000600000, 61, 0, 3600, 0, 'resolved')
+                        """, arguments: [ringID.uuidString])
+                let tables = try String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE name = 'vitals_reading'")
+                #expect(tables.isEmpty)
             }
-            #expect(tables.isEmpty)
         }
         let store = try RingStore(url: url)
-        let f = try clocked(store)
-        try f.fetch(.combined, vitals(600, spo2: 97), at: at(3600))
-        try store.ingest(ringID: f.ring.id, kind: .combined)
-        #expect(try store.vitalsReadings(ringID: f.ring.id).count == 1)
+        // Data written at v3 survives the migration.
+        #expect(try store.ring(id: ringID) != nil)
+        #expect(try store.transfers(ringID: ringID).transfers.map(\.transfer.data) == [data])
+        #expect(try store.heartRateReadings(ringID: ringID).map(\.value.bpm) == [61])
+        #expect(try store.vitalsReadings(ringID: ringID).isEmpty)
+        try store.recordClockSet(ClockSetEvent(
+            ringID: ringID, instant: at(-200_000), timeZoneIdentifier: "Europe/London", utcOffsetSeconds: plus1))
+        try store.recordClockSet(ClockSetEvent(
+            ringID: ringID, instant: at(0), timeZoneIdentifier: "Europe/London", utcOffsetSeconds: plus1))
+        let r = try store.ingest(ringID: ringID, kind: .combined)
+        #expect(r.inserted == 1)
+        #expect(try store.vitalsReadings(ringID: ringID).count == 1)
     }
 }
