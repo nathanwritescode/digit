@@ -227,13 +227,16 @@ struct IngestionTests {
         }
     }
 
-    @Test func combinedIsRejectedExplicitly() throws {
+    // The combined record became ingestible in #33 (see VitalsIngestionTests), so only the
+    // unknown-ring check remains here.
+    @Test func ingestingForAnUnknownRingThrows() throws {
         try onEachStore { store in
-            let f = try Fixture(store)
             let missing = UUID()
-            #expect(throws: RingStoreError.notIngestible(.combined)) { try store.ingest(ringID: f.ring.id, kind: .combined) }
             #expect(throws: RingStoreError.unknownRing(missing)) {
                 try store.ingest(ringID: missing, kind: .heartRate)
+            }
+            #expect(throws: RingStoreError.unknownRing(missing)) {
+                try store.ingest(ringID: missing, kind: .combined)
             }
         }
     }

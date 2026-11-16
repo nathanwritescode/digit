@@ -469,6 +469,27 @@ public final class RingStore: Sendable {
                 ) STRICT;
                 """)
         }
+        // SpO2, respiration, HRV and CVRR from the combined record (#33). Only these four values are
+        // stored (nullable: an absent value is NULL, never 0 or 255); no heart rate, steps, blood
+        // pressure, temperature, body fat, glucose or raw bytes. No reference to `history_transfer`,
+        // like the other typed tables.
+        migrator.registerMigration("v4-vitals") { db in
+            try db.execute(sql: """
+                CREATE TABLE vitals_reading (
+                    id INTEGER PRIMARY KEY,
+                    ring_id TEXT NOT NULL REFERENCES ring(id),
+                    time INTEGER NOT NULL,
+                    spo2 INTEGER,
+                    respiration_rate INTEGER,
+                    hrv INTEGER,
+                    cvrr INTEGER,
+                    utc_offset_seconds INTEGER NOT NULL,
+                    ring_local_seconds INTEGER NOT NULL,
+                    time_source TEXT NOT NULL,
+                    UNIQUE (ring_id, time)
+                ) STRICT;
+                """)
+        }
         return migrator
     }
 
