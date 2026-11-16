@@ -312,6 +312,12 @@ private final class FakeLink: RingLink, @unchecked Sendable {
         await waitFor(within: seconds) { self.heldEmpty != nil }
     }
 
+    /// Whether a write of `type` was attempted (parked or not) within `seconds`.
+    func waitUntilAttempted(_ type: UInt16, within seconds: Double = 10) async -> Bool {
+        let entry = "attempt \(String(format: "%04X", type))"
+        return await waitFor(within: seconds) { self.log.contains(entry) }
+    }
+
     func waitUntilReaderWaits(within seconds: Double = 10) async -> Bool {
         await waitFor(within: seconds) { self.reader != nil }
     }
@@ -906,36 +912,70 @@ private func expectTimeoutAtTheDeadline(alwaysReady frame: Frame) async throws {
     }
 }
 
-// Pins the overrun past the deadline at about 3B, with B the write backstop. Every write hangs
-// until the session's backstop ends it. An acknowledgement is in progress when the request starts,
-// so its command is written shortly before the deadline; the command write runs B past that, an
-// acknowledgement queued during it runs B more, and the conversation waits for it at the end.
-@Test(.timeLimit(.minutes(1))) func requestEndsWithinThreeBackstopsOfItsDeadline() async throws {
+/// Runs a request on a link where every write hangs until the session's backstop B ends it, and
+/// returns how far past its deadline the request ended, in backstops, and how it ended.
+/// Acknowledgement 1 is in progress when the request starts, so the request first waits for it;
+/// `conversationTimeout` decides whether that wait ends before the deadline. Once the request
+/// waits, a second event arrives, so its acknowledgement takes the write turn just ahead of the
+/// command; a third arrives during the command write, so the conversation ends waiting for it.
+private func overrunOfARequestBehindStuckWrites(
+    conversationTimeout: Double
+) async throws -> (backstops: Double, result: Result<Frame, Error>?) {
     let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
     defer { link.close() }
     link.parkAllSends()
-    // A backstop of about 1 s, so the slack allowed below is well under one backstop.
+    // A backstop of about 1 s, so scheduling delay is small beside it.
     let replyTimeout = 1.0
     let backstop = link.writeTimeout + replyTimeout
-    let conversationTimeout = backstop + 0.3
     let s = RingSession(link: link, replyTimeout: replyTimeout, conversationTimeout: conversationTimeout, monotonicNow: { ContinuousClock.now })
-    try await using(s, link) { s async throws in
+    return try await using(s, link) { s async throws in
         await s.start()
         link.deliver([event])
         #expect(await link.waitUntilSendParked())
         let start = ContinuousClock.now
         let pending = Task { try await s.request(Command.deviceInfo) }
-        await waitUntil("the command write has started") { link.events.contains("attempt 0200") }
+        await waitUntil("the request waits for acknowledgement 1") { await s.pendingFlushes == 1 }
         link.deliver([otherEvent])
-        let result = await outcome(of: pending, within: 20)
-        let overrun = ContinuousClock.now - start - .seconds(conversationTimeout)
-        switch result {
-        case .failure(RingError.timeout)?: break
-        case let other: Issue.record("expected a timeout, got \(String(describing: other))")
+        let third = Frame(group: 0x04, key: 0x0B, payload: [0x03])
+        let duringCommand = Task {
+            if await link.waitUntilAttempted(0x0200, within: 20) { link.deliver([third]) }
         }
-        // Half a backstop of slack for timers on a loaded machine; the old bound was about 4B.
-        #expect(overrun < .seconds(3.5 * backstop))
+        let result = await outcome(of: pending, within: 30)
+        let end = ContinuousClock.now
+        duringCommand.cancel()
+        return ((end - start - .seconds(conversationTimeout)) / .seconds(backstop), result)
     }
+}
+
+// The worst case for a request now: acknowledgement 1 is written just before the deadline, the
+// second acknowledgement takes the write turn ahead of the command (B), the command write hangs
+// (B), and the conversation waits for the third acknowledgement (B). Expected overrun: 3B minus
+// the 0.3 s by which acknowledgement 1 beats the deadline, about 2.7B. Allowed: up to 3.25B, so a
+// quarter of a backstop (about 0.25 s) plus that 0.3 s of slack for timers on a loaded machine.
+@Test(.timeLimit(.minutes(1))) func requestEndsWithinThreeBackstopsOfItsDeadline() async throws {
+    let (overrun, result) = try await overrunOfARequestBehindStuckWrites(conversationTimeout: 1.02 + 0.3)
+    switch result {
+    case .failure(RingError.timeout(let what))?: #expect(what == "write confirmation")
+    case let other: Issue.record("expected the command write to time out, got \(String(describing: other))")
+    }
+    // Above 2B shows the schedule really reached the worst case.
+    #expect(overrun > 2)
+    #expect(overrun < 3.25)
+}
+
+// The schedule that the old rules made worst: acknowledgement 1 is still being written when the
+// deadline passes. The wait for it now ends at the deadline and the request fails, so it ends
+// about 1B late (the end-of-conversation wait). When that wait could run a full backstop past the
+// deadline and the command could then still be written, the same schedule ended about 3.8B late.
+// Allowed: up to 3.25B, which leaves about 2.25 backstops of margin now, and would have failed the
+// old rules by about 0.5 backstops.
+@Test(.timeLimit(.minutes(1))) func requestBehindAnAcknowledgementThatOutlastsTheDeadlineDoesNotOverrunFurther() async throws {
+    let (overrun, result) = try await overrunOfARequestBehindStuckWrites(conversationTimeout: 0.2)
+    switch result {
+    case .failure(RingError.timeout(let what))?: #expect(what == "event acknowledgements to be written")
+    case let other: Issue.record("expected the wait for acknowledgements to time out, got \(String(describing: other))")
+    }
+    #expect(overrun < 3.25)
 }
 
 // A command is never written after the conversation's deadline: here the deadline passes while the
@@ -959,14 +999,62 @@ private func expectTimeoutAtTheDeadline(alwaysReady frame: Frame) async throws {
     }
 }
 
+// `converse` checks the deadline before it writes, and the wait for acknowledgements reads the
+// clock again. If the deadline passes between the two readings, the command still is not
+// written and the wait does not get a full backstop: the request fails at once. The clock is
+// made to jump between exactly those two readings.
+@Test(.timeLimit(.minutes(1))) func deadlinePassingJustBeforeTheWaitForAcknowledgementsFailsTheCommand() async throws {
+    let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
+    defer { link.close() }
+    link.parkSends(ofGroup: 0x04)
+    link.holdPartialResets()
+    let clock = ManualClock()
+    // The stuck acknowledgement's backstop is about 2 s: waiting for it would let the command out.
+    let s = RingSession(link: link, replyTimeout: 2, conversationTimeout: 5, monotonicNow: { clock.now() })
+    try await using(s, link) { s async throws in
+        await s.start()
+        link.deliver([event])
+        #expect(await link.waitUntilSendParked())
+        let pending = Task { try await s.request(Command.deviceInfo) }
+        #expect(await link.waitUntilPartialResetHeld())
+        // Nothing else reads the clock while the conversation is not waiting: the next read is the
+        // check in `converse`, the one after it the wait for acknowledgements.
+        clock.advance(by: 6, afterReads: 1)
+        let start = ContinuousClock.now
+        link.releasePartialReset()
+        switch await outcome(of: pending, within: 20) {
+        case .failure(RingError.timeout(let what))?: #expect(what == "event acknowledgements to be written")
+        case let other: Issue.record("expected a timeout, got \(String(describing: other))")
+        }
+        #expect(!link.events.contains("attempt 0200"))
+        // Ends with the end-of-conversation wait (at most one backstop), never a second one.
+        #expect(ContinuousClock.now - start < .seconds(3))
+    }
+}
+
 /// A monotonic clock that moves only when the test says so.
 // @unchecked Sendable: all state is guarded by `lock`.
 private final class ManualClock: @unchecked Sendable {
     private let lock = NSLock()
     private var offset: Duration = .zero
+    private var pending: (reads: Int, by: Duration)?
     private let start = ContinuousClock.now
-    func now() -> ContinuousClock.Instant { lock.withLock { start + offset } }
+    func now() -> ContinuousClock.Instant {
+        lock.withLock {
+            if let jump = pending {
+                if jump.reads == 0 {
+                    offset += jump.by
+                    pending = nil
+                } else {
+                    pending = (jump.reads - 1, jump.by)
+                }
+            }
+            return start + offset
+        }
+    }
     func advance(by seconds: Double) { lock.withLock { offset += .seconds(seconds) } }
+    /// Moves the clock on by `seconds` just before the read that follows the next `reads` reads.
+    func advance(by seconds: Double, afterReads reads: Int) { lock.withLock { pending = (reads, .seconds(seconds)) } }
 }
 
 // The wait for acknowledgements before a conversation's write ends at the conversation's deadline,
@@ -1370,6 +1458,101 @@ private func acknowledgement(of event: Frame) -> Frame { Frame(group: 0x04, key:
         case let other: Issue.record("expected the fetch to fail with stopped, got \(String(describing: other))")
         }
         #expect(link.sent == [Command.history(kind)])
+    }
+}
+
+private func expectStopped<T>(_ result: Result<T, Error>?, sourceLocation: SourceLocation = #_sourceLocation) {
+    guard case .failure(RingError.stopped)? = result else {
+        Issue.record("expected stopped, got \(String(describing: result))", sourceLocation: sourceLocation)
+        return
+    }
+}
+
+// A reply that arrived during the command write is held for the conversation; if `stop()` comes
+// before the write finishes, the request still fails rather than return it.
+@Test(.timeLimit(.minutes(1))) func replyHeldDuringTheWriteIsNotReturnedAfterStop() async throws {
+    let link = FakeLink()
+    // Long enough that the backstop cannot cut off the parked write during the test.
+    try await using(RingSession(link: link, replyTimeout: 30), link) { s async throws in
+        link.parkNextSend()
+        let pending = Task { try await s.request(Command.deviceInfo) }
+        #expect(await link.waitUntilSendParked())
+        link.deliver([deviceReply])
+        await waitUntil("the reply is held") { await s.heldFrames == 1 }
+        await s.stop()
+        link.releaseParked()
+        switch await outcome(of: pending, within: 5) {
+        case .failure(RingError.stopped)?: break
+        case let other: Issue.record("expected the request to fail with stopped, got \(String(describing: other))")
+        }
+    }
+}
+
+// The same for a whole history transfer held during its command write: after `stop()` it is not
+// persisted and not acknowledged.
+@Test(.timeLimit(.minutes(1))) func transferHeldDuringTheWriteIsNotPersistedAfterStop() async throws {
+    let link = FakeLink()
+    let persisted = PersistRecorder()
+    try await using(RingSession(link: link, replyTimeout: 30), link) { s async throws in
+        link.parkNextSend()
+        let pending = Task { try await s.fetchHistory(kind) { await persisted.add($0) } }
+        #expect(await link.waitUntilSendParked())
+        link.deliver([header(12), dataFrame([1, 2]), endFrame(checksum: CRC16.ccittFalse([1, 2]))])
+        await waitUntil("the transfer is held") { await s.heldFrames == 3 }
+        await s.stop()
+        link.releaseParked()
+        switch await outcome(of: pending, within: 5) {
+        case .failure(RingError.stopped)?: break
+        case let other: Issue.record("expected the fetch to fail with stopped, got \(String(describing: other))")
+        }
+        #expect(await persisted.calls.isEmpty)
+        #expect(link.sent == [Command.history(kind)])
+    }
+}
+
+// A request made after `stop()` fails at once, not after the conversation holding the turn (here
+// parked in `persist`) has finished.
+@Test(.timeLimit(.minutes(1))) func requestAfterStopFailsWithoutWaitingForTheTurn() async throws {
+    let link = historyLink(chunks: [[1]])
+    let gate = Gate()
+    try await using(session(link), link, alsoOnCancel: { gate.release() }) { s async throws in
+        let first = Task { try await s.fetchHistory(kind) { _ in await gate.park() } }
+        #expect(await gate.parked.wait())
+        await s.stop()
+        let late = Task { try await s.request(Command.deviceInfo) }
+        switch await outcome(of: late, within: 5) {
+        case .failure(RingError.stopped)?: break
+        case let other: Issue.record("expected the request to fail with stopped at once, got \(String(describing: other))")
+        }
+        gate.release()
+        _ = await outcome(of: first, within: 5)
+    }
+}
+
+// Conversations queued for the turn when `stop()` comes all fail within about one backstop in
+// total: `stop()` waits once for the stuck acknowledgements, and the conversations failing behind
+// it do not each wait again (four stuck acknowledgements would otherwise cost one backstop each).
+@Test(.timeLimit(.minutes(1))) func conversationsQueuedAtStopDoNotEachWaitForAcknowledgements() async throws {
+    let link = historyLink(chunks: [[1]])
+    defer { link.close() }
+    link.parkSends(ofGroup: 0x04)
+    let replyTimeout = 1.0
+    let backstop = link.writeTimeout + replyTimeout
+    let gate = Gate()
+    try await using(RingSession(link: link, replyTimeout: replyTimeout), link, alsoOnCancel: { gate.release() }) { s async throws in
+        let holder = Task { try await s.fetchHistory(kind) { _ in await gate.park() } }
+        #expect(await gate.parked.wait())
+        link.deliver((0..<4).map { Frame(group: 0x04, key: 0x0E, payload: [UInt8($0)]) })
+        await waitUntil("the events are read") { await s.queuedAcknowledgements == 4 }
+        let queued = (0..<3).map { _ in Task { try await s.request(Command.deviceInfo) } }
+        await waitUntil("three requests wait for the turn") { await s.queuedConversations == 3 }
+        let start = ContinuousClock.now
+        await s.stop()
+        gate.release()
+        expectStopped(await outcome(of: holder, within: 10))
+        for task in queued { expectStopped(await outcome(of: task, within: 10)) }
+        // `stop()` waits up to one backstop; allow half a backstop more for scheduling.
+        #expect(ContinuousClock.now - start < .seconds(1.5 * backstop))
     }
 }
 
