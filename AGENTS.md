@@ -54,7 +54,7 @@ swift run ringprobe raw 0200:4743   # send a known read-only frame
 Build the app for the simulator from the repository root (needs Xcode, no signing):
 
 ```
-xcodebuild -project App/Digit.xcodeproj -scheme Digit -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+xcodebuild -project App/Digit.xcodeproj -scheme Digit -destination 'generic/platform=iOS Simulator' -disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO build
 ```
 
 To run on a device, copy `App/Config/Local.xcconfig.example` to `App/Config/Local.xcconfig`, uncomment the `DEVELOPMENT_TEAM` line and set it there. Never choose a team in Xcode's Signing & Capabilities pane: Xcode writes it into `project.pbxproj`, and CI fails if `DEVELOPMENT_TEAM` appears there.
@@ -140,7 +140,7 @@ Built for the command-line tool; these must be closed before the app relies on i
 - **Layering.** `RingProtocol` stays free of CoreBluetooth and of I/O so it is testable anywhere. Bluetooth code lives in `RingTransport`. UI code never parses bytes.
 - **Tests.** Every decoder gets a test. Prefer bytes captured from the real ring over synthetic ones, and say in the test which they are. Run `swift test` before committing.
 - **Unverified code.** If something is implemented from documentation and not confirmed on hardware, say so in a comment or in the table above. Do not present it as working.
-- **Dependencies.** Keep them few. Ask the owner before adding one.
+- **Dependencies.** Keep them few. Ask the owner before adding one. When a dependency changes, update both lockfiles together: `Packages/RingKit/Package.resolved` and `App/Digit.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved` (the app's own resolution, committed so CI and clean clones pin the same revisions). The app build passes `-disableAutomaticPackageResolution`, so Xcode never rewrites the app's lockfile. Tested with `xcodebuild` on Xcode 27.2 from an empty package cache: the build fails if the lockfile is missing, lacks a pin, or pins a version outside `Package.swift`'s requirement; `originHash` is not checked; a pin inside the requirement is built exactly as written, even if it differs from RingKit's lockfile, so CI does not yet catch the two lockfiles disagreeing (#58). A warm local package cache can hide a missing pin; CI starts clean. Not checked: CI's own Xcode version, and what the Xcode app does when it opens the project.
 - **Comments.** Explain why, and record protocol quirks; don't restate the code.
 
 ## Workflow
