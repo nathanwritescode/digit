@@ -206,21 +206,6 @@ public final class RingConnection: NSObject, @unchecked Sendable {
         }
     }
 
-    /// Drops frames and partial frames left over from an earlier conversation.
-    ///
-    /// `RingSession` never calls this: it drops queued ring-initiated events, which must still be
-    /// acknowledged. Do not call it on a link a session is reading; the session drains the link
-    /// itself and uses `discardPartialFrames()`.
-    public func discardPendingFrames() async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            queue.async {
-                self.assemblers = [:]
-                self.inbox.clear()
-                continuation.resume()
-            }
-        }
-    }
-
     /// Resets the assembler of the command characteristic, which carries the replies, and nothing
     /// else: queued complete frames stay, and so do partial frames on the upload characteristic,
     /// which carries no replies, so a stale partial there cannot be misread as one. The cost is

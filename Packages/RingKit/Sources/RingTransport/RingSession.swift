@@ -65,10 +65,13 @@ extension RingConnection: RingLink {}
 /// still unwritten after that are written later by the acknowledgement task, just not waited for.
 /// A failed acknowledgement does not fail the conversation and is not retried.
 ///
-/// **Lifetime.** The reader starts on `start()`, or on the first request or subscription, and
-/// ends on `stop()`. Between conversations it waits for frames in slices of at most 0.1 s, so a
-/// new conversation can start up to that long after it is asked for, and an idle session wakes
-/// about ten times a second. The session cannot tell a quiet ring from a dead link: a reader on a
+/// **Lifetime.** A session lives for one connection. The reader starts on `start()`, or on the
+/// first request or subscription, and ends on `stop()`, which is final: a stopped session cannot
+/// be started again. After reconnecting, the owner creates a new session, and must not do so
+/// until the old session's `stop()` has returned, or two readers would compete for frames.
+/// Between conversations the reader waits for frames in slices of at most 0.1 s, so a new
+/// conversation can start up to that long after it is asked for, and an idle session wakes about
+/// ten times a second. The session cannot tell a quiet ring from a dead link: a reader on a
 /// disconnected link keeps polling until `stop()`, so the owner of the link must call `stop()`
 /// when it disconnects.
 public actor RingSession {
@@ -118,12 +121,11 @@ public actor RingSession {
     // The reader.
     private enum ReaderState { case notStarted, running, stopped }
     private var readerState = ReaderState.notStarted
-    private var readerGeneration = 0
     private var readerTask: Task<Void, Never>?
+    /// The work of the first `stop()`, which later calls wait for too.
+    private var stopping: Task<Void, Never>?
     /// Counts the reader's waits, so the drain can insist on an empty read that began after it was asked for.
     private var waitsBegun = 0
-    /// Frames the reader took after `stop`; routed first if the session is started again.
-    private var carriedOver: [Frame] = []
 
     // The conversation in flight.
     /// The deadline of the conversation holding the turn, if any.
@@ -141,7 +143,10 @@ public actor RingSession {
     private var lastWaiterID = 0
 
     // Event acknowledgements.
+    /// Acknowledgements not yet written start at `pendingAckHead`; the array is compacted now and
+    /// then rather than shifted on every write, because under a flood of events it can grow large.
     private var pendingAcks: [Frame] = []
+    private var pendingAckHead = 0
     private var acksQueued = 0
     private var acksFinished = 0
     private var ackWriterRunning = false
@@ -192,24 +197,18 @@ public actor RingSession {
     // MARK: Lifetime
 
     /// Starts reading frames from the link. Requests and subscriptions start the session
-    /// themselves if it has never run, so calling this is needed only to acknowledge events
-    /// before anything else is asked for, or to resume after `stop()`.
+    /// themselves, so calling this is needed only to acknowledge events before anything else is
+    /// asked for. Does nothing once the session has been stopped.
     ///
     /// The reader runs until `stop()`, whatever state the link is in: on a disconnected link it
     /// keeps polling, because an empty read looks the same as a quiet ring.
     public func start() {
-        guard readerState != .running else { return }
+        guard readerState == .notStarted else { return }
         readerState = .running
-        readerGeneration += 1
-        let generation = readerGeneration
-        let previous = readerTask
         let link = self.link
         // Holds the session weakly, so a session nobody references ends its reader.
         readerTask = Task { [weak self] in
-            // A reader left over from before `stop` must have ended, or two would compete for frames.
-            await previous?.value
-            await self?.routeCarriedOver(generation: generation)
-            while let wait = await self?.beginWait(generation: generation) {
+            while let wait = await self?.beginWait() {
                 let frame = await link.nextFrame(timeout: wait.timeout)
                 await self?.route(frame, wait: wait.number)
                 // `nextFrame` returns without suspending when a frame is already queued, so without
@@ -221,31 +220,41 @@ public actor RingSession {
         }
     }
 
-    /// Stops reading. The conversation in flight fails with `RingError.stopped`, as do any
-    /// queued behind it and any later ones until `start()` is called again; subscribers' streams
-    /// end. Acknowledgements already queued are still written. Returns once the reader has
-    /// ended (at most one reader wait later) and those acknowledgements have been written, or
-    /// after one write backstop (`link.writeTimeout + replyTimeout`) of waiting for them, after
-    /// which the rest are still written but not waited for.
+    /// Stops the session for good: it cannot be started again. The conversation waiting for a
+    /// frame fails with `RingError.stopped`; one that is writing or inside `persist` fails at its
+    /// next wait or write (so a history transfer stopped inside `persist` is not acknowledged,
+    /// which is safe because the ring keeps its data). Conversations queued behind it and any
+    /// later ones fail too, and subscribers' streams end. A frame the reader takes while stopping
+    /// is dropped; if it is an event, it goes unacknowledged.
+    ///
+    /// Acknowledgements already queued are still written. Returns once the reader has ended (at
+    /// most one reader wait later) and those acknowledgements have been written, or after one
+    /// write backstop (`link.writeTimeout + replyTimeout`) of waiting for them, after which the
+    /// rest are still written but not waited for. A second call made while the first is in
+    /// progress waits for the same thing.
     ///
     /// Call this when the link disconnects: the session cannot tell, and its reader would keep
     /// polling the dead link until stopped.
     public func stop() async {
-        switch readerState {
-        case .notStarted:
+        if let stopping {
+            await stopping.value
+            return
+        }
+        guard readerState == .running else {
             readerState = .stopped
             return
-        case .stopped:
-            return
-        case .running:
-            break
         }
         readerState = .stopped
         wake(with: .failure(RingError.stopped))
         for subscriber in subscribers.values { subscriber.finish() }
         subscribers = [:]
-        await readerTask?.value
-        _ = await flushAcknowledgements(waitingAtMost: writeBackstop)
+        let reader = readerTask
+        let work = Task {
+            await reader?.value
+            _ = await flushAcknowledgements(waitingAtMost: writeBackstop)
+        }
+        stopping = work
+        await work.value
     }
 
     /// Ring-initiated events and live values, in arrival order, from now until `stop()`. Each
@@ -277,18 +286,11 @@ public actor RingSession {
 
     // MARK: Reader
 
-    private func beginWait(generation: Int) -> (number: Int, timeout: TimeInterval)? {
-        guard readerState == .running, generation == readerGeneration else { return nil }
+    private func beginWait() -> (number: Int, timeout: TimeInterval)? {
+        guard readerState == .running else { return nil }
         waitsBegun += 1
         // While a conversation waits for the drain, read without waiting so it starts promptly.
         return (waitsBegun, drainFromWait == nil ? pollInterval : 0)
-    }
-
-    private func routeCarriedOver(generation: Int) {
-        guard readerState == .running, generation == readerGeneration else { return }
-        let frames = carriedOver
-        carriedOver = []
-        for frame in frames { dispatch(frame) }
     }
 
     private func route(_ frame: Frame?, wait number: Int) {
@@ -309,10 +311,8 @@ public actor RingSession {
             }
             return
         }
-        guard readerState == .running else {
-            carriedOver.append(frame)
-            return
-        }
+        // Taken while stopping: dropped, so an event among such frames goes unacknowledged.
+        guard readerState == .running else { return }
         // Checked on every frame, not only by the waiter's timer: a link that always has a frame
         // ready must not be able to keep a conversation past its deadline, even if the timer's
         // task cannot get a thread.
@@ -464,8 +464,8 @@ public actor RingSession {
         return try await conversation { try await converse(command, deadline: $0) }
     }
 
-    /// Test hook: a request without `request`'s own checks, so tests can reach the refusal in
-    /// `transmit` and see where a reply in an upload group would go.
+    /// Tests only: a request without `request`'s own checks, so tests can reach the refusal in
+    /// `transmit` and see where a reply in an upload group would go. Never call it elsewhere.
     func requestSkippingChecks(_ command: Frame) async throws -> Frame {
         try await conversation { try await converse(command, deadline: $0) }
     }
@@ -481,6 +481,9 @@ public actor RingSession {
 
     private func converse(_ command: Frame, deadline: ContinuousClock.Instant) async throws -> Frame {
         let what = String(format: "reply to %04X", command.type)
+        // A command is never written after the deadline: its reply could no longer be waited for,
+        // and the write and the waits after it would only add to the overrun.
+        guard now() < deadline else { throw RingError.timeout(what) }
         try await transmit(command)
         // Events never reach the conversation: the reader acknowledges them.
         while let frame = try await nextFrame(until: deadline, what) {
@@ -518,8 +521,8 @@ public actor RingSession {
     /// session (any method), or the session deadlocks. Events that arrive meanwhile are still
     /// acknowledged.
     ///
-    /// Verified on an R99 with single-record transfers, where the ring kept its history after
-    /// the acknowledgement. Transfers spanning several data frames have not been seen yet.
+    /// Verified on an R99, including a transfer spanning three data frames; the ring kept its
+    /// history after the acknowledgement in the one case tested.
     public func fetchHistory(
         _ kind: HistoryKind,
         persist: @Sendable (HistoryTransfer) async throws -> Void
@@ -581,28 +584,40 @@ public actor RingSession {
     /// Every write goes through here so the delete-range refusal holds even for a link that forgets it.
     private func transmit(_ frame: Frame, acknowledgement: Bool = false) async throws {
         guard !frame.erasesRingData else { throw RingError.refusedDestructive(frame) }
+        // After `stop`, only event acknowledgements are still written; checked again at the write
+        // turn, since `stop` can come while this waits.
+        guard acknowledgement || readerState == .running else { throw RingError.stopped }
         // Events already read are acknowledged before a conversation's write, so the order on the
         // link follows the order of arrival. The acknowledgement writer does not wait for itself.
-        // The wait is part of the conversation, so it ends at the conversation's deadline; a
-        // write after the deadline has passed (the history acknowledgement after a long `persist`)
-        // still gets one write backstop. If the acknowledgements are not all written by then the
+        // The wait is part of the conversation, so it ends at the conversation's deadline; if that
+        // has already passed (only the history acknowledgement after a `persist` that outran it)
+        // it gets one write backstop. If the acknowledgements are not all written by then, the
         // link is not completing writes and the conversation fails rather than jump ahead of them.
+        // So a conversation that reaches its write with little time left and an acknowledgement
+        // still unwritten fails with this timeout.
         if !acknowledgement, acksFinished < acksQueued {
             var limit = writeBackstop
-            if let deadline = conversationDeadline { limit = max(limit, (deadline - now()) / .seconds(1)) }
+            if let deadline = conversationDeadline, case let left = deadline - now(), left > .zero {
+                limit = left / .seconds(1)
+            }
             guard await flushAcknowledgements(waitingAtMost: limit) else {
                 throw RingError.timeout("event acknowledgements to be written")
             }
         }
         try await withWriteTurn {
-            // After `stop`, only event acknowledgements already queued are still written.
             guard acknowledgement || readerState == .running else { throw RingError.stopped }
             // Backstop only, for a link that breaks the `RingLink.send` contract. A compliant link
             // throws by `writeTimeout` and clears its own in-flight state first; this deadline is
             // always `replyTimeout` later than that, so it fires first only if the link is
-            // non-compliant. It is derived from the link's bound so the two cannot drift apart. A
-            // final write can therefore overrun the conversation deadline by up to one backstop,
-            // plus up to one more waiting for an acknowledgement write ahead of it in the queue.
+            // non-compliant. It is derived from the link's bound so the two cannot drift apart.
+            //
+            // Overrun past the conversation deadline, with B this backstop: a command is never
+            // written after the deadline (`converse`), and the wait above ends by it, but a write
+            // that starts just before it can wait up to B for its turn (at most one acknowledgement
+            // write is ahead) and take up to B itself, and the conversation then waits up to B for
+            // acknowledgements: about 3B in all. The history acknowledgement after `persist` can
+            // end up to 4B after the later of the deadline and the end of `persist` (one more B
+            // waiting for acknowledgements when the deadline has passed).
             let link = self.link
             try await withDeadline(writeBackstop, "write confirmation") { try await link.send(frame) }
         }
@@ -621,8 +636,17 @@ public actor RingSession {
     }
 
     private func writeAcknowledgements() async {
-        while !pendingAcks.isEmpty {
-            let ack = pendingAcks.removeFirst()
+        while pendingAckHead < pendingAcks.count {
+            let ack = pendingAcks[pendingAckHead]
+            pendingAckHead += 1
+            if pendingAckHead == pendingAcks.count {
+                pendingAcks.removeAll()
+                pendingAckHead = 0
+            } else if pendingAckHead >= 1024, pendingAckHead * 2 >= pendingAcks.count {
+                // Drop the written prefix in one go: amortised O(1) per acknowledgement.
+                pendingAcks.removeFirst(pendingAckHead)
+                pendingAckHead = 0
+            }
             // Not retried: a write that failed may still have reached the ring, and a second
             // acknowledgement of the same event is not known to be harmless. Whether the ring
             // repeats an event that was never acknowledged is unverified.
@@ -659,19 +683,23 @@ public actor RingSession {
         flushWaiters.removeValue(forKey: id)?.continuation.resume(returning: false)
     }
 
-    // MARK: Test hooks
+    // MARK: Test hooks (tests only)
 
-    /// How many writes are waiting for the write in progress.
+    // Internal, for `@testable` tests to observe state that has no signal of its own. Nothing
+    // outside the tests may use these.
+
+    /// Tests only: how many writes are waiting for the write in progress.
     var queuedWrites: Int { writeWaiters.count }
-    /// How many callers are waiting for acknowledgements to be written.
+    /// Tests only: how many callers are waiting for acknowledgements to be written.
     var pendingFlushes: Int { flushWaiters.count }
-    /// Acknowledgements queued and not yet written (or failed).
+    /// Tests only: acknowledgements queued and not yet written (or failed).
     var queuedAcknowledgements: Int { acksQueued - acksFinished }
-    /// Frames held for the open conversation.
+    /// Tests only: frames held for the open conversation.
     var heldFrames: Int { mailbox.count }
-    /// Whether a conversation is waiting for the link to drain.
+    /// Tests only: whether a conversation is waiting for the link to drain.
     var isDraining: Bool { drainFromWait != nil }
-    /// Whether an open conversation is waiting for a frame.
+    /// Tests only: whether an open conversation is waiting for a frame.
     var conversationIsWaiting: Bool { conversationOpen && waiter != nil }
+    /// Tests only: whether `stop()` has been called.
     var isStopped: Bool { readerState == .stopped }
 }
