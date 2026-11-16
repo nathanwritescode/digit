@@ -5,8 +5,9 @@ import Foundation
 /// and a combined record.
 ///
 /// The cases are the only values the app may ever send. Another ring of this family is reported
-/// to acknowledge any interval byte, so validation on the ring cannot be relied on. Verified on an
-/// R99 (firmware 2.32): off, 1, 5 and 10 minutes. 15, 20, 30 and 60 minutes have never been sent.
+/// to acknowledge any interval byte, so validation on the ring cannot be relied on. Spacing observed
+/// on an R99 (firmware 2.32): off, 1, 5 and 10 minutes. 15, 20, 30 and 60 minutes were each sent
+/// once and acknowledged; readings at those spacings have not been observed.
 public enum MonitoringInterval: Int, CaseIterable, Sendable {
     case off = 0
     case oneMinute = 1
