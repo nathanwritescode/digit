@@ -4,7 +4,9 @@ import RingTransport
 
 /// The ring side of a sync: exactly the three things `RingSyncer` asks of a connected ring.
 /// `RingSession` is the real implementation; tests script the ring's behaviour through this
-/// protocol instead of building frames.
+/// protocol instead of building frames. Shaped by the YCBT family (history with a `persist` step,
+/// a wall-clock clock-set, one monitoring interval); it will sit behind the planned ring
+/// abstraction when a second family arrives.
 ///
 /// Errors follow `RingSession`: `RingError` for transport failures and error replies, and
 /// `MonitoringSettingError` when the ring refuses a monitoring interval.

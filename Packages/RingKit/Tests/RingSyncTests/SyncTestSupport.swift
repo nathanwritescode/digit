@@ -121,6 +121,8 @@ actor FakeRing: SyncableRing {
         case fail(any Error)
         /// Persists, then the acknowledgement fails.
         case ackFails(any Error)
+        /// Breaks the contract: acknowledges and returns the data without calling `persist`.
+        case skipsPersist([UInt8])
     }
 
     enum Reply {
@@ -182,6 +184,9 @@ actor FakeRing: SyncableRing {
         case .fail(let error): throw error
         case .empty: return transfer(kind, [])
         case .data(let bytes): data = bytes
+        case .skipsPersist(let bytes):
+            record("ack \(kind.name)")
+            return transfer(kind, bytes)
         case .ackFails(let error):
             data = syntheticHistory[kind] ?? [1]
             ackError = error

@@ -20,17 +20,13 @@ private func syncer(
         clock: { clock }, timeZone: { zone }, monotonicNow: { monotonic.now() })
 }
 
-private func isIngested(_ outcome: IngestionOutcome?) -> Bool {
-    if case .ingested = outcome { true } else { false }
-}
-
-private func isStored(_ outcome: FetchOutcome?) -> Bool {
+private func isStored(_ outcome: FetchOutcome) -> Bool {
     if case .stored = outcome { true } else { false }
 }
 
-private func allIngested(_ result: SyncResult) -> Bool {
-    HistoryKind.allCases.allSatisfy { isIngested(result.ingestions[$0]) }
-}
+private func allIngested(_ result: SyncResult) -> Bool { result.ingestions.values.allSatisfy(\.succeeded) }
+
+private let syntheticTimeout = RingError.timeout("synthetic")
 
 // MARK: Complete sync
 
@@ -47,6 +43,9 @@ private func allIngested(_ result: SyncResult) -> Bool {
     #expect(await ring.typedRowsDuringRingSteps == [0, 0, 0, 0])
     #expect(try await typedRowCounts(store, id) == [2, 1, 2, 1])
 
+    // Results are listed in fetch order.
+    #expect(result.fetches.entries.map(\.kind) == RingSyncer.fetchOrder)
+    #expect(result.ingestions.entries.map(\.kind) == RingSyncer.fetchOrder)
     for kind in HistoryKind.allCases {
         guard case .stored(.inserted, let bytes) = result.fetches[kind] else {
             Issue.record("\(kind.name) was not stored")
@@ -63,10 +62,7 @@ private func allIngested(_ result: SyncResult) -> Bool {
         Issue.record("clock-set not acknowledged and logged")
         return
     }
-    guard case .accepted(.tenMinutes) = result.monitoringInterval else {
-        Issue.record("interval not accepted")
-        return
-    }
+    #expect(result.monitoringInterval == .accepted(.tenMinutes))
     #expect(try await store.clockSets(ringID: id).count == 2)
     #expect(result.isComplete)
     #expect(!result.clockSetLogIncomplete)
@@ -108,13 +104,58 @@ private func allIngested(_ result: SyncResult) -> Bool {
     #expect(try await store.vitalsReadings(ringID: id) == before.3)
 }
 
+// MARK: Two phases
+
+@Test(.timeLimit(.minutes(1))) func ringPhaseAloneTouchesNoTypedRows() async throws {
+    let (store, id) = try await makeStore()
+    let ring = FakeRing(store: store, ringID: id)
+    let phase = await syncer(ring, store, id).syncRing()
+    #expect(await ring.log == completeLog)
+    #expect(phase.fetches.values.allSatisfy { $0.isFetched })
+    #expect(phase.clockSet.wasAcknowledged)
+    #expect(phase.monitoringInterval == .accepted(.tenMinutes))
+    #expect(try await typedRowCounts(store, id) == [0, 0, 0, 0])
+}
+
+@Test(.timeLimit(.minutes(1))) func derivePhaseAloneIngestsWithoutTheRing() async throws {
+    let (store, id) = try await makeStore()
+    _ = await syncer(FakeRing(store: store, ringID: id), store, id).syncRing()
+    // A fresh fake that would log anything sent to it: the derive phase sends nothing.
+    let idle = FakeRing(store: store, ringID: id)
+    let ingestions = await syncer(idle, store, id).ingestAll()
+    #expect(await idle.log.isEmpty)
+    #expect(ingestions.entries.map(\.kind) == RingSyncer.fetchOrder)
+    #expect(ingestions.values.allSatisfy { $0.succeeded })
+    #expect(try await typedRowCounts(store, id) == [2, 1, 2, 1])
+}
+
+@Test(.timeLimit(.minutes(1))) func phasesComposeToWhatRunReturns() async throws {
+    let (storeA, idA) = try await makeStore()
+    let (storeB, idB) = try await makeStore()
+    let whole = await syncer(FakeRing(store: storeA, ringID: idA), storeA, idA).run()
+    let split = syncer(FakeRing(store: storeB, ringID: idB), storeB, idB)
+    let ringPhase = await split.syncRing()
+    let composed = SyncResult(ringPhase: ringPhase, ingestions: await split.ingestAll())
+
+    #expect(composed.isComplete && whole.isComplete)
+    #expect(composed.fetches == whole.fetches)
+    #expect(composed.monitoringInterval == whole.monitoringInterval)
+    #expect(composed.ingestions == whole.ingestions)
+    // The clock-set entries differ only in the store's ring id.
+    guard case .acknowledgedAndLogged(let a) = whole.clockSet, case .acknowledgedAndLogged(let b) = composed.clockSet else {
+        Issue.record("clock-set not acknowledged and logged")
+        return
+    }
+    #expect(a.instant == b.instant && a.timeZoneIdentifier == b.timeZoneIdentifier && a.utcOffsetSeconds == b.utcOffsetSeconds)
+}
+
 // MARK: Fetch failures
 
 @Test(.timeLimit(.minutes(1)), arguments: HistoryKind.allCases)
 func failedFetchSkipsClockAndIntervalButNotOtherKindsOrIngestion(_ failing: HistoryKind) async throws {
     let (store, id) = try await makeStore()
     var fetches = syntheticHistory.mapValues { FakeRing.Fetch.data($0) }
-    fetches[failing] = .fail(RingError.timeout("synthetic"))
+    fetches[failing] = .fail(syntheticTimeout)
     let ring = FakeRing(store: store, ringID: id, fetches: fetches)
     let result = await syncer(ring, store, id).run()
 
@@ -126,18 +167,9 @@ func failedFetchSkipsClockAndIntervalButNotOtherKindsOrIngestion(_ failing: Hist
     for kind in HistoryKind.allCases where kind != failing {
         #expect(isStored(result.fetches[kind]), "\(kind.name)")
     }
-    guard case .failed(.transfer, let error) = result.fetches[failing], case RingError.timeout = error else {
-        Issue.record("the failing kind is not reported as failed with its error")
-        return
-    }
-    guard case .skipped(.historyIncomplete) = result.clockSet else {
-        Issue.record("clock-set not skipped")
-        return
-    }
-    guard case .skipped(.tenMinutes, .clockNotAcknowledged) = result.monitoringInterval else {
-        Issue.record("interval not skipped")
-        return
-    }
+    #expect(result.fetches[failing] == .failed(stage: .transfer, error: .ring(.timeout("synthetic"))))
+    #expect(result.clockSet == .skipped(.historyIncomplete))
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .clockNotAcknowledged))
     // Only the clock-set seeded before the sync.
     #expect(try await store.clockSets(ringID: id).count == 1)
     #expect(allIngested(result))
@@ -154,7 +186,7 @@ func failedFetchSkipsClockAndIntervalButNotOtherKindsOrIngestion(_ failing: Hist
     #expect(log.contains("not acknowledged sleep"))
     #expect(!log.contains("ack sleep"))
     #expect(!log.contains("setTime"))
-    guard case .failed(.store, _) = result.fetches[.sleep] else {
+    guard case .failed(.store, .database) = result.fetches[.sleep] else {
         Issue.record("sleep not reported as a store failure")
         return
     }
@@ -167,16 +199,26 @@ func failedFetchSkipsClockAndIntervalButNotOtherKindsOrIngestion(_ failing: Hist
 @Test(.timeLimit(.minutes(1))) func failedAcknowledgementAfterStoringIsReportedAsSuch() async throws {
     let (store, id) = try await makeStore()
     var fetches = syntheticHistory.mapValues { FakeRing.Fetch.data($0) }
-    fetches[.activity] = .ackFails(RingError.timeout("synthetic"))
+    fetches[.activity] = .ackFails(syntheticTimeout)
     let result = await syncer(FakeRing(store: store, ringID: id, fetches: fetches), store, id).run()
-    guard case .failed(.acknowledgement, _) = result.fetches[.activity] else {
-        Issue.record("activity not reported as an acknowledgement failure")
-        return
-    }
-    guard case .skipped(.historyIncomplete) = result.clockSet else {
-        Issue.record("clock-set not skipped")
-        return
-    }
+    #expect(result.fetches[.activity] == .failed(stage: .acknowledgement, error: .ring(.timeout("synthetic"))))
+    #expect(result.clockSet == .skipped(.historyIncomplete))
+}
+
+@Test(.timeLimit(.minutes(1))) func dataReturnedWithoutPersistIsStoredButReportedAsFailed() async throws {
+    let (store, id) = try await makeStore()
+    var fetches = syntheticHistory.mapValues { FakeRing.Fetch.data($0) }
+    fetches[.heartRate] = .skipsPersist(syntheticHistory[.heartRate]!)
+    let ring = FakeRing(store: store, ringID: id, fetches: fetches)
+    let result = await syncer(ring, store, id).run()
+
+    #expect(result.fetches[.heartRate] == .failed(stage: .notPersistedBeforeAcknowledgement, error: .persistNotCalled))
+    // Stored all the same, so nothing is lost.
+    let logged = try await store.observations(ringID: id, kind: .heartRate).observations
+    #expect(logged.map(\.dataLength) == [syntheticHistory[.heartRate]!.count])
+    #expect(result.clockSet == .skipped(.historyIncomplete))
+    #expect(!(await ring.log).contains("setTime"))
+    #expect(!result.isComplete)
 }
 
 @Test(.timeLimit(.minutes(1)), arguments: [RingError.stopped, RingError.notConnected])
@@ -189,20 +231,10 @@ func sessionEndingDuringAFetchLeavesTheRestNotAttempted(_ error: RingError) asyn
 
     #expect(await ring.log == ["fetch activity", "persisted activity", "ack activity", "fetch sleep"])
     #expect(isStored(result.fetches[.activity]))
-    guard case .failed(.transfer, _) = result.fetches[.sleep] else {
-        Issue.record("sleep not failed")
-        return
-    }
-    for kind in [HistoryKind.heartRate, .combined] {
-        guard case .notAttempted(.sessionUnavailable) = result.fetches[kind] else {
-            Issue.record("\(kind.name) was attempted")
-            continue
-        }
-    }
-    guard case .skipped(.historyIncomplete) = result.clockSet else {
-        Issue.record("clock-set not skipped")
-        return
-    }
+    #expect(result.fetches[.sleep] == .failed(stage: .transfer, error: SyncError(error)))
+    #expect(result.fetches[.heartRate] == .notAttempted(.sessionUnavailable))
+    #expect(result.fetches[.combined] == .notAttempted(.sessionUnavailable))
+    #expect(result.clockSet == .skipped(.historyIncomplete))
     #expect(allIngested(result))
 }
 
@@ -213,10 +245,7 @@ func sessionEndingDuringAFetchLeavesTheRestNotAttempted(_ error: RingError) asyn
     let ring = FakeRing(store: store, ringID: id, fetches: fetches)
     let result = await syncer(ring, store, id).run()
 
-    guard case .empty = result.fetches[.heartRate] else {
-        Issue.record("heart rate not reported empty")
-        return
-    }
+    #expect(result.fetches[.heartRate] == .empty)
     let observations = try await store.observations(ringID: id, kind: .heartRate).observations
     #expect(observations.count == 1)
     #expect(observations.first?.dataLength == 0)
@@ -233,57 +262,54 @@ func sessionEndingDuringAFetchLeavesTheRestNotAttempted(_ error: RingError) asyn
     var fetches = syntheticHistory.mapValues { FakeRing.Fetch.data($0) }
     fetches[.heartRate] = .empty
     let result = await syncer(FakeRing(store: store, ringID: id, fetches: fetches), store, id).run()
-    guard case .failed(.store, _) = result.fetches[.heartRate] else {
+    guard case .failed(.store, .database) = result.fetches[.heartRate] else {
         Issue.record("heart rate not reported as a store failure")
         return
     }
-    guard case .skipped(.historyIncomplete) = result.clockSet else {
-        Issue.record("clock-set not skipped")
-        return
-    }
+    #expect(result.clockSet == .skipped(.historyIncomplete))
 }
 
 // MARK: Clock
 
-@Test(.timeLimit(.minutes(1))) func clockTimeoutIsLoggedAsUnknownAndSkipsTheInterval() async throws {
+/// Errors after which the clock-set may have reached the ring, so it is logged as unknown.
+/// `stopped` is here: a `stop()` can come after the command was written.
+@Test(.timeLimit(.minutes(1)), arguments: [
+    syntheticTimeout, RingError.stopped, RingError.notConnected, RingError.connectionFailed("synthetic"),
+    RingError.tooManyFrames(1024),
+])
+func clockWithUnknownOutcomeIsLoggedAndSkipsTheInterval(_ error: RingError) async throws {
     let (store, id) = try await makeStore()
-    let ring = FakeRing(store: store, ringID: id, clock: .fail(RingError.timeout("synthetic")))
+    let ring = FakeRing(store: store, ringID: id, clock: .fail(error))
     let result = await syncer(ring, store, id).run()
 
-    guard case .unknownAndLogged(let event, let error) = result.clockSet, case RingError.timeout = error else {
+    guard case .unknownAndLogged(let event, let reported) = result.clockSet else {
         Issue.record("clock-set not unknown and logged")
         return
     }
+    #expect(reported == SyncError(error))
     #expect(try await store.clockSets(ringID: id).last == event)
     #expect(try await store.clockSets(ringID: id).count == 2)
-    guard case .skipped(.tenMinutes, .clockNotAcknowledged) = result.monitoringInterval else {
-        Issue.record("interval not skipped")
-        return
-    }
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .clockNotAcknowledged))
     #expect(!(await ring.log).contains { $0.hasPrefix("interval") })
     #expect(allIngested(result))
     #expect(!result.isComplete)
 }
 
+/// Only an error reply and refusals made before anything is written count as "not applied".
 @Test(.timeLimit(.minutes(1)), arguments: [
     RingError.rejected(Frame(group: 0x01, key: 0x00, payload: [0xFC])),
-    RingError.stopped,
     RingError.refusedDestructive(Frame(group: 0x05, key: 0x40)),
+    RingError.refusedUploadGroup(Frame(group: 0x04, key: 0x00)),
+    RingError.busy("synthetic"),
 ])
 func clockDefinitelyNotAppliedIsNotLoggedAndSkipsTheInterval(_ error: RingError) async throws {
     let (store, id) = try await makeStore()
     let ring = FakeRing(store: store, ringID: id, clock: .fail(error))
     let result = await syncer(ring, store, id).run()
 
-    guard case .notApplied = result.clockSet else {
-        Issue.record("clock-set not reported as not applied")
-        return
-    }
+    #expect(result.clockSet == .notApplied(error: SyncError(error)))
     #expect(try await store.clockSets(ringID: id).count == 1)
-    guard case .skipped(.tenMinutes, .clockNotAcknowledged) = result.monitoringInterval else {
-        Issue.record("interval not skipped")
-        return
-    }
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .clockNotAcknowledged))
     #expect(!(await ring.log).contains { $0.hasPrefix("interval") })
     #expect(!result.isComplete)
 }
@@ -302,16 +328,13 @@ func clockDefinitelyNotAppliedIsNotLoggedAndSkipsTheInterval(_ error: RingError)
     #expect(!result.isComplete)
     // Sent once, and the interval still follows an acknowledged clock-set.
     #expect(await ring.log.filter { $0 == "setTime" }.count == 1)
-    guard case .accepted = result.monitoringInterval else {
-        Issue.record("interval not sent after an acknowledged clock-set")
-        return
-    }
+    #expect(result.monitoringInterval == .accepted(.tenMinutes))
 }
 
 @Test(.timeLimit(.minutes(1))) func unknownClockThatCannotBeLoggedIsReported() async throws {
     let (store, id) = try await makeStore()
     try failInserts(into: "clock_set", store)
-    let ring = FakeRing(store: store, ringID: id, clock: .fail(RingError.timeout("synthetic")))
+    let ring = FakeRing(store: store, ringID: id, clock: .fail(syntheticTimeout))
     let result = await syncer(ring, store, id).run()
     guard case .unknownAndNotLogged = result.clockSet else {
         Issue.record("clock-set not reported as unknown and not logged")
@@ -326,7 +349,7 @@ func clockDefinitelyNotAppliedIsNotLoggedAndSkipsTheInterval(_ error: RingError)
     (1_814_529_600.123456, "America/New_York", -14_400),
     // The same instant in Kolkata (UTC+5:30, no daylight saving).
     (1_814_529_600.123456, "Asia/Kolkata", 19_800),
-    // 2027-01-15 08:00:00.999 UTC: Auckland on daylight saving time (UTC+13).
+    // 2027-01-15 08:00:00.9999 UTC: Auckland on daylight saving time (UTC+13).
     (1_800_000_000.9999, "Pacific/Auckland", 46_800),
 ])
 func loggedClockSetIsExactlyWhatWasSent(_ seconds: Double, _ zoneID: String, _ offset: Int) async throws {
@@ -339,16 +362,50 @@ func loggedClockSetIsExactlyWhatWasSent(_ seconds: Double, _ zoneID: String, _ o
     let sent = try #require(await ring.clockSent)
     #expect(sent.date == date)
     #expect(sent.zone.identifier == zoneID)
+    let expected = ClockSetEvent(
+        ringID: id, instant: HistoryTransfer.truncatedToMilliseconds(date), timeZoneIdentifier: zoneID,
+        utcOffsetSeconds: offset)
+    #expect(result.clockSet == .acknowledgedAndLogged(expected))
+    #expect(try await store.clockSets(ringID: id).last == expected)
+    #expect(HistoryTransfer.millisecondsSince1970(expected.instant) == Int64((seconds * 1000).rounded(.down)))
+}
+
+/// Returns the next value on every call, so reading a closure twice shows up as a mismatch.
+/// `@unchecked Sendable` because all state is guarded by `lock`.
+private final class Rotating<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Value]
+    private(set) var reads = 0
+    init(_ values: [Value]) { self.values = values }
+    func next() -> Value {
+        lock.withLock {
+            reads += 1
+            return values.count > 1 ? values.removeFirst() : values[0]
+        }
+    }
+}
+
+@Test(.timeLimit(.minutes(1))) func clockAndZoneAreReadOnceForTheCommandAndTheLog() async throws {
+    let (store, id) = try await makeStore()
+    // Each read returns a different instant and zone (with different offsets).
+    let dates = Rotating([1_814_529_600.25, 1_814_529_700.5, 1_814_529_800.75].map(Date.init(timeIntervalSince1970:)))
+    let zones = Rotating(["America/New_York", "Asia/Kolkata", "Pacific/Auckland"].map { TimeZone(identifier: $0)! })
+    let ring = FakeRing(store: store, ringID: id)
+    let result = await RingSyncer(
+        ring: ring, store: store, ringID: id, monitoringInterval: nil, budget: .seconds(60),
+        clock: { dates.next() }, timeZone: { zones.next() }
+    ).run()
+
+    #expect(dates.reads == 1 && zones.reads == 1)
+    let sent = try #require(await ring.clockSent)
     guard case .acknowledgedAndLogged(let event) = result.clockSet else {
         Issue.record("clock-set not acknowledged and logged")
         return
     }
-    let expected = ClockSetEvent(
-        ringID: id, instant: HistoryTransfer.truncatedToMilliseconds(date), timeZoneIdentifier: zoneID,
-        utcOffsetSeconds: offset)
-    #expect(event == expected)
-    #expect(try await store.clockSets(ringID: id).last == expected)
-    #expect(HistoryTransfer.millisecondsSince1970(event.instant) == Int64((seconds * 1000).rounded(.down)))
+    #expect(event.instant == HistoryTransfer.truncatedToMilliseconds(sent.date))
+    #expect(event.timeZoneIdentifier == sent.zone.identifier)
+    #expect(event.utcOffsetSeconds == sent.zone.secondsFromGMT(for: sent.date))
+    #expect(event.timeZoneIdentifier == "America/New_York" && event.utcOffsetSeconds == -14_400)
 }
 
 // MARK: Interval
@@ -357,22 +414,16 @@ func loggedClockSetIsExactlyWhatWasSent(_ seconds: Double, _ zoneID: String, _ o
     let (store, id) = try await makeStore()
     let ring = FakeRing(store: store, ringID: id, interval: .fail(MonitoringSettingError.unsupported))
     let result = await syncer(ring, store, id).run()
-    guard case .refused(.tenMinutes, .unsupported) = result.monitoringInterval else {
-        Issue.record("interval not refused")
-        return
-    }
+    #expect(result.monitoringInterval == .refused(.tenMinutes, .unsupported))
     #expect(!result.isComplete)
     #expect(allIngested(result))
 }
 
 @Test(.timeLimit(.minutes(1))) func intervalFailingInTransportIsUnknown() async throws {
     let (store, id) = try await makeStore()
-    let ring = FakeRing(store: store, ringID: id, interval: .fail(RingError.timeout("synthetic")))
+    let ring = FakeRing(store: store, ringID: id, interval: .fail(syntheticTimeout))
     let result = await syncer(ring, store, id).run()
-    guard case .unknown(.tenMinutes, let error) = result.monitoringInterval, case RingError.timeout = error else {
-        Issue.record("interval not unknown")
-        return
-    }
+    #expect(result.monitoringInterval == .unknown(.tenMinutes, error: .ring(.timeout("synthetic"))))
     #expect(!result.isComplete)
 }
 
@@ -381,10 +432,7 @@ func loggedClockSetIsExactlyWhatWasSent(_ seconds: Double, _ zoneID: String, _ o
     let ring = FakeRing(store: store, ringID: id)
     let result = await syncer(ring, store, id, interval: nil).run()
     #expect(await ring.log == Array(completeLog.dropLast()))
-    guard case .notRequested = result.monitoringInterval else {
-        Issue.record("interval not reported as not requested")
-        return
-    }
+    #expect(result.monitoringInterval == .notRequested)
     #expect(result.isComplete)
 }
 
@@ -399,20 +447,10 @@ func loggedClockSetIsExactlyWhatWasSent(_ seconds: Double, _ zoneID: String, _ o
 
     #expect(await ring.log == Array(completeLog.prefix(6)))
     #expect(isStored(result.fetches[.sleep]))
-    for kind in [HistoryKind.heartRate, .combined] {
-        guard case .notAttempted(.budgetExhausted) = result.fetches[kind] else {
-            Issue.record("\(kind.name) was attempted")
-            continue
-        }
-    }
-    guard case .skipped(.historyIncomplete) = result.clockSet else {
-        Issue.record("clock-set not skipped")
-        return
-    }
-    guard case .skipped(.tenMinutes, .clockNotAcknowledged) = result.monitoringInterval else {
-        Issue.record("interval not skipped")
-        return
-    }
+    #expect(result.fetches[.heartRate] == .notAttempted(.budgetExhausted))
+    #expect(result.fetches[.combined] == .notAttempted(.budgetExhausted))
+    #expect(result.clockSet == .skipped(.historyIncomplete))
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .clockNotAcknowledged))
     #expect(allIngested(result))
     #expect(try await typedRowCounts(store, id) == [2, 1, 0, 0])
 }
@@ -424,14 +462,8 @@ func loggedClockSetIsExactlyWhatWasSent(_ seconds: Double, _ zoneID: String, _ o
     let result = await syncer(ring, store, id, budget: .seconds(10), monotonic: clock).run()
 
     #expect(await ring.log == Array(completeLog.prefix(12)))
-    guard case .skipped(.budgetExhausted) = result.clockSet else {
-        Issue.record("clock-set not skipped for the budget")
-        return
-    }
-    guard case .skipped(.tenMinutes, .budgetExhausted) = result.monitoringInterval else {
-        Issue.record("interval not skipped for the budget")
-        return
-    }
+    #expect(result.clockSet == .skipped(.budgetExhausted))
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .budgetExhausted))
     #expect(try await store.clockSets(ringID: id).count == 1)
     #expect(allIngested(result))
     #expect(!result.isComplete)
@@ -445,10 +477,7 @@ func loggedClockSetIsExactlyWhatWasSent(_ seconds: Double, _ zoneID: String, _ o
 
     #expect(await ring.log == Array(completeLog.dropLast()))
     #expect(result.clockSet.wasAcknowledged)
-    guard case .skipped(.tenMinutes, .budgetExhausted) = result.monitoringInterval else {
-        Issue.record("interval not skipped for the budget")
-        return
-    }
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .budgetExhausted))
     #expect(allIngested(result))
     #expect(!result.isComplete)
 }
@@ -460,12 +489,12 @@ func loggedClockSetIsExactlyWhatWasSent(_ seconds: Double, _ zoneID: String, _ o
     try failInserts(into: "sleep_session", store)
     let result = await syncer(FakeRing(store: store, ringID: id), store, id).run()
 
-    guard case .failed = result.ingestions[.sleep] else {
-        Issue.record("sleep ingestion did not fail")
+    guard case .failed(.database) = result.ingestions[.sleep] else {
+        Issue.record("sleep ingestion did not fail with a database error")
         return
     }
     for kind in HistoryKind.allCases where kind != .sleep {
-        #expect(isIngested(result.ingestions[kind]), "\(kind.name)")
+        #expect(result.ingestions[kind].succeeded, "\(kind.name)")
     }
     #expect(try await typedRowCounts(store, id) == [2, 0, 2, 1])
     // The ring steps all completed; only ingestion failed.

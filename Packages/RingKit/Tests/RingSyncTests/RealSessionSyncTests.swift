@@ -22,11 +22,28 @@ private final class ScriptedLink: RingLink, @unchecked Sendable {
     private var lastReaderID = 0
     let writeTimeout: TimeInterval = 0.5
 
-    init(history: [HistoryKind: [UInt8]]) { self.history = history }
+    /// Command types the "ring" takes but never answers.
+    private let silent: Set<UInt16>
+
+    init(history: [HistoryKind: [UInt8]], silent: Set<UInt16> = []) {
+        self.history = history
+        self.silent = silent
+    }
 
     var sent: [Frame] { lock.withLock { sentFrames } }
 
+    /// Whether a frame of `type` was written within `seconds` (polled; ends on cancellation too).
+    func waitUntilSent(_ type: UInt16, within seconds: Double = 10) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(seconds)
+        while ContinuousClock.now < deadline, !Task.isCancelled {
+            if sent.contains(where: { $0.type == type }) { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return sent.contains { $0.type == type }
+    }
+
     private func replies(to frame: Frame) -> [Frame] {
+        if silent.contains(frame.type) { return [] }
         if frame.group == Command.healthGroup, let kind = HistoryKind(rawValue: frame.key) {
             let data = history[kind] ?? []
             guard !data.isEmpty else {
@@ -130,4 +147,36 @@ private final class ScriptedLink: RingLink, @unchecked Sendable {
     #expect(try await store.clockSets(ringID: id).last == expected)
     #expect(try await store.observations(ringID: id).observations.count == 4)
     #expect(try await typedRowCounts(store, id) == [2, 1, 2, 0])
+}
+
+/// The realistic stop: the ring takes the clock-set (the frame is written) and then drops out of
+/// range before replying, and the owner of the link calls `stop()`. The ring may have applied it,
+/// so it must be logged, as unknown, and the interval skipped.
+@Test(.timeLimit(.minutes(1))) func stopAfterTheClockSetWasWrittenIsLoggedAsUnknown() async throws {
+    let (store, id) = try await makeStore()
+    let link = ScriptedLink(history: syntheticHistory, silent: [0x0100])
+    // A long conversation timeout, so only the stop can end the wait for the reply.
+    let session = RingSession(link: link, replyTimeout: 0.5, conversationTimeout: 30)
+    await session.start()
+    let syncDate = Date(timeIntervalSince1970: 1_814_529_600.25)
+    let syncZone = try #require(TimeZone(identifier: "America/New_York"))
+    let sync = Task {
+        await RingSyncer(
+            ring: session, store: store, ringID: id, monitoringInterval: .fiveMinutes, budget: .seconds(60),
+            clock: { syncDate }, timeZone: { syncZone }
+        ).run()
+    }
+    let written = await link.waitUntilSent(0x0100)
+    await session.stop()
+    let result = await sync.value
+    #expect(written)
+
+    let expected = ClockSetEvent(
+        ringID: id, instant: HistoryTransfer.truncatedToMilliseconds(syncDate),
+        timeZoneIdentifier: "America/New_York", utcOffsetSeconds: -14_400)
+    #expect(result.clockSet == .unknownAndLogged(expected, error: .ring(.stopped)))
+    #expect(try await store.clockSets(ringID: id).last == expected)
+    #expect(result.monitoringInterval == .skipped(.fiveMinutes, .clockNotAcknowledged))
+    #expect(!link.sent.contains { $0.type == 0x010C })
+    #expect(!result.isComplete)
 }

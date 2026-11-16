@@ -35,7 +35,11 @@ let package = Package(
         // monitoring interval, ingest. No Bluetooth import, no UI, no network.
         .target(
             name: "RingSync",
-            dependencies: ["RingProtocol", "RingTransport", "RingStore"]
+            dependencies: [
+                "RingProtocol", "RingTransport", "RingStore",
+                // Only to reduce GRDB's DatabaseError to its result codes (SyncError).
+                .product(name: "GRDB", package: "GRDB.swift"),
+            ]
         ),
         // macOS command-line tool for probing a ring and capturing raw data.
         .executableTarget(

@@ -3,50 +3,76 @@ import RingProtocol
 import RingStore
 import RingTransport
 
-/// Runs one sync against a ring that is already connected and whose session is started:
+/// Runs one sync with a ring, in two phases.
 ///
+/// **Ring phase** (`syncRing()`), against a ring that is already connected and whose session is
+/// started:
 /// 1. Fetch and store each history kind in `fetchOrder` (activity, sleep, heart rate, combined),
 ///    storing each transfer through `RingStore.insert` as the session's `persist` step, so it is
 ///    durable before the ring is told it was received. An empty transfer is logged with `insert`
 ///    afterwards, so the fetch log shows the buffer was empty at this sync. A kind that fails is
 ///    recorded and the next kind is still fetched, except that `RingError.stopped` or
-///    `RingError.notConnected` ends the fetching: the remaining kinds are not attempted.
+///    `RingError.notConnected` ends the fetching: the remaining kinds are not attempted. (So the
+///    sync relies on a dead link's `send` throwing `notConnected`; a link-level "closed" signal is
+///    a follow-up.)
 /// 2. Only if every kind was stored or found empty: set the clock, with one reading of the clock
-///    and zone used for both the command and the log entry. A clock-set the ring acknowledged, or
-///    whose outcome is unknown (a timeout or other transport error after the command may have been
-///    written), is logged with `recordClockSet`; one the ring definitely did not apply (an error
-///    reply, `RingError.stopped`, a refusal) is not.
+///    and one fixed copy of the zone used for the command and the log entry alike. A clock-set the
+///    ring acknowledged, or whose outcome is unknown, is logged with `recordClockSet`; one the ring
+///    certainly did not apply is not (see `definitelyNotApplied`).
 /// 3. Only if the ring acknowledged the clock-set, and an interval was supplied: send the
 ///    monitoring interval. The clock goes first because readings align to the ring's clock.
-/// 4. Always: ingest every history kind, each on its own, whatever happened before.
+///
+/// **Derive phase** (`ingestAll()`): ingest every history kind, each on its own. It needs only the
+/// store, so the caller can disconnect from the ring first; ingestion's time grows with history
+/// and is outside the budget. `run()` runs both phases one after the other, whatever the ring
+/// phase did.
 ///
 /// Nothing is retried (a late reply to a timed-out request can be accepted by a retry of the same
 /// request), the session is never stopped or restarted (one session per connection is the
 /// caller's business), and the sync neither connects nor disconnects.
 ///
-/// **Budget.** There is no task cancellation in the transport yet, so the budget is checked
+/// **Callers must not run two syncs of one ring at once.** The clock-set relies on every kind
+/// having been stored just before it; an overlapping run breaks that reasoning (and the ring
+/// carries one conversation at a time anyway).
+///
+/// **Unknown clock-set outcomes.** Every `RingError` except an error reply and the refusals made
+/// before writing (`rejected`, `refusedDestructive`, `refusedUploadGroup`, `busy`) is taken to
+/// mean the command may have reached the ring, and the clock-set is logged. Some of those errors
+/// are in fact raised before anything is written (the session's deadline check before the write,
+/// its wait for event acknowledgements, a `stop()` before the write), and the session cannot tell
+/// the sync which; those log a clock-set that never happened. Telling them apart needs the session
+/// to report whether the command was written (a follow-up). Logging is the safer error: a
+/// `stop()` after the write, the realistic case of a ring that took the clock-set and then went
+/// out of range, would otherwise leave a clock-set out of the log.
+///
+/// **Budget.** There is no task cancellation in the transport yet (#52), so the budget is checked
 /// between steps only: before each fetch, before the clock-set and before the interval. Once it
-/// has run out the remaining ring steps are skipped (`SyncSkipReason.budgetExhausted`); ingestion
-/// still runs and is not covered by the budget. A step that starts just before the budget runs
-/// out can overrun it by one conversation timeout (`RingSession.conversationTimeout`) plus the
-/// session's own overrun past a conversation deadline (about three write backstops for a request,
-/// and four after the end of `persist` for a history acknowledgement; a write backstop is the
-/// link's `writeTimeout` plus `replyTimeout`), plus the time `persist` takes, which is unbounded.
-/// Ingestion's own time comes on top. The budget is measured on the injected monotonic clock
-/// (`ContinuousClock` by default, which advances while the device sleeps).
+/// has run out the remaining ring steps are skipped (`SyncSkipReason.budgetExhausted`). A step that
+/// starts just before the budget runs out can overrun it by one conversation timeout
+/// (`RingSession.conversationTimeout`) plus the session's own overrun past a conversation deadline
+/// (about three write backstops for a request, and four after the end of `persist` for a history
+/// acknowledgement; a write backstop is the link's `writeTimeout` plus `replyTimeout`), plus the
+/// time `persist` takes, which is unbounded. The derive phase is not covered by the budget. The
+/// budget is measured on the injected monotonic clock (`ContinuousClock` by default, which advances
+/// while the device sleeps).
+///
+/// **Cancellation** of the calling task is not handled (#52): store calls then throw
+/// `CancellationError`, which is reported as `SyncError.cancelled` like any other failure.
+///
+/// Specific to the YCBT family, like `SyncableRing` and `fetchOrder`; it will sit behind the
+/// planned ring abstraction when a second family arrives.
 ///
 /// Tested against scripted fakes only (a fake ring, and a real `RingSession` over a fake link);
 /// never run against a ring.
 public struct RingSyncer: Sendable {
-    /// The order the history kinds are fetched in.
+    /// The order the history kinds are fetched in (and results are listed in). YCBT-specific.
     public static let fetchOrder: [HistoryKind] = [.activity, .sleep, .heartRate, .combined]
 
-    public let ring: any SyncableRing
-    public let store: RingStore
-    public let ringID: UUID
-    /// Sent after an acknowledged clock-set; `nil` means do not send one.
-    public let monitoringInterval: MonitoringInterval?
-    public let budget: Duration
+    private let ring: any SyncableRing
+    private let store: RingStore
+    private let ringID: UUID
+    private let monitoringInterval: MonitoringInterval?
+    private let budget: Duration
     private let clock: @Sendable () -> Date
     private let timeZone: @Sendable () -> TimeZone
     private let monotonicNow: @Sendable () -> ContinuousClock.Instant
@@ -57,8 +83,10 @@ public struct RingSyncer: Sendable {
     ///   - ringID: the ring's id in `store`.
     ///   - monitoringInterval: the interval to send, or `nil` to send none.
     ///   - budget: how long the ring steps may start for (see the type's documentation).
-    ///   - clock: read once, for the clock-set.
-    ///   - timeZone: read once, together with `clock`.
+    ///   - clock: read once per clock-set.
+    ///   - timeZone: read once per clock-set, together with `clock`. A fixed copy of the zone it
+    ///     returns (by identifier) is used for the command, the offset and the logged identifier, so
+    ///     an auto-updating zone that changes meanwhile cannot make them disagree.
     ///   - monotonicNow: the clock the budget is measured on.
     public init(
         ring: any SyncableRing,
@@ -80,46 +108,57 @@ public struct RingSyncer: Sendable {
         self.monotonicNow = monotonicNow
     }
 
-    /// Runs the sync once. Never throws: every failure is in the result.
+    /// Runs both phases: `syncRing()`, then `ingestAll()`. Never throws: every failure is in the result.
     public func run() async -> SyncResult {
-        let deadline = monotonicNow() + budget
-        func budgetLeft() -> Bool { monotonicNow() < deadline }
+        let ringPhase = await syncRing()
+        return SyncResult(ringPhase: ringPhase, ingestions: await ingestAll())
+    }
 
+    /// The ring phase: fetch and store every kind, set the clock, send the interval. The budget
+    /// starts when this is called. Never throws.
+    public func syncRing() async -> RingPhaseResult {
+        let deadline = monotonicNow() + budget
+        let budgetLeft = { monotonicNow() < deadline }
         let fetches = await fetchAll(budgetLeft: budgetLeft)
         let clockSet = await setClock(after: fetches, budgetLeft: budgetLeft)
         let interval = await sendInterval(after: clockSet, budgetLeft: budgetLeft)
-        var ingestions: [HistoryKind: IngestionOutcome] = [:]
-        for kind in HistoryKind.allCases {
+        return RingPhaseResult(fetches: fetches, clockSet: clockSet, monitoringInterval: interval)
+    }
+
+    /// The derive phase: ingest every kind, each on its own, so one failure does not stop the
+    /// others. Needs only the store. Never throws.
+    public func ingestAll() async -> PerKind<IngestionOutcome> {
+        let store = self.store
+        let ringID = self.ringID
+        return await PerKind { kind in
             do {
-                ingestions[kind] = .ingested(try await store.ingest(ringID: ringID, kind: kind))
+                return .ingested(try await store.ingest(ringID: ringID, kind: kind))
             } catch {
-                ingestions[kind] = .failed(error)
+                return .failed(SyncError(error))
             }
         }
-        return SyncResult(fetches: fetches, clockSet: clockSet, monitoringInterval: interval, ingestions: ingestions)
     }
 
     // MARK: Steps
 
-    private func fetchAll(budgetLeft: () -> Bool) async -> [HistoryKind: FetchOutcome] {
-        var outcomes: [HistoryKind: FetchOutcome] = [:]
+    private func fetchAll(budgetLeft: () -> Bool) async -> PerKind<FetchOutcome> {
         var stopReason: SyncSkipReason?
+        var outcomes: [HistoryKind: FetchOutcome] = [:]
         for kind in Self.fetchOrder {
             if stopReason == nil, !budgetLeft() { stopReason = .budgetExhausted }
             if let stopReason {
                 outcomes[kind] = .notAttempted(stopReason)
                 continue
             }
-            let outcome = await fetch(kind)
+            let (outcome, raw) = await fetch(kind)
             outcomes[kind] = outcome
-            if case .failed(_, let error) = outcome, Self.endsSession(error) {
-                stopReason = .sessionUnavailable
-            }
+            if let raw, Self.endsSession(raw) { stopReason = .sessionUnavailable }
         }
-        return outcomes
+        return await PerKind { outcomes[$0]! }
     }
 
-    private func fetch(_ kind: HistoryKind) async -> FetchOutcome {
+    /// The outcome, and the raw error if the fetch itself threw (for deciding whether to go on).
+    private func fetch(_ kind: HistoryKind) async -> (FetchOutcome, (any Error)?) {
         let persisted = PersistRecord()
         let store = self.store
         let ringID = self.ringID
@@ -140,48 +179,52 @@ public struct RingSyncer: Sendable {
             case .failed: .store
             case .stored: .acknowledgement
             }
-            return .failed(stage: stage, error: error)
+            return (.failed(stage: stage, error: SyncError(error)), error)
         }
         if case .stored(let outcome) = await persisted.state {
-            return transfer.data.isEmpty ? .empty : .stored(outcome, byteCount: transfer.data.count)
+            return (transfer.data.isEmpty ? .empty : .stored(outcome, byteCount: transfer.data.count), nil)
         }
-        // The session does not call `persist` for an empty transfer; log it here so the fetch log
-        // records that the buffer was empty at this sync. (A conformer that skipped `persist` for
-        // data would have it stored here too, though only after acknowledging it.)
-        let outcome: InsertOutcome
+        // `persist` was not called. For an empty transfer that is the session's normal behaviour;
+        // log it here so the fetch log records that the buffer was empty at this sync. For data it
+        // is a contract violation: store it anyway, but report the kind as failed, since it was not
+        // stored before the ring was told it was received.
         do {
-            outcome = try await store.insert(transfer, ringID: ringID)
+            try await store.insert(transfer, ringID: ringID)
         } catch {
-            return .failed(stage: .store, error: error)
+            let stage: FetchFailureStage = transfer.data.isEmpty ? .store : .notPersistedBeforeAcknowledgement
+            return (.failed(stage: stage, error: SyncError(error)), nil)
         }
-        return transfer.data.isEmpty ? .empty : .stored(outcome, byteCount: transfer.data.count)
+        if transfer.data.isEmpty { return (.empty, nil) }
+        return (.failed(stage: .notPersistedBeforeAcknowledgement, error: .persistNotCalled), nil)
     }
 
-    private func setClock(after fetches: [HistoryKind: FetchOutcome], budgetLeft: () -> Bool) async -> ClockSetOutcome {
-        guard Self.fetchOrder.allSatisfy({ fetches[$0]?.isFetched == true }) else { return .skipped(.historyIncomplete) }
+    private func setClock(after fetches: PerKind<FetchOutcome>, budgetLeft: () -> Bool) async -> ClockSetOutcome {
+        guard fetches.values.allSatisfy(\.isFetched) else { return .skipped(.historyIncomplete) }
         guard budgetLeft() else { return .skipped(.budgetExhausted) }
-        // One reading for both the command and the log entry: reading twice could log a different
-        // offset from the one sent at a daylight-saving boundary.
+        // One reading of each, and a fixed copy of the zone: reading twice, or an auto-updating
+        // zone changing in between, could log a different offset from the one sent at a
+        // daylight-saving boundary.
         let date = clock()
-        let zone = timeZone()
+        let given = timeZone()
+        let zone = TimeZone(identifier: given.identifier) ?? given
         let event = ClockSetEvent(
             ringID: ringID,
             instant: HistoryTransfer.truncatedToMilliseconds(date),
             timeZoneIdentifier: zone.identifier,
             utcOffsetSeconds: zone.secondsFromGMT(for: date))
-        let sendError: (any Error)?
+        let sendError: SyncError?
         do {
             try await ring.setTime(date, timeZone: zone)
             sendError = nil
         } catch {
-            if Self.definitelyNotApplied(error) { return .notApplied(error: error) }
-            sendError = error
+            if Self.definitelyNotApplied(error) { return .notApplied(error: SyncError(error)) }
+            sendError = SyncError(error)
         }
         do {
             try await store.recordClockSet(event)
         } catch {
-            if let sendError { return .unknownAndNotLogged(event, error: sendError, logError: error) }
-            return .acknowledgedButNotLogged(event, logError: error)
+            if let sendError { return .unknownAndNotLogged(event, error: sendError, logError: SyncError(error)) }
+            return .acknowledgedButNotLogged(event, logError: SyncError(error))
         }
         if let sendError { return .unknownAndLogged(event, error: sendError) }
         return .acknowledgedAndLogged(event)
@@ -198,30 +241,40 @@ public struct RingSyncer: Sendable {
         } catch let refusal as MonitoringSettingError {
             return .refused(interval, refusal)
         } catch {
-            return .unknown(interval, error: error)
+            return .unknown(interval, error: SyncError(error))
         }
     }
 
     // MARK: Error classes
 
+    // Both switches name every `RingError` case, so a new case forces a decision; the default
+    // covers only errors that are not `RingError`.
+
     /// The session cannot carry another conversation, so later fetches would fail the same way.
     static func endsSession(_ error: any Error) -> Bool {
-        switch error as? RingError {
-        case .stopped, .notConnected: true
-        default: false
+        guard let error = error as? RingError else { return false }
+        switch error {
+        case .stopped, .notConnected:
+            return true
+        case .bluetoothUnavailable, .notFound, .unknownIdentifier, .connectionFailed, .missingService,
+             .timeout, .rejected, .checksumMismatch, .refusedDestructive, .busy, .tooManyFrames,
+             .refusedUploadGroup:
+            return false
         }
     }
 
-    /// The ring definitely did not apply the clock-set: it answered with an error, or the session
-    /// refused before writing. Every other error leaves the outcome unknown.
-    ///
-    /// `RingError.stopped` is counted here, as #51 specifies, but the session also throws it when
-    /// `stop()` comes after the command was written (while the reply is awaited). The ring may then
-    /// have applied a clock-set that is not logged. Unresolved: the session does not say which.
+    /// The ring certainly did not apply the clock-set: it answered with an error reply, or the
+    /// command was refused before anything could be written. Everything else leaves the outcome
+    /// unknown, including `stopped` (a `stop()` can come after the write) and errors that are not
+    /// `RingError`.
     static func definitelyNotApplied(_ error: any Error) -> Bool {
-        switch error as? RingError {
-        case .rejected, .stopped, .refusedDestructive, .refusedUploadGroup: true
-        default: false
+        guard let error = error as? RingError else { return false }
+        switch error {
+        case .rejected, .refusedDestructive, .refusedUploadGroup, .busy:
+            return true
+        case .bluetoothUnavailable, .notFound, .unknownIdentifier, .connectionFailed, .missingService,
+             .notConnected, .timeout, .checksumMismatch, .stopped, .tooManyFrames:
+            return false
         }
     }
 }
