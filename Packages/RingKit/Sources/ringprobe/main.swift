@@ -5,7 +5,14 @@ import RingTransport
 let usage = """
 ringprobe: talk to a YCBT smart ring from a Mac.
 
-  ringprobe scan [seconds]              list nearby Bluetooth devices
+  ringprobe scan [seconds]              list nearby Bluetooth devices. Prints no identifiers or
+                                        names unless --show; rows are labelled candidate ring,
+                                        matches --name, or other device
+  ringprobe scan [seconds] --save-id <file>
+                                        save the identifier of the one candidate ring to <file>
+                                        (owner-only, replacing it) without printing it. Refuses a
+                                        file inside a git work tree that git does not ignore.
+                                        Suggested: ../../captures/ring-id (git-ignored)
   ringprobe info                        firmware and battery (device id and today's activity with --show)
   ringprobe settime                     set the ring's clock to this Mac's local time
   ringprobe history <kind>|all --save <dir>
@@ -16,12 +23,20 @@ ringprobe: talk to a YCBT smart ring from a Mac.
   ringprobe raw <GGKK[:payloadhex]>...  send frames and print the replies
 
 Options:
-  --name <text>     match rings whose advertised name contains <text> (default "R99")
+  --name <text>     match rings whose advertised name contains <text> (default "R99"). Given
+                    with scan, it also labels matching devices and narrows --save-id.
+  --id-file <file>  connect to the device whose identifier is in <file> (as written by scan
+                    --save-id) instead of matching by name, without scanning if this Mac already
+                    knows it. Identifiers are specific to this Mac but identify the ring here:
+                    never paste them into issues, pull requests, commits or the repository.
+                    There is no --id: an identifier on the command line would stay in shell
+                    history. Cannot be combined with --name, and scan does not use it.
   --save <dir>      required with history: write each transfer (raw bytes as hex,
                     plus header, fetch time and time zone) to <dir>/<kind>-<timestamp>.json.
                     The bytes are written before the transfer is acknowledged to the ring.
-  --show            print health data (decoded records, reply payloads). Off by default so that
-                    health data stays out of terminal logs and agent transcripts.
+  --show            print health data (decoded records, reply payloads) and, with scan, the
+                    names and identifiers of every device heard. Off by default so that health
+                    data and device identities stay out of terminal logs and agent transcripts.
   --allow-unknown   with raw: send frame types that are not on the known read-only list.
                     Their effects are unknown and may include resetting the ring.
   --trace           print every raw packet (implies health data is printed)
@@ -35,42 +50,50 @@ func fail(_ message: String) -> Never {
     exit(1)
 }
 
-var arguments = Array(CommandLine.arguments.dropFirst())
+/// Parses the command line before anything else happens; every rule is in `parseArguments`.
+let options: ProbeOptions = {
+    switch parseArguments(Array(CommandLine.arguments.dropFirst())) {
+    case .success(let options): return options
+    case .failure(let error): fail(error.message)
+    }
+}()
 
-@MainActor func option(_ flag: String) -> String? {
-    guard let i = arguments.firstIndex(of: flag) else { return nil }
-    guard i + 1 < arguments.count else { fail("\(flag) needs a value") }
-    let value = arguments[i + 1]
-    arguments.removeSubrange(i...(i + 1))
-    return value
+let trace = options.trace
+let show = options.show
+let allowUnknown = options.allowUnknown
+let nameOption = options.name
+let ringName = nameOption ?? "R99"
+let saveDirectory = options.saveDirectory
+
+guard let command = options.command else { print(usage); exit(0) }
+
+// Resolved before anything connects (and before `monitor` asks for confirmation), so a bad
+// --id-file fails first. The file is read through `readRingIdentifier`, which never echoes it.
+let ringID: UUID? = {
+    guard let path = options.idFile else { return nil }
+    switch readRingIdentifier(path: path) {
+    case .success(let id): return id
+    case .failure(let error): fail(error.message)
+    }
+}()
+// Refuse a save target that could be committed now, not after an 8 second scan.
+// The one resolved path is used for the check and for the write.
+let saveIDTarget: String? = options.saveID.map { path in
+    switch checkSaveTarget(path: path) {
+    case .success(let resolved): return resolved
+    case .failure(let refusal): fail(refusal.message)
+    }
 }
-
-@MainActor func flag(_ name: String) -> Bool {
-    guard arguments.contains(name) else { return false }
-    arguments.removeAll { $0 == name }
-    return true
-}
-
-let trace = flag("--trace")
-let show = flag("--show")
-let allowUnknown = flag("--allow-unknown")
-
-let ringName = option("--name") ?? "R99"
-let saveDirectory = option("--save")
-
-guard let command = arguments.first else { print(usage); exit(0) }
-let operands = Array(arguments.dropFirst())
+let operands = options.operands
 @Sendable func traceBytes(_ outgoing: Bool, _ bytes: [UInt8]) {
     print("  \(outgoing ? ">>" : "<<") \(bytes.map { String(format: "%02x", $0) }.joined())")
 }
 
-// `monitor` changes a ring setting, so it validates and gets the owner's confirmation here, before
-// the connection object (and so any Bluetooth manager) exists. A refused run never touches Bluetooth.
-let monitorInterval: MonitoringInterval? = command == "monitor" ? confirmMonitor() : nil
-func confirmMonitor() -> MonitoringInterval {
-    guard operands.count == 1, let interval = MonitoringInterval(argument: operands[0]) else {
-        fail("monitor needs one of: 1, 5, 10, 15, 20, 30, 60, off")
-    }
+// `monitor` changes a ring setting. Its argument was validated by the parser; the owner's
+// confirmation is asked here, before the connection object (and so any Bluetooth manager) exists,
+// and after --id-file was read. A refused run never touches Bluetooth.
+let monitorInterval: MonitoringInterval? = options.monitorInterval.map(confirmMonitor)
+func confirmMonitor(_ interval: MonitoringInterval) -> MonitoringInterval {
     // A piped answer must not be able to confirm.
     guard isatty(STDIN_FILENO) != 0 else { fail("monitor needs a terminal on standard input to ask for confirmation; nothing sent") }
     print("About to send 010C \(Hex.encode(Command.setMonitoringInterval(interval).payload)): \(interval.summary).")
@@ -84,7 +107,11 @@ func confirmMonitor() -> MonitoringInterval {
 let connection = trace ? RingConnection(onRawBytes: traceBytes) : RingConnection()
 
 func connect() async throws -> RingSession {
-    try await connection.connect { ($0.name ?? "").localizedCaseInsensitiveContains(ringName) }
+    if let ringID {
+        try await connection.connect(identifier: ringID)
+    } else {
+        try await connection.connect { ($0.name ?? "").localizedCaseInsensitiveContains(ringName) }
+    }
     return RingSession(link: connection)
 }
 
@@ -145,13 +172,30 @@ do {
     switch command {
     case "scan":
         let seconds = operands.first.flatMap(Double.init) ?? 8
-        for device in try await connection.scan(for: seconds) {
-            let services = device.serviceUUIDs.isEmpty ? "" : "  services: \(device.serviceUUIDs.joined(separator: ","))"
-            // Advertised names identify devices (the ring's suffix, other people's gadgets), so
-            // they are shown only with --show.
-            let matches = (device.name ?? "").localizedCaseInsensitiveContains(ringName)
-            let label = show ? (device.name ?? "(unnamed)") : (matches ? "\(ringName) (matching ring)" : "(other device)")
-            print("\(String(format: "%4d", device.rssi)) dBm  \(label)\(services)")
+        let devices = try await connection.scan(for: seconds)
+        if let saveIDFile = saveIDTarget {
+            // The same rule as `discoverRings`, so scan and the app cannot disagree on what a ring is.
+            let chosen = devices.filter { device in
+                guard scanMatch(for: device, nameOption: nameOption) == .candidate else { return false }
+                return nameOption.map { (device.name ?? "").localizedCaseInsensitiveContains($0) } ?? true
+            }
+            guard chosen.count == 1 else {
+                fail(chosen.isEmpty
+                     ? "no candidate ring was heard; nothing saved"
+                     : "\(chosen.count) candidate rings were heard; narrow with --name; nothing saved")
+            }
+            do {
+                try PrivateFile.createDirectory(URL(fileURLWithPath: saveIDFile).deletingLastPathComponent().path)
+                try PrivateFile.replace(Data((chosen[0].identifier.uuidString + "\n").utf8), at: saveIDFile)
+            } catch {
+                fail("cannot save the identifier: \(error)")
+            }
+            // Only that it was saved: the identifier stays out of the terminal.
+            print("saved the ring's identifier to \(options.saveID ?? saveIDFile)")
+            break
+        }
+        for device in devices {
+            print(scanRow(device, show: show, match: scanMatch(for: device, nameOption: nameOption)))
         }
 
     case "info":
@@ -170,7 +214,7 @@ do {
         print("ring clock set to \(timestamps.string(from: Date())) local time")
 
     case "monitor":
-        // Validated and confirmed before the connection existed (see `monitorInterval`).
+        // Validated by the parser and confirmed before the connection existed (see `monitorInterval`).
         guard let interval = monitorInterval else { fail("internal error: monitor was not confirmed") }
         let session = try await connect()
         do {
