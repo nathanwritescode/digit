@@ -49,6 +49,7 @@ struct SyncView {
     @discardableResult
     func rebuild(ringID: UUID) throws -> [HistoryKind: IngestionResult] { try store.rebuild(ringID: ringID) }
     func heartRateReadings(ringID: UUID) throws -> [StoredRow<HeartRateReading>] { try store.heartRateReadings(ringID: ringID) }
+    func vitalsReadings(ringID: UUID) throws -> [StoredRow<VitalsReading>] { try store.vitalsReadings(ringID: ringID) }
     func activityIntervals(ringID: UUID) throws -> [StoredRow<ActivityInterval>] { try store.activityIntervals(ringID: ringID) }
     func sleepSessions(ringID: UUID) throws -> [StoredRow<SleepSessionRecord>] { try store.sleepSessions(ringID: ringID) }
 }
@@ -135,7 +136,11 @@ struct AsyncTwinTests {
             #expect(try sync(store).ingest(ringID: f.ring.id, kind: .heartRate).unchanged == 2)
             try await store.ingest(ringID: f.ring.id, kind: .activity)
             try await store.ingest(ringID: f.ring.id, kind: .sleep)
-            await #expect(throws: RingStoreError.self) { try await store.ingest(ringID: f.ring.id, kind: .combined) }
+            // Combined records are ingestible (vitals). `notIngestible` is reserved for a future kind.
+            try f.fetch(.combined, combinedBytes(hr0, spo2: 97, resp: 16, hrv: 37, cvrr: 30), at: t0.addingTimeInterval(1000))
+            let combined = try await store.ingest(ringID: f.ring.id, kind: .combined)
+            #expect(combined.inserted == 1)
+            #expect(try sync(store).ingest(ringID: f.ring.id, kind: .combined).unchanged == 1)
             await #expect(throws: RingStoreError.self) { try await store.ingest(ringID: UUID(), kind: .heartRate) }
 
             let hr = try await store.heartRateReadings(ringID: f.ring.id)
@@ -144,11 +149,17 @@ struct AsyncTwinTests {
             #expect(hr.map(\.value) == (try sync(store).heartRateReadings(ringID: f.ring.id)).map(\.value))
             #expect(act.map(\.value) == (try sync(store).activityIntervals(ringID: f.ring.id)).map(\.value))
             #expect(sleep.map(\.value) == (try sync(store).sleepSessions(ringID: f.ring.id)).map(\.value))
+            let vitals = try await store.vitalsReadings(ringID: f.ring.id)
+            #expect(vitals.map(\.value) == (try sync(store).vitalsReadings(ringID: f.ring.id)).map(\.value))
+            #expect(vitals.map(\.value.spo2) == [97])
             #expect(hr.count == 2 && act.count == 1 && sleep.count == 1)
 
             let rebuilt = try await store.rebuild(ringID: f.ring.id)
             #expect(rebuilt == (try sync(store).rebuild(ringID: f.ring.id)))
             #expect(try await store.heartRateReadings(ringID: f.ring.id).map(\.value) == hr.map(\.value))
+            #expect(try await store.vitalsReadings(ringID: f.ring.id).map(\.value) == vitals.map(\.value))
+            #expect(Set(rebuilt.keys) == [.heartRate, .activity, .sleep, .combined])
+            #expect(rebuilt[.combined]?.inserted == 1)
             await #expect(throws: RingStoreError.self) { try await store.rebuild(ringID: UUID()) }
         }
     }
@@ -215,5 +226,60 @@ struct PeripheralIdentifierTests {
         let p = UUID()
         try store.setPeripheralIdentifier(p, forRing: id)
         #expect(try store.ring(id: id)?.peripheralIdentifier == p)
+    }
+
+    /// A database exactly as `v4-vitals` left it (rings, a transfer, typed rows of every kind and a
+    /// vitals row) gets the column from `v5-ring-peripheral` and keeps everything.
+    @Test func migratingFromV4KeepsEverything() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("ring.sqlite")
+        let id = UUID(), other = UUID()
+        let data = hrBytes(1000, bpm: 60)
+        try makeV4Database(at: url, id: id, other: other, data: data)
+        let store = try RingStore(url: url)
+        #expect(try await store.rings().count == 2)
+        #expect(try await store.rings().allSatisfy { $0.peripheralIdentifier == nil })
+        #expect(try await store.transfers(ringID: id).transfers.map(\.transfer.data) == [data])
+        #expect(try await store.heartRateReadings(ringID: id).map(\.value.bpm) == [61])
+        #expect(try await store.activityIntervals(ringID: id).map(\.value.steps) == [10])
+        #expect(try await store.sleepSessions(ringID: id).count == 1)
+        #expect(try await store.vitalsReadings(ringID: id).map(\.value.spo2) == [97])
+        let p = UUID()
+        try await store.setPeripheralIdentifier(p, forRing: id)
+        #expect(try await store.ring(id: id)?.peripheralIdentifier == p)
+        #expect(try await store.vitalsReadings(ringID: id).count == 1)
+    }
+}
+
+/// A database exactly as `v4-vitals` left it. Synchronous on purpose (GRDB's `write` is async-overloaded).
+private func makeV4Database(at url: URL, id: UUID, other: UUID, data: [UInt8]) throws {
+    let hash = RingStore.contentHash(ringID: id, kind: .heartRate, data: data)
+    let queue = try DatabaseQueue(path: url.path)
+    try RingStore.migrator.migrate(queue, upTo: "v4-vitals")
+    try queue.write { db in
+        #expect(try !db.columns(in: "ring").contains { $0.name == "peripheral_identifier" })
+        #expect(try db.tableExists("vitals_reading"))
+        for ring in [id, other] {
+            try db.execute(
+                sql: "INSERT INTO ring (id, protocol_family, model, firmware, first_seen_at) VALUES (?, 'ycbt', 'M', '1', 1000)",
+                arguments: [ring.uuidString])
+        }
+        try db.execute(
+            sql: RingStore.insertTransferSQL,
+            arguments: [id.uuidString, "heartRate", Data([1]), Data(data), 5000, "UTC", Data(hash)])
+        try db.execute(
+            sql: "INSERT INTO heart_rate_reading (ring_id, time, bpm, mode, utc_offset_seconds, ring_local_seconds, time_source) VALUES (?, 5000, 61, 0, 0, 0, 'resolved')",
+            arguments: [id.uuidString])
+        try db.execute(
+            sql: "INSERT INTO activity_interval (ring_id, start, \"end\", steps, distance_meters, kilocalories, utc_offset_seconds, ring_local_seconds, time_source) VALUES (?, 0, 1800000, 10, 0, 0, 0, 0, 'resolved')",
+            arguments: [id.uuidString])
+        try db.execute(
+            sql: "INSERT INTO sleep_session (ring_id, start, \"end\", utc_offset_seconds, ring_local_seconds, time_source) VALUES (?, 0, 600000, 0, 0, 'resolved')",
+            arguments: [id.uuidString])
+        try db.execute(
+            sql: "INSERT INTO vitals_reading (ring_id, time, spo2, utc_offset_seconds, ring_local_seconds, time_source) VALUES (?, 7000, 97, 0, 0, 'resolved')",
+            arguments: [id.uuidString])
     }
 }

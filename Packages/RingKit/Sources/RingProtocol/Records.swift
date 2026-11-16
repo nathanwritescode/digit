@@ -232,9 +232,11 @@ public struct SleepSession: Equatable, Sendable {
 /// heart-rate records). The Swift decoder matched an independent decode of a real R99 capture.
 ///
 /// Only values the ring can measure are exposed. A zero in a measured field means "no reading"
-/// and becomes nil (an on-demand HRV record is reported to have every other field zero; that comes
-/// from another ring of the same family and is unverified on the R99). SpO2 outside 1...100 is
-/// not a reading and also becomes nil.
+/// and becomes nil (an on-demand HRV record is reported to have every other field zero; that
+/// comes from another ring of the same family and is unverified on the R99). SpO2 outside
+/// 1...100 is not a reading and also becomes nil. So does 255 in SpO2, respiration, HRV and
+/// CVRR, as a filler value; 255 has never been seen in a real record, so that is unverified on
+/// hardware.
 ///
 /// Deliberately not decoded into properties. They stay only in the module-internal `raw`, so
 /// later layers cannot read them; the stored `HistoryTransfer` is the source of truth:
@@ -251,6 +253,9 @@ public struct CombinedRecord: Equatable, Sendable {
     /// Cross-check only: activity records are the source of steps. A zero here does not mean a
     /// measured zero.
     public var steps: Int
+    /// Not filtered like the other values: 0 and 255 are NOT turned into nil here. Heart rate from
+    /// the combined record is not stored; the heart-rate record is the source, so do not treat
+    /// this as a reading without checking it.
     public var heartRate: Int?
     public var spo2: Int?
     public var respirationRate: Int?
@@ -261,18 +266,29 @@ public struct CombinedRecord: Equatable, Sendable {
 
     /// Decodes consecutive records; a trailing partial record is ignored.
     public static func decode(_ b: [UInt8], timeZone: TimeZone) -> [CombinedRecord] {
+        decodeLocated(b, timeZone: timeZone).map(\.record)
+    }
+
+    /// Whole records with their byte ranges; a trailing partial record is ignored.
+    ///
+    /// SpO2, respiration, HRV and CVRR treat 0 and 255 as absent (255 is a filler byte, not a
+    /// reading; assumed from the same convention as heart rate, not seen in a combined record).
+    /// Heart rate treats only 0 as absent, as before.
+    public static func decodeLocated(_ b: [UInt8], timeZone: TimeZone) -> [Located<CombinedRecord>] {
         func reading(_ value: UInt8) -> Int? { value == 0 ? nil : Int(value) }
+        func vital(_ value: UInt8) -> Int? { value == 0 || value == 255 ? nil : Int(value) }
         return stride(from: 0, to: b.count - (size - 1), by: size).map { i in
-            let spo2 = reading(b[i + 9])
-            return CombinedRecord(
-                time: RingTime.date(fromRingSeconds: b.u32(i), timeZone: timeZone),
-                steps: Int(b.u16(i + 4)),
-                heartRate: reading(b[i + 6]),
-                spo2: spo2.flatMap { (1...100).contains($0) ? $0 : nil },
-                respirationRate: reading(b[i + 10]),
-                hrv: reading(b[i + 11]),
-                cvrr: reading(b[i + 12]),
-                raw: Array(b[i..<i + size]))
+            Located(
+                record: CombinedRecord(
+                    time: RingTime.date(fromRingSeconds: b.u32(i), timeZone: timeZone),
+                    steps: Int(b.u16(i + 4)),
+                    heartRate: reading(b[i + 6]),
+                    spo2: vital(b[i + 9]).flatMap { (1...100).contains($0) ? $0 : nil },
+                    respirationRate: vital(b[i + 10]),
+                    hrv: vital(b[i + 11]),
+                    cvrr: vital(b[i + 12]),
+                    raw: Array(b[i..<i + size])),
+                offset: i, length: size)
         }
     }
 }
