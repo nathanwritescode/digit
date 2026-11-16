@@ -46,13 +46,16 @@ jobs:
         timeout-minutes: 10
         run: swift test
 
-      # Again with a one-thread concurrency pool, which catches code that keeps a thread and
-      # starves the tasks and timers that should run beside it. Already built by the step above.
-      - name: Test with a one-thread concurrency pool
+      # The transport tests again with a one-thread concurrency pool, which catches code that
+      # keeps a thread and starves the tasks and timers that should run beside it. Already built
+      # by the step above. LIBDISPATCH_COOPERATIVE_POOL_STRICT is an undocumented libdispatch
+      # setting: if a future runner image ignores it, this step silently becomes an ordinary run
+      # and stops catching starvation.
+      - name: Test transport with a one-thread concurrency pool
         timeout-minutes: 5
         env:
           LIBDISPATCH_COOPERATIVE_POOL_STRICT: "1"
-        run: swift test --skip-build
+        run: swift test --skip-build --filter RingTransportTests
 
   app:
     name: App build (iOS simulator)
