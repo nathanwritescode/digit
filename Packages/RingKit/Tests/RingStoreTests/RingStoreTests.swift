@@ -206,10 +206,14 @@ struct RingStoreTests {
         }
     }
 
-    @Test func ringTableHoldsNoDeviceIdentifiers() throws {
-        // Only an app-generated id plus family, model, firmware and first-seen time.
+    @Test func ringTableHoldsOnlyAllowedColumns() throws {
+        // An app-generated id plus family, model, firmware and first-seen time, and (v5) the one
+        // device identifier: the per-phone CoreBluetooth UUID, which the only writer
+        // (`setPeripheralIdentifier`) takes as a `UUID`, so no Bluetooth address, name suffix or
+        // serial number can be stored through the API. Any further column needs the same
+        // justification.
         let columns = try RingStore().writer.read { db in try db.columns(in: "ring").map(\.name) }
-        #expect(columns == ["id", "protocol_family", "model", "firmware", "first_seen_at"])
+        #expect(columns == ["id", "protocol_family", "model", "firmware", "first_seen_at", "peripheral_identifier"])
     }
 
     @Test func storageCodesForKindsAreFrozen() {
@@ -296,12 +300,12 @@ struct RingStoreTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = try RingStore(url: dir.appendingPathComponent("ring.sqlite"))
-        let ring = try store.registerRing(protocolFamily: "ycbt")
+        let ring = try blocking(store).registerRing(protocolFamily: "ycbt")
         let ringID = ring.id
         let outcomes = try await withThrowingTaskGroup(of: InsertOutcome.self) { group in
             for i in 0..<32 {
                 group.addTask {
-                    try store.insert(transfer(at: t0.addingTimeInterval(Double(i))), ringID: ringID)
+                    try blocking(store).insert(transfer(at: t0.addingTimeInterval(Double(i))), ringID: ringID)
                 }
             }
             var all: [InsertOutcome] = []
@@ -311,6 +315,6 @@ struct RingStoreTests {
         let inserted = outcomes.filter { if case .inserted = $0 { true } else { false } }
         #expect(inserted.count == 1)
         #expect(outcomes.count == 32)
-        #expect(try store.transfers(ringID: ringID).transfers.count == 1)
+        #expect(try blocking(store).transfers(ringID: ringID).transfers.count == 1)
     }
 }

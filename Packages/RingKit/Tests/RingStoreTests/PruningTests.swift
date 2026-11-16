@@ -277,16 +277,16 @@ struct PruningTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = try RingStore(url: dir.appendingPathComponent("ring.sqlite"))
-        let ringID = try store.registerRing(protocolFamily: "ycbt").id
+        let ringID = try blocking(store).registerRing(protocolFamily: "ycbt").id
         try await withThrowingTaskGroup(of: Void.self) { group in
             for n in 1...40 {
                 group.addTask {
-                    try store.insert(transfer(data: Array(repeating: 7, count: n)), ringID: ringID)
+                    try blocking(store).insert(transfer(data: Array(repeating: 7, count: n)), ringID: ringID)
                 }
             }
             try await group.waitForAll()
         }
-        let data = try store.transfers(ringID: ringID).transfers.map(\.transfer.data)
+        let data = try blocking(store).transfers(ringID: ringID).transfers.map(\.transfer.data)
         #expect(data == [Array(repeating: 7, count: 40)])
     }
 

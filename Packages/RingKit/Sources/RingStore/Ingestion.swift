@@ -17,6 +17,12 @@ extension RingStore {
 
     // MARK: Public API
 
+    /// Blocking form of `ingest(ringID:kind:)` (internal, for tests).
+    @discardableResult
+    func ingest(ringID: UUID, kind: HistoryKind) throws -> IngestionResult {
+        try writer.write { db in try Self.checkedIngest(db, ringID: ringID, kind: kind) }
+    }
+
     /// Makes the typed table for `kind` match what the stored transfers say, in one write
     /// transaction (a failure leaves the tables as they were). Combined records yield
     /// `VitalsReading`s only.
@@ -27,48 +33,92 @@ extension RingStore {
     /// is not a session record, or at a session cut short, so what follows it is counted and not
     /// ingested), and a record the sanity checks refuse is counted and skipped, in
     /// `IngestionResult.rejectedImplausible` or `rejectedFuture`.
+    ///
+    /// Throws `unknownRing(ringID)` if the ring is not stored. The whole run is one write
+    /// transaction, which holds the database's write lock until it finishes (a known follow-up).
+    /// A `CancellationError` rolls it back: cancelling discards the work so far and leaves the
+    /// typed table as it was. (`notIngestible` is reserved for a future kind and cannot be thrown
+    /// today.)
     @discardableResult
-    public func ingest(ringID: UUID, kind: HistoryKind) throws -> IngestionResult {
+    public func ingest(ringID: UUID, kind: HistoryKind) async throws -> IngestionResult {
+        try await writer.write { db in try Self.checkedIngest(db, ringID: ringID, kind: kind) }
+    }
+
+    private static func checkedIngest(_ db: Database, ringID: UUID, kind: HistoryKind) throws -> IngestionResult {
         guard Self.ingestibleKinds.contains(kind) else { throw RingStoreError.notIngestible(kind) }
-        return try writer.write { db in
-            try Self.requireRing(db, ringID)
-            return try Self.ingest(db, ringID: ringID, kind: kind)
-        }
+        try Self.requireRing(db, ringID)
+        return try Self.ingest(db, ringID: ringID, kind: kind)
     }
 
-    /// Deletes the ring's typed rows for every ingestible kind and derives them again from
-    /// the stored transfers, in one transaction. The result is what `ingest` would converge on.
+    /// Blocking form of `rebuild(ringID:)` (internal, for tests).
     @discardableResult
-    public func rebuild(ringID: UUID) throws -> [HistoryKind: IngestionResult] {
-        try writer.write { db in
-            try Self.requireRing(db, ringID)
-            var results: [HistoryKind: IngestionResult] = [:]
-            for kind in Self.ingestibleKinds {
-                try Self.deleteTypedRows(db, ringID: ringID, kind: kind)
-                results[kind] = try Self.ingest(db, ringID: ringID, kind: kind)
-            }
-            return results
-        }
+    func rebuild(ringID: UUID) throws -> [HistoryKind: IngestionResult] {
+        try writer.write { db in try Self.rebuild(db, ringID: ringID) }
     }
 
-    /// All heart-rate readings for a ring, oldest first.
-    public func heartRateReadings(ringID: UUID) throws -> [StoredRow<HeartRateReading>] {
+    /// Deletes the ring's typed rows for every ingestible kind (activity, sleep, heart rate and
+    /// vitals) and derives them again from the stored transfers, in one transaction. The result is
+    /// what `ingest` would converge on, keyed by kind. Throws `unknownRing(ringID)` if the ring is
+    /// not stored. The whole run is one write transaction, holding the write lock until it
+    /// finishes. A `CancellationError` rolls it back: cancelling discards the work so far, including
+    /// the deletions, so the typed tables stay as they were.
+    @discardableResult
+    public func rebuild(ringID: UUID) async throws -> [HistoryKind: IngestionResult] {
+        try await writer.write { db in try Self.rebuild(db, ringID: ringID) }
+    }
+
+    private static func rebuild(_ db: Database, ringID: UUID) throws -> [HistoryKind: IngestionResult] {
+        try Self.requireRing(db, ringID)
+        var results: [HistoryKind: IngestionResult] = [:]
+        for kind in Self.ingestibleKinds {
+            try Self.deleteTypedRows(db, ringID: ringID, kind: kind)
+            results[kind] = try Self.ingest(db, ringID: ringID, kind: kind)
+        }
+        return results
+    }
+
+    /// Blocking form of `heartRateReadings(ringID:)` (internal, for tests).
+    func heartRateReadings(ringID: UUID) throws -> [StoredRow<HeartRateReading>] {
         try writer.read { db in try Self.heartRateRows(db, ringID: ringID) }
     }
 
-    /// All vitals readings (SpO2, respiration, HRV, CVRR) for a ring, oldest first.
-    public func vitalsReadings(ringID: UUID) throws -> [StoredRow<VitalsReading>] {
+    /// All heart-rate readings for a ring, oldest first; empty if none or the ring is not stored.
+    /// Can throw `CancellationError`.
+    public func heartRateReadings(ringID: UUID) async throws -> [StoredRow<HeartRateReading>] {
+        try await writer.read { db in try Self.heartRateRows(db, ringID: ringID) }
+    }
+
+    /// Blocking form of `vitalsReadings(ringID:)` (internal, for tests).
+    func vitalsReadings(ringID: UUID) throws -> [StoredRow<VitalsReading>] {
         try writer.read { db in try Self.vitalsRows(db, ringID: ringID) }
     }
 
-    /// All activity intervals for a ring, oldest first.
-    public func activityIntervals(ringID: UUID) throws -> [StoredRow<ActivityInterval>] {
+    /// All vitals readings (SpO2, respiration, HRV, CVRR) for a ring, oldest first; empty if none or
+    /// the ring is not stored. An absent value is `nil`, never zero. Can throw `CancellationError`.
+    public func vitalsReadings(ringID: UUID) async throws -> [StoredRow<VitalsReading>] {
+        try await writer.read { db in try Self.vitalsRows(db, ringID: ringID) }
+    }
+
+    /// Blocking form of `activityIntervals(ringID:)` (internal, for tests).
+    func activityIntervals(ringID: UUID) throws -> [StoredRow<ActivityInterval>] {
         try writer.read { db in try Self.activityRows(db, ringID: ringID) }
     }
 
-    /// All sleep sessions for a ring, oldest first, with their stages in order.
-    public func sleepSessions(ringID: UUID) throws -> [StoredRow<SleepSessionRecord>] {
+    /// All activity intervals for a ring, oldest first; empty if none or the ring is not stored.
+    /// Can throw `CancellationError`.
+    public func activityIntervals(ringID: UUID) async throws -> [StoredRow<ActivityInterval>] {
+        try await writer.read { db in try Self.activityRows(db, ringID: ringID) }
+    }
+
+    /// Blocking form of `sleepSessions(ringID:)` (internal, for tests).
+    func sleepSessions(ringID: UUID) throws -> [StoredRow<SleepSessionRecord>] {
         try writer.read { db in try Self.sleepRows(db, ringID: ringID) }
+    }
+
+    /// All sleep sessions for a ring, oldest first, with their stages in order; empty if none or the
+    /// ring is not stored. Can throw `CancellationError`.
+    public func sleepSessions(ringID: UUID) async throws -> [StoredRow<SleepSessionRecord>] {
+        try await writer.read { db in try Self.sleepRows(db, ringID: ringID) }
     }
 
     // MARK: Derivation
