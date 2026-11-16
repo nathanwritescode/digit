@@ -51,6 +51,14 @@ public struct DiscoveredDevice: Sendable {
     public let rssi: Int
     public let serviceUUIDs: [String]
 
+    /// Public so tools and tests can build devices without CoreBluetooth.
+    public init(identifier: UUID, name: String?, rssi: Int, serviceUUIDs: [String]) {
+        self.identifier = identifier
+        self.name = name
+        self.rssi = rssi
+        self.serviceUUIDs = serviceUUIDs
+    }
+
     /// Whether this device looks like a supported ring: it advertises the YCBT service, or its
     /// advertised name starts with one of `namePrefixes` (ignoring case). The rule
     /// `discoverRings` applies; public so tools can label a full scan the same way.
@@ -95,6 +103,11 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     // finishes, so names and identifiers of unrelated devices are not kept beyond the call.
     private var scanResults: [UUID: DiscoveredDevice] = [:]
     private var scanMatch: (@Sendable (DiscoveredDevice) -> Bool)?
+    // The waiter of the running listing scan and which scan it belongs to. Resumed only by
+    // `finishListing`, which takes it out first, so its timer and a Bluetooth state change cannot
+    // both resume it.
+    private var listingWaiter: CheckedContinuation<[DiscoveredDevice], Error>?
+    private var listingGeneration = 0
     // Who started the running scan, if any. CoreBluetooth has one scan per central manager, so
     // only the owner may stop it; `RingDiscovery.scanConflict` refuses a second user. Released by
     // the listing scan's timer, or for a connect by `finishConnect` (every exit of an attempt
@@ -160,10 +173,12 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     /// Lists every device heard advertising during `duration`, strongest signal first.
     ///
     /// Throws `RingError.busy` while a connect attempt is pending or another scan is running:
-    /// they would share CoreBluetooth's one scan, and one could stop the other's.
+    /// they would share CoreBluetooth's one scan, and one could stop the other's. Throws
+    /// `RingError.bluetoothUnavailable` if Bluetooth leaves powered-on before `duration` has
+    /// passed, since what was heard is then incomplete. Unverified on hardware.
     public func scan(for duration: TimeInterval) async throws -> [DiscoveredDevice] {
         try await waitUntilPoweredOn()
-        return try await withCheckedThrowingContinuation { continuation in
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[DiscoveredDevice], Error>) in
             queue.async {
                 if let conflict = RingDiscovery.scanConflict(owner: self.scanOwner, connectPending: self.connectWaiter != nil) {
                     continuation.resume(throwing: RingError.busy(conflict))
@@ -176,16 +191,18 @@ public final class RingConnection: NSObject, @unchecked Sendable {
                 self.scanOwner = .listing
                 self.scanResults = [:]
                 self.scanMatch = nil
+                self.listingWaiter = continuation
+                self.listingGeneration += 1
+                let generation = self.listingGeneration
                 self.central.scanForPeripherals(withServices: nil)
-                // The only exit of a listing scan, so it always releases ownership. Nothing else
-                // can take the scan over meanwhile (connects and scans are refused), so this timer
-                // always belongs to the running listing scan.
+                // Normally the exit of a listing scan; the other is Bluetooth leaving powered-on
+                // (`centralManagerDidUpdateState`). Both go through `finishListing`, which resumes
+                // the waiter once and releases ownership. Nothing can start another listing scan
+                // meanwhile (connects and scans are refused while one runs), but the other exit
+                // can end this one early, so the timer checks it still belongs to this scan.
                 self.queue.asyncAfter(deadline: .now() + duration) {
-                    self.stopScanIfPoweredOn()
-                    self.scanOwner = nil
-                    let devices = RingDiscovery.ordered(Array(self.scanResults.values))
-                    self.scanResults = [:]
-                    continuation.resume(returning: devices)
+                    guard self.listingWaiter != nil, self.listingGeneration == generation else { return }
+                    self.finishListing(.success(RingDiscovery.ordered(Array(self.scanResults.values))))
                 }
             }
         }
@@ -204,7 +221,8 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     /// The scan is unfiltered and the results are filtered afterwards. A scan filtered by service
     /// reports only peripherals advertising one of the listed services, and it is not yet known
     /// whether the R99 puts the YCBT service in its advertisement, so a filtered scan could miss it.
-    /// Throws `RingError.busy` like `scan(for:)`.
+    /// Throws `RingError.busy` like `scan(for:)`, and `RingError.bluetoothUnavailable` if Bluetooth
+    /// leaves powered-on before the scan ends (a partial list is never returned).
     /// Unverified on hardware: the R99's advertisement has not been checked for the service.
     public func discoverRings(for duration: TimeInterval, namePrefixes: [String]) async throws -> [DiscoveredDevice] {
         let devices = try await scan(for: duration)
@@ -403,6 +421,21 @@ public final class RingConnection: NSObject, @unchecked Sendable {
         central.scanForPeripherals(withServices: nil)
     }
 
+    /// The one way a listing scan ends: resumes its waiter (once; a later call finds nothing) and
+    /// releases the scan and what it heard. Unverified on hardware: the early exit, a Bluetooth
+    /// state change in the middle of a scan, has only been reasoned about, not run.
+    private func finishListing(_ result: Result<[DiscoveredDevice], Error>) {
+        guard let waiter = listingWaiter else { return }
+        listingWaiter = nil
+        if scanOwner == .listing {
+            stopScanIfPoweredOn()
+            scanOwner = nil
+        }
+        scanMatch = nil
+        scanResults = [:]
+        waiter.resume(with: result)
+    }
+
     /// `stopScan` while Bluetooth is not powered on is API misuse (and the scan is gone anyway).
     private func stopScanIfPoweredOn() {
         if central.state == .poweredOn { central.stopScan() }
@@ -515,11 +548,13 @@ extension RingConnection: CBCentralManagerDelegate {
             // Bluetooth went away (or is resetting) under a connection: no disconnect callback is
             // guaranteed to follow, so reset here and fail whatever is pending. Every link is gone,
             // including a cancelled one still being waited out, and the scan with them. A listing
-            // scan keeps its ownership until its timer returns what it heard.
+            // scan is cut short, so what it heard is incomplete and it fails instead of returning
+            // a partial or empty list.
             resetLink(cancelling: false)
             cancelledLink = nil
             let error = RingError.bluetoothUnavailable(central.state)
             failPending(connect: error, write: error)
+            finishListing(.failure(error))
         }
         guard central.state != .unknown, central.state != .resetting else { return }
         let waiters = stateWaiters.values
@@ -538,9 +573,11 @@ extension RingConnection: CBCentralManagerDelegate {
         // A report queued before the scan stopped must not refill the results.
         guard scanOwner != nil else { return }
         let services = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        // An advertised name that is empty or only whitespace counts as missing, like a missing one.
+        let advertised = RingDiscovery.usableName(advertisementData[CBAdvertisementDataLocalNameKey] as? String)
         let sighting = DiscoveredDevice(
             identifier: peripheral.identifier,
-            name: (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? peripheral.name,
+            name: advertised ?? RingDiscovery.usableName(peripheral.name),
             rssi: RSSI.intValue,
             serviceUUIDs: services.map(\.uuidString))
         // A later report of the same device may leave out what an earlier one carried.

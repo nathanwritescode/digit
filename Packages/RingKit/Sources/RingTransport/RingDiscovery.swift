@@ -22,6 +22,13 @@ enum RingDiscovery {
         }
     }
 
+    /// The name if it holds anything but whitespace, otherwise nil: CoreBluetooth can report an
+    /// empty name, which must count as no name. The name is returned unchanged, not trimmed.
+    static func usableName(_ name: String?) -> String? {
+        guard let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return name
+    }
+
     /// Strongest signal first. A device whose RSSI was unavailable sorts after every measured one;
     /// ties are broken by identifier so the order is stable from one call to the next.
     static func ordered(_ devices: [DiscoveredDevice]) -> [DiscoveredDevice] {
@@ -98,7 +105,8 @@ extension DiscoveredDevice {
     /// advertisement and again with its scan response, and a later report need not repeat what
     /// an earlier one carried. Keeping only the latest could lose the name or the service that
     /// makes it a candidate, so the name and services accumulate and the latest measured signal
-    /// strength wins. An empty name counts as no name, so it never replaces a real one.
+    /// strength wins. An empty or whitespace-only name counts as no name, so it never replaces a real
+    /// one, and two such names merge to nil.
     func merging(_ later: DiscoveredDevice) -> DiscoveredDevice {
         var services = serviceUUIDs
         for uuid in later.serviceUUIDs where !services.contains(where: { $0.caseInsensitiveCompare(uuid) == .orderedSame }) {
@@ -106,7 +114,7 @@ extension DiscoveredDevice {
         }
         return DiscoveredDevice(
             identifier: identifier,
-            name: later.name.flatMap { $0.isEmpty ? nil : $0 } ?? name,
+            name: RingDiscovery.usableName(later.name) ?? RingDiscovery.usableName(name),
             rssi: later.rssi == RingDiscovery.unavailableRSSI ? rssi : later.rssi,
             serviceUUIDs: services)
     }

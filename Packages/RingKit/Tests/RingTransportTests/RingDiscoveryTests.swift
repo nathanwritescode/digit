@@ -91,23 +91,48 @@ private func device(_ n: Int, name: String? = nil, rssi: Int = -60, services: [S
     #expect(merged.serviceUUIDs == [ycbt])
 }
 
-@Test func emptyLaterNameDoesNotReplaceEarlierName() {
-    #expect(device(1, name: "R99 0000").merging(device(1, name: "")).name == "R99 0000")
-    #expect(device(1, name: "").merging(device(1, name: "R99 0000")).name == "R99 0000")
+@Test func mergedNameTable() {
+    // Every pairing of nil, empty, whitespace-only and real names, earlier then later: the later
+    // real name wins, else the earlier real name, else nil. Whitespace never counts as a name.
+    let absent: [String?] = [nil, "", " ", "\t\n"]
+    for earlier in absent + ["Old"] {
+        for later in absent + ["New"] {
+            let expected: String? = later == "New" ? "New" : earlier == "Old" ? "Old" : nil
+            let merged = device(1, name: earlier).merging(device(1, name: later)).name
+            #expect(merged == expected, "earlier \(String(describing: earlier)), later \(String(describing: later))")
+        }
+    }
 }
 
-@Test func publicCandidateRuleMatchesDiscovery() {
-    // `ringprobe scan` labels devices with the public rule; it must agree with `discoverRings`.
-    let devices = [device(1, name: "R99 0000"), device(2, services: [ycbt]), device(3, name: "Headphones"), device(4)]
-    let viaPublic = devices.filter { $0.isCandidateRing(namePrefixes: YCBT.knownNamePrefixes) }.map(\.identifier)
-    let viaDiscovery = RingDiscovery.candidates(in: devices, service: ycbt, namePrefixes: YCBT.knownNamePrefixes)
-        .map(\.identifier)
-    #expect(Set(viaPublic) == Set(viaDiscovery))
-    #expect(viaPublic == [devices[0].identifier, devices[1].identifier])
+@Test func usableNameTreatsWhitespaceAsMissing() {
+    #expect(RingDiscovery.usableName(nil) == nil)
+    #expect(RingDiscovery.usableName("") == nil)
+    #expect(RingDiscovery.usableName("  \n") == nil)
+    #expect(RingDiscovery.usableName(" R99 0000 ") == " R99 0000 ")
 }
 
-@Test func knownNamePrefixesAcceptTheRing() {
-    #expect(device(1, name: "R99 0000").isCandidateRing(namePrefixes: YCBT.knownNamePrefixes))
+@Test func candidateRuleHasExplicitExpectations() {
+    // Listed by hand so the test does not lean on the function under test: (device, is a candidate).
+    let cases: [(DiscoveredDevice, Bool)] = [
+        (device(1, name: "R99 0000"), true),
+        (device(2, name: "r99 0000"), true),
+        (device(3, services: [ycbt]), true),               // the YCBT service and no name
+        (device(4, name: "Headphones", services: [ycbt]), true),
+        (device(5, name: "Headphones", services: ["180D"]), false), // only an unrelated service
+        (device(6, services: ["180D"]), false),
+        (device(7, name: "Not R99"), false),
+        (device(8, name: " "), false),
+        (device(9), false),
+    ]
+    for (candidate, expected) in cases {
+        #expect(candidate.isCandidateRing(namePrefixes: YCBT.knownNamePrefixes) == expected, "device \(candidate.identifier)")
+    }
+    let found = RingDiscovery.candidates(in: cases.map(\.0), service: ycbt, namePrefixes: YCBT.knownNamePrefixes)
+    #expect(Set(found.map(\.identifier)) == Set(cases.filter(\.1).map(\.0.identifier)))
+}
+
+@Test func knownNamePrefixesAreExactlyTheR99() {
+    #expect(YCBT.knownNamePrefixes == ["R99"])
 }
 
 // Scan ownership: one CoreBluetooth scan, so nothing starts while a connect is pending or a
