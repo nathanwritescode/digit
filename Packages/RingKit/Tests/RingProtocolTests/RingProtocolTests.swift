@@ -87,10 +87,26 @@ private let utc = TimeZone(identifier: "UTC")!
     #expect(!Frame(group: 0x01, key: 0x00, payload: [0x00]).isErrorReply)
 }
 
+// Layout confirmed against an R99; the bytes here are synthetic.
 @Test func decodesDeviceInfo() {
     let info = DeviceInfo(payload: hex("a30020020064000000000000000000000000000000000000"))
     #expect(info?.deviceID == 0x00A3)
     #expect(info?.firmwareVersion == "2.32")
+    #expect(info?.batteryState == 0)
+    #expect(info?.batteryPercent == 100)
+}
+
+// Synthetic bytes: on the charger (state 2) at 58%, the two fields the R99 was seen to change.
+@Test func decodesBatteryStateAndPercentage() {
+    let info = DeviceInfo(payload: hex("a3002002023a000000000000000000000000000000000000"))
+    #expect(info?.batteryState == 2)
+    #expect(info?.batteryPercent == 58)
+}
+
+// Synthetic bytes. A percentage byte above 100 has never been seen on a ring; this pins the
+// decoder's defensive clamp, not a known meaning.
+@Test func clampsABatteryByteAbove100() {
+    let info = DeviceInfo(payload: hex("a300200200ff000000000000000000000000000000000000"))
     #expect(info?.batteryPercent == 100)
 }
 
