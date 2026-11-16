@@ -97,7 +97,7 @@ func confirmMonitor(_ interval: MonitoringInterval) -> MonitoringInterval {
     // A piped answer must not be able to confirm.
     guard isatty(STDIN_FILENO) != 0 else { fail("monitor needs a terminal on standard input to ask for confirmation; nothing sent") }
     print("About to send 010C \(Hex.encode(Command.setMonitoringInterval(interval).payload)): \(interval.summary).")
-    if !interval.isVerifiedOnHardware { print("This value has not been tried on a ring before.") }
+    if !interval.isSpacingObservedOnHardware { print("A ring has accepted this value once, but readings at this spacing have not been observed.") }
     print("The ring cannot report this setting back. Type yes to send it: ", terminator: "")
     fflush(stdout)
     guard MonitoringInterval.isConfirmation(readLine()) else { fail("not confirmed; nothing sent") }

@@ -21,8 +21,10 @@ extension MonitoringInterval {
         answer?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "yes"
     }
 
-    /// True for the values confirmed on hardware (R99, firmware 2.32).
-    var isVerifiedOnHardware: Bool {
+    /// True for the values whose effect was seen on hardware (R99, firmware 2.32): readings arrived
+    /// at that spacing, or stopped for `off`. The other values (15, 20, 30 and 60 minutes) were each
+    /// sent once and acknowledged, but no reading was waited for.
+    var isSpacingObservedOnHardware: Bool {
         switch self {
         case .off, .oneMinute, .fiveMinutes, .tenMinutes: true
         default: false
