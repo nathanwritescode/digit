@@ -206,11 +206,12 @@ struct RingStoreTests {
         }
     }
 
-    @Test func ringTableHoldsNoDeviceIdentifiers() throws {
-        // An app-generated id plus family, model, firmware and first-seen time, and (v4) the
-        // identifier CoreBluetooth gave this phone for the ring: a per-phone UUID, not the
-        // Bluetooth address, name suffix or serial number. Anything else added here needs the
-        // same justification.
+    @Test func ringTableHoldsOnlyAllowedColumns() throws {
+        // An app-generated id plus family, model, firmware and first-seen time, and (v5) the one
+        // device identifier: the per-phone CoreBluetooth UUID, which the only writer
+        // (`setPeripheralIdentifier`) takes as a `UUID`, so no Bluetooth address, name suffix or
+        // serial number can be stored through the API. Any further column needs the same
+        // justification.
         let columns = try RingStore().writer.read { db in try db.columns(in: "ring").map(\.name) }
         #expect(columns == ["id", "protocol_family", "model", "firmware", "first_seen_at", "peripheral_identifier"])
     }

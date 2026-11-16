@@ -10,8 +10,11 @@ import RingProtocol
 /// No health data is ever logged from here. Errors thrown by SQLite itself surface as GRDB's
 /// `DatabaseError`; the store's own failures are `RingStoreError`.
 ///
-/// **The public database API is `async` only.** Every function that touches the database is
-/// `async throws` and runs off the caller's thread. The synchronous same-name forms (`internal`,
+/// **The public database API is `async` only, except initialisation.** Every function that touches
+/// an open database is `async throws` and runs off the caller's thread. `init(url:)` (and
+/// `init()`) are synchronous: they open the file, run every migration and set file protection on
+/// the calling thread, so call them off the main actor (an async opener is a follow-up for when
+/// the app links the store, #13). The synchronous same-name forms (`internal`,
 /// used by tests through `@testable import`) block the calling thread; they are not public because
 /// a same-name synchronous overload is chosen silently in any synchronous context and in any
 /// closure without an `await`, where it would block. Each pair calls one `static` implementation,
@@ -36,6 +39,9 @@ public final class RingStore: Sendable {
     /// of the App Group container). On iOS the directory itself is given file protection
     /// `completeUntilFirstUserAuthentication`, because SQLite recreates the `-wal` and `-shm`
     /// files and only a protected directory covers the new ones.
+    ///
+    /// Synchronous: opening, migrating and setting file protection all happen on the calling
+    /// thread, so call it off the main actor.
     public init(url: URL) throws {
         try Self.prepareFile(at: url)
         let pool = try DatabasePool(path: url.path, configuration: Self.configuration())
@@ -154,6 +160,27 @@ public final class RingStore: Sendable {
         if db.changesCount == 0 { throw RingStoreError.unknownRing(id) }
     }
 
+    /// Blocking form of `ring(peripheralIdentifier:)` (internal, for tests).
+    func ring(peripheralIdentifier: UUID) throws -> StoredRing? {
+        try writer.read { db in try Self.ring(db, peripheralIdentifier: peripheralIdentifier) }
+    }
+
+    /// The stored ring that holds this CoreBluetooth identifier, or `nil` (not an error). The
+    /// match ignores letter case, like the unique index. **The sync engine must look a connected
+    /// peripheral up here before registering a new ring, and reuse the ring it finds** (#51);
+    /// registering a second ring for a ring the store already knows would store and ingest the
+    /// same records twice. Can throw `CancellationError`.
+    public func ring(peripheralIdentifier: UUID) async throws -> StoredRing? {
+        try await writer.read { db in try Self.ring(db, peripheralIdentifier: peripheralIdentifier) }
+    }
+
+    private static func ring(_ db: Database, peripheralIdentifier: UUID) throws -> StoredRing? {
+        try Row.fetchOne(
+            db, sql: "SELECT * FROM ring WHERE peripheral_identifier = ? COLLATE NOCASE",
+            arguments: [peripheralIdentifier.uuidString]
+        ).map(Self.ring)
+    }
+
     /// Blocking form of `setPeripheralIdentifier(_:forRing:)` (internal, for tests).
     func setPeripheralIdentifier(_ identifier: UUID?, forRing id: UUID) throws {
         try writer.write { db in try Self.setPeripheralIdentifier(db, identifier, forRing: id) }
@@ -163,11 +190,15 @@ public final class RingStore: Sendable {
     /// (`CBPeripheral.identifier`), so the app can reconnect without scanning; `nil` clears it. It
     /// replaces any earlier value of this ring.
     ///
-    /// **One identifier, one ring (move semantics).** A given identifier is held by at most one
-    /// ring: setting it on a ring first clears it from any other ring that holds it, in the same
-    /// transaction, and a unique index backs this up. With no serial or Bluetooth address stored,
-    /// this identifier is what links a connected peripheral to a stored ring on this phone, so a
-    /// duplicate would attribute history to the wrong ring.
+    /// **One identifier, one ring.** An identifier names one physical ring on one phone, so if
+    /// another ring already holds it, the two are almost certainly the same ring and the caller has
+    /// made a mistake (moving it would orphan that ring's history and have this one store and
+    /// ingest the same records again). The call then throws `peripheralIdentifierInUse(holder)`,
+    /// naming the holding ring by its app id (never the identifier), and changes nothing. Setting
+    /// the value this ring already holds succeeds, and `nil` always does. A unique index (case
+    /// insensitive) backs this up. **The sync engine must look a connected peripheral up with
+    /// `ring(peripheralIdentifier:)` before registering a new ring, and reuse the ring it finds**
+    /// (#51).
     ///
     /// This is a per-phone device identifier assigned by CoreBluetooth. It is not the Bluetooth
     /// address and not the ring's serial number, and it can change (for example after a
@@ -176,8 +207,8 @@ public final class RingStore: Sendable {
     /// payloads, test fixtures, issues or pull requests. This is the only place it is stored, and
     /// the column holds nothing else, never an advertised name or address.
     ///
-    /// Throws `unknownRing(id)` if no such ring is stored, in which case no row is changed. One
-    /// write transaction; a `CancellationError` rolls it back.
+    /// Throws `unknownRing(id)` first if no such ring is stored; either error leaves every row
+    /// unchanged. One write transaction; a `CancellationError` rolls it back.
     public func setPeripheralIdentifier(_ identifier: UUID?, forRing id: UUID) async throws {
         try await writer.write { db in try Self.setPeripheralIdentifier(db, identifier, forRing: id) }
     }
@@ -185,10 +216,11 @@ public final class RingStore: Sendable {
     private static func setPeripheralIdentifier(_ db: Database, _ identifier: UUID?, forRing id: UUID) throws {
         try Self.requireRing(db, id)
         if let identifier {
-            // Move, not copy: clear it from whichever other ring holds it before taking it.
-            try db.execute(
-                sql: "UPDATE ring SET peripheral_identifier = NULL WHERE peripheral_identifier = ? AND id <> ?",
+            // Case-insensitive, matching the index: a lower-case copy written outside the API counts.
+            let holder = try String.fetchOne(
+                db, sql: "SELECT id FROM ring WHERE peripheral_identifier = ? COLLATE NOCASE AND id <> ?",
                 arguments: [identifier.uuidString, id.uuidString])
+            if let holder { throw RingStoreError.peripheralIdentifierInUse(try uuid(holder)) }
         }
         try db.execute(
             sql: "UPDATE ring SET peripheral_identifier = ? WHERE id = ?",
@@ -649,11 +681,11 @@ public final class RingStore: Sendable {
         // After v4-vitals, which is the released order. GRDB tracks applied migrations by name.
         // The CoreBluetooth peripheral identifier is a per-phone device identifier and the only link
         // from a connected peripheral to a stored ring, so it is unique among rings (partial: many
-        // rings have none).
+        // rings have none) and case-insensitive, since reads accept lower case.
         migrator.registerMigration("v5-ring-peripheral") { db in
             try db.execute(sql: """
                 ALTER TABLE ring ADD COLUMN peripheral_identifier TEXT;
-                CREATE UNIQUE INDEX ring_peripheral_identifier ON ring(peripheral_identifier)
+                CREATE UNIQUE INDEX ring_peripheral_identifier ON ring(peripheral_identifier COLLATE NOCASE)
                     WHERE peripheral_identifier IS NOT NULL;
                 """)
         }

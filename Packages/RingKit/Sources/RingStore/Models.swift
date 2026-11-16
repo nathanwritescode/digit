@@ -23,7 +23,7 @@ public struct StoredRing: Equatable, Sendable {
     /// not a UUID. A per-phone device identifier assigned by CoreBluetooth: not the Bluetooth
     /// address or serial number, meaningless off this device, and it can change (for example after
     /// a network-settings reset), so a lookup miss means rescan and overwrite. Never to be exported
-    /// or sent anywhere. At most one ring holds a given value. Set with
+    /// or sent anywhere (see the list on the type). At most one ring holds a given value. Set with
     /// `RingStore.setPeripheralIdentifier(_:forRing:)`.
     public var peripheralIdentifier: UUID? = nil
 }
@@ -32,6 +32,9 @@ extension StoredRing: CustomStringConvertible, CustomDebugStringConvertible, Cus
     public var description: String { redacted }
     public var debugDescription: String { redacted }
 
+    // The fields are listed by hand: a new stored property must be added to the mirror and to
+    // `redacted`, and a test compares the mirror's labels with the stored properties. The redaction
+    // is a default guard against `print` and `dump`, not a guarantee: the property itself is public.
     public var customMirror: Mirror {
         Mirror(self, children: [
             "id": id, "protocolFamily": protocolFamily, "model": model as Any, "firmware": firmware as Any,
@@ -116,6 +119,9 @@ public struct ClockSetEvent: Equatable, Sendable {
 
 public enum RingStoreError: Error, Equatable, Sendable {
     case unknownRing(UUID)
+    /// `setPeripheralIdentifier` was given an identifier another ring holds. Carries that ring's
+    /// app id, never the identifier, so the description holds no device identifier.
+    case peripheralIdentifierInUse(UUID)
     /// The database file (or its -wal/-shm companion) could not be created or its mode set.
     case fileAccess(path: String, errno: Int32)
     /// A stored value could not be read back (for example an unknown history kind name).

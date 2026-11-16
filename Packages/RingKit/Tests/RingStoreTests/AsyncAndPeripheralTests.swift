@@ -22,6 +22,7 @@ func onEachStoreAsync(_ body: (RingStore) async throws -> Void) async throws {
 struct BlockingView {
     let store: RingStore
     func ring(id: UUID) throws -> StoredRing? { try store.ring(id: id) }
+    func ring(peripheralIdentifier: UUID) throws -> StoredRing? { try store.ring(peripheralIdentifier: peripheralIdentifier) }
     func rings() throws -> [StoredRing] { try store.rings() }
     @discardableResult
     func registerRing(protocolFamily: String, now: Date) throws -> StoredRing {
@@ -64,6 +65,49 @@ private func rawExecute(_ store: RingStore, _ sql: String, _ arguments: Statemen
 }
 
 struct AsyncTwinTests {
+    /// A `now` that is not a whole millisecond: the returned ring equals what is read back.
+    @Test func registerRingWithFractionalMillisecondReturnsWhatIsStored() async throws {
+        try await onEachStoreAsync { store in
+            let now = Date(timeIntervalSince1970: 1_700_000_000.123_456_7)
+            let ring = try await store.registerRing(protocolFamily: "ycbt", now: now)
+            #expect(ring.firstSeenAt == Date(timeIntervalSince1970: 1_700_000_000.123))
+            #expect(try await store.ring(id: ring.id) == ring)
+        }
+    }
+
+    /// Deterministic: the task is cancelled before the call, so the call throws and writes nothing.
+    @Test func callsFromACancelledTaskThrowAndWriteNothing() async throws {
+        try await onEachStoreAsync { store in
+            let ring = try await store.registerRing(protocolFamily: "ycbt")
+            let before = try await store.rings()
+            let task = Task {
+                withUnsafeCurrentTask { $0?.cancel() }
+                do {
+                    _ = try await store.registerRing(protocolFamily: "other")
+                    return false
+                } catch is CancellationError {
+                    return true
+                } catch {
+                    return false
+                }
+            }
+            #expect(await task.value)
+            let task2 = Task {
+                withUnsafeCurrentTask { $0?.cancel() }
+                do {
+                    try await store.setPeripheralIdentifier(UUID(), forRing: ring.id)
+                    return false
+                } catch is CancellationError {
+                    return true
+                } catch {
+                    return false
+                }
+            }
+            #expect(await task2.value)
+            #expect(try await store.rings() == before)
+        }
+    }
+
     @Test func ringFunctionsMatchTheirSynchronousTwins() async throws {
         try await onEachStoreAsync { store in
             let ring = try await store.registerRing(protocolFamily: "ycbt", model: "M", firmware: "1.0", now: t0)
@@ -206,6 +250,12 @@ struct AsyncTwinTests {
 }
 
 struct PeripheralIdentifierTests {
+    /// The registered migrations, in order. Applied migrations are tracked by name, so a rename
+    /// or reorder would break existing databases.
+    @Test func migrationNamesAndOrderArePinned() {
+        #expect(RingStore.migrator.migrations == ["v1", "v2", "v3", "v4-vitals", "v5-ring-peripheral"])
+    }
+
     @Test func setReplaceAndClear() async throws {
         try await onEachStoreAsync { store in
             let ring = try blocking(store).registerRing(protocolFamily: "ycbt")
@@ -226,30 +276,133 @@ struct PeripheralIdentifierTests {
         }
     }
 
-    /// One identifier, one ring: setting it on a second ring moves it.
-    @Test func settingAnIdentifierOnAnotherRingMovesIt() async throws {
+    /// One identifier, one ring: setting it on a second ring is an error naming the holder.
+    @Test func settingAnIdentifierAnotherRingHoldsThrowsAndChangesNothing() async throws {
         try await onEachStoreAsync { store in
             let a = try blocking(store).registerRing(protocolFamily: "ycbt")
             let b = try blocking(store).registerRing(protocolFamily: "ycbt")
-            let third = try blocking(store).registerRing(protocolFamily: "ycbt")
-            let x = UUID(), y = UUID()
+            let x = UUID()
             try await store.setPeripheralIdentifier(x, forRing: a.id)
-            try await store.setPeripheralIdentifier(y, forRing: third.id)
-            try await store.setPeripheralIdentifier(x, forRing: b.id)
-            #expect(try await store.ring(id: a.id)?.peripheralIdentifier == nil)
-            #expect(try await store.ring(id: b.id)?.peripheralIdentifier == x)
-            #expect(try await store.ring(id: third.id)?.peripheralIdentifier == y)
-            // Setting the value a ring already holds changes nothing.
-            try blocking(store).setPeripheralIdentifier(x, forRing: b.id)
-            #expect(try await store.ring(id: b.id)?.peripheralIdentifier == x)
-            // And back again with the blocking form.
-            try blocking(store).setPeripheralIdentifier(x, forRing: a.id)
+            let before = try await store.rings()
+            await #expect(throws: RingStoreError.peripheralIdentifierInUse(a.id)) {
+                try await store.setPeripheralIdentifier(x, forRing: b.id)
+            }
+            #expect(throws: RingStoreError.peripheralIdentifierInUse(a.id)) {
+                try blocking(store).setPeripheralIdentifier(x, forRing: b.id)
+            }
+            #expect(try await store.rings() == before)
             #expect(try await store.ring(id: a.id)?.peripheralIdentifier == x)
             #expect(try await store.ring(id: b.id)?.peripheralIdentifier == nil)
+            // The error names the app's ring id and does not carry the device identifier.
+            let text = "\(RingStoreError.peripheralIdentifierInUse(a.id))"
+            #expect(!text.contains(x.uuidString))
         }
     }
 
-    /// The unique index refuses a raw duplicate, so a bug in the move cannot leave two rings with one.
+    @Test func settingTheHeldValueOnTheSameRingSucceeds() async throws {
+        try await onEachStoreAsync { store in
+            let a = try blocking(store).registerRing(protocolFamily: "ycbt")
+            let x = UUID()
+            try await store.setPeripheralIdentifier(x, forRing: a.id)
+            try await store.setPeripheralIdentifier(x, forRing: a.id)
+            try blocking(store).setPeripheralIdentifier(x, forRing: a.id)
+            #expect(try await store.ring(id: a.id)?.peripheralIdentifier == x)
+        }
+    }
+
+    @Test func clearingFreesTheIdentifierForAnotherRing() async throws {
+        try await onEachStoreAsync { store in
+            let a = try blocking(store).registerRing(protocolFamily: "ycbt")
+            let b = try blocking(store).registerRing(protocolFamily: "ycbt")
+            let x = UUID()
+            try await store.setPeripheralIdentifier(x, forRing: a.id)
+            try await store.setPeripheralIdentifier(nil, forRing: a.id)
+            try await store.setPeripheralIdentifier(nil, forRing: b.id)  // clearing nothing is fine
+            try await store.setPeripheralIdentifier(x, forRing: b.id)
+            #expect(try await store.ring(id: a.id)?.peripheralIdentifier == nil)
+            #expect(try await store.ring(id: b.id)?.peripheralIdentifier == x)
+        }
+    }
+
+    @Test func lookupByIdentifier() async throws {
+        try await onEachStoreAsync { store in
+            let a = try blocking(store).registerRing(protocolFamily: "ycbt")
+            _ = try blocking(store).registerRing(protocolFamily: "ycbt")
+            let x = UUID()
+            #expect(try await store.ring(peripheralIdentifier: x) == nil)
+            try await store.setPeripheralIdentifier(x, forRing: a.id)
+            let found = try await store.ring(peripheralIdentifier: x)
+            #expect(found?.id == a.id && found?.peripheralIdentifier == x)
+            #expect(try blocking(store).ring(peripheralIdentifier: x) == found)
+            #expect(try await store.ring(peripheralIdentifier: UUID()) == nil)
+            try await store.setPeripheralIdentifier(nil, forRing: a.id)
+            #expect(try await store.ring(peripheralIdentifier: x) == nil)
+        }
+    }
+
+    /// Reads accept lower case, so a lower-case copy written outside the API must still count.
+    @Test func identifierMatchingIgnoresCase() async throws {
+        try await onEachStoreAsync { store in
+            let a = try blocking(store).registerRing(protocolFamily: "ycbt")
+            let b = try blocking(store).registerRing(protocolFamily: "ycbt")
+            let x = UUID()
+            try rawExecute(
+                store, "UPDATE ring SET peripheral_identifier = ? WHERE id = ?",
+                [x.uuidString.lowercased(), a.id.uuidString])
+            #expect(try await store.ring(peripheralIdentifier: x)?.id == a.id)
+            await #expect(throws: RingStoreError.peripheralIdentifierInUse(a.id)) {
+                try await store.setPeripheralIdentifier(x, forRing: b.id)
+            }
+            // Raw SQL in upper case is refused by the index too.
+            #expect(throws: DatabaseError.self) {
+                try rawExecute(
+                    store, "UPDATE ring SET peripheral_identifier = ? WHERE id = ?",
+                    [x.uuidString.uppercased(), b.id.uuidString])
+            }
+            #expect(try await store.ring(id: b.id)?.peripheralIdentifier == nil)
+            // The holder can still set its own value.
+            try await store.setPeripheralIdentifier(x, forRing: a.id)
+            #expect(try await store.ring(id: a.id)?.peripheralIdentifier == x)
+        }
+    }
+
+    /// Writes are serialised, so of many rings racing for one identifier exactly one wins.
+    @Test func concurrentSetsLeaveExactlyOneHolder() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = try RingStore(url: dir.appendingPathComponent("ring.sqlite"))
+        var ids: [UUID] = []
+        for _ in 0..<12 { ids.append(try await store.registerRing(protocolFamily: "ycbt").id) }
+        let x = UUID()
+        let results = await withTaskGroup(of: (UUID, Bool, RingStoreError?).self) { group in
+            for id in ids {
+                group.addTask {
+                    do {
+                        try await store.setPeripheralIdentifier(x, forRing: id)
+                        return (id, true, nil)
+                    } catch let error as RingStoreError {
+                        return (id, false, error)
+                    } catch {
+                        return (id, false, nil)
+                    }
+                }
+            }
+            var all: [(UUID, Bool, RingStoreError?)] = []
+            for await r in group { all.append(r) }
+            return all
+        }
+        let winners = results.filter(\.1)
+        #expect(winners.count == 1)
+        let holder = try #require(winners.first?.0)
+        for (_, ok, error) in results where !ok {
+            #expect(error == .peripheralIdentifierInUse(holder))
+        }
+        let holders = try await store.rings().filter { $0.peripheralIdentifier == x }
+        #expect(holders.map(\.id) == [holder])
+    }
+
+    /// The unique index refuses a raw duplicate, so a bug in the check cannot leave two rings with one.
     @Test func theIndexRefusesADuplicateIdentifier() throws {
         try onEachStore { store in
             let a = try store.registerRing(protocolFamily: "ycbt")
@@ -309,6 +462,16 @@ struct PeripheralIdentifierTests {
         #expect(bare.description.contains("peripheralIdentifier: none"))
         // The mirror keeps every field, with the identifier replaced.
         #expect(Mirror(reflecting: ring).children.count == 6)
+    }
+
+    /// The mirror is listed by hand, so a new stored property must not be silently missing from it.
+    /// Reflection cannot see past a custom mirror, so this pins the labels and checks the type's
+    /// size against a tuple of the same field types (a new stored property changes it).
+    @Test func mirrorListsEveryStoredProperty() {
+        let ring = StoredRing(id: UUID(), protocolFamily: "ycbt", firstSeenAt: t0)
+        let labels = Mirror(reflecting: ring).children.compactMap(\.label)
+        #expect(labels == ["id", "protocolFamily", "model", "firmware", "firstSeenAt", "peripheralIdentifier"])
+        #expect(MemoryLayout<StoredRing>.size == MemoryLayout<(UUID, String, String?, String?, Date, UUID?)>.size)
     }
 
     @Test func unknownRingThrows() async throws {
