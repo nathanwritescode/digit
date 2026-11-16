@@ -224,6 +224,7 @@ The planner starts at most one hardware-check implementer at a time, and never w
     - App Group sharing configuration (suspension notifications, a read-only opener for a widget) is needed before the app links the store (#13).
     - Once the ring's buffer is full and drops its oldest records, no transfer is a prefix of the next, so a full copy is stored on every sync; overlap-aware merging is needed once that is seen on hardware (#32).
     - Pruning assumes the ring never rewrites a record in place. Activity is now observed to list completed buckets only, and all four kinds have only ever grown at the end (see "History growth" under Data quirks); an open sleep session is the remaining unverified case. It fails safe by keeping both rows, and ingestion then keeps the later copy and counts the earlier as superseded (#32). Unpruned rows also make the prefix scan on each insert grow.
+- **Sync results:** results returned by `RingSync` never carry a raw error, only `SyncError` (case names, command types, reply and result codes), because raw store and transport errors can hold health data (GRDB statement arguments, ring frames) that reflection (`dump`, a debugger) prints.
 - **Minimum iOS version:** iOS 26.
 - **Concurrency defaults:** the app target defaults to main-actor isolation (`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`); the RingKit package does not.
 - **Bundle identifier:** `com.nathantalley.digit`.

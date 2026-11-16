@@ -133,6 +133,8 @@ actor FakeRing: SyncableRing {
     private(set) var log: [String] = []
     /// What `setTime` was given, exactly.
     private(set) var clockSent: (date: Date, zone: TimeZone)?
+    /// The clock-set frame a session would have written for that date and zone.
+    private(set) var clockFrame: Frame?
     /// Kinds whose transfer was in the store (by observation) when the fake acknowledged it.
     private(set) var storedWhenAcknowledged: [HistoryKind] = []
     /// Typed row counts seen when the interval (or, if none, the clock) was sent.
@@ -211,6 +213,8 @@ actor FakeRing: SyncableRing {
     func setTime(_ date: Date, timeZone: TimeZone) async throws {
         record("setTime")
         clockSent = (date, timeZone)
+        // Built on receipt, as `RingSession.setTime` builds the frame it writes.
+        clockFrame = Command.setTime(date, timeZone: timeZone)
         typedRowsDuringRingSteps = try await typedRowCounts(store, ringID)
         if case .fail(let error) = clock { throw error }
     }

@@ -16,6 +16,8 @@ public enum RingError: Error, CustomStringConvertible {
     case connectionFailed(String)
     case missingService
     case notConnected
+    /// What was waited for. The text must be built from constants and command types only, never
+    /// from ring or health data, because the sync keeps it in its results (`SyncError`).
     case timeout(String)
     case rejected(Frame)
     case checksumMismatch

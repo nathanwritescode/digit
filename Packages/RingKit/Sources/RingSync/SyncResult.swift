@@ -3,11 +3,21 @@ import RingProtocol
 import RingStore
 import RingTransport
 
-// What one sync did. A result holds counts (bytes per transfer, rows per ingestion), outcomes,
-// sanitised errors (`SyncError`, never a raw error), the monitoring interval, and in a clock-set
-// entry the store's own ring id, the instant and the zone identifier that were sent. It holds no
-// history bytes, no decoded reading, no `Frame` and no device identifier. This target prints and
-// logs nothing.
+// What one sync did. A result holds exactly:
+// - history kinds, outcome and skip-reason cases, and failure stages;
+// - byte counts per transfer, and the store's `InsertOutcome` (its own row ids and a prune count);
+// - `IngestionResult` counts only (rows inserted, updated, deleted and unchanged; records rejected,
+//   superseded, colliding or without vitals; unusable bytes; skipped sleep stages; rows per time
+//   source);
+// - in a clock-set entry, the store's own ring id, the instant sent (whole milliseconds), the zone
+//   identifier and the UTC offset;
+// - the monitoring interval, and `MonitoringSettingError` codes;
+// - sanitised errors (`SyncError`, never a raw error): ring error case names, the session's
+//   timeout text, command types and reply codes; store failures with the store's own ring ids, an
+//   errno, or a constant naming what could not be read; SQLite result codes; an error's type name.
+// Row ids and the store's ring ids are the app's own, not device identifiers. It holds no history
+// bytes, no decoded reading, no `Frame`, no file path and no device identifier. This target prints
+// and logs nothing.
 
 /// Why a step of the sync was not run.
 public enum SyncSkipReason: Sendable, Equatable {

@@ -155,8 +155,11 @@ private final class ScriptedLink: RingLink, @unchecked Sendable {
 @Test(.timeLimit(.minutes(1))) func stopAfterTheClockSetWasWrittenIsLoggedAsUnknown() async throws {
     let (store, id) = try await makeStore()
     let link = ScriptedLink(history: syntheticHistory, silent: [0x0100])
-    // A long conversation timeout, so only the stop can end the wait for the reply.
-    let session = RingSession(link: link, replyTimeout: 0.5, conversationTimeout: 30)
+    // The wait for a reply ends at the reply timeout (one empty read slice) or the conversation
+    // timeout, whichever comes first, so both are far longer than the test needs: only the stop
+    // can end the wait. (With a short reply timeout, a stop arriving late would end it as a
+    // timeout instead, which is also logged as unknown but is not what this test is about.)
+    let session = RingSession(link: link, replyTimeout: 20, conversationTimeout: 40)
     await session.start()
     let syncDate = Date(timeIntervalSince1970: 1_814_529_600.25)
     let syncZone = try #require(TimeZone(identifier: "America/New_York"))

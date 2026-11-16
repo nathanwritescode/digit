@@ -109,6 +109,7 @@ public struct RingSyncer: Sendable {
     }
 
     /// Runs both phases: `syncRing()`, then `ingestAll()`. Never throws: every failure is in the result.
+    /// At most once per session, like `syncRing()`.
     public func run() async -> SyncResult {
         let ringPhase = await syncRing()
         return SyncResult(ringPhase: ringPhase, ingestions: await ingestAll())
@@ -116,6 +117,11 @@ public struct RingSyncer: Sendable {
 
     /// The ring phase: fetch and store every kind, set the clock, send the interval. The budget
     /// starts when this is called. Never throws.
+    ///
+    /// Run it at most once per session (connect, create a session, sync once). A late reply to an
+    /// earlier request can be taken as the reply to a later one of the same type, so a second
+    /// clock-set on the same session could be answered by a late error reply to the first, be
+    /// classed as not applied, and be left out of the log although the ring applied it.
     public func syncRing() async -> RingPhaseResult {
         let deadline = monotonicNow() + budget
         let budgetLeft = { monotonicNow() < deadline }

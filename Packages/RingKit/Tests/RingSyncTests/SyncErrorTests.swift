@@ -23,9 +23,13 @@ private func dumped(_ result: SyncResult, without ringID: UUID) -> String {
 /// Text that only a raw error (statement arguments, frames, byte buffers) would put in a dump.
 private let rawErrorMarkers = ["DatabaseError", "StatementArguments", "arguments", "RingProtocol.Frame", "payload", "bytes"]
 
-@Test(.timeLimit(.minutes(1))) func resultOfAStoreFailureInsidePersistHoldsNoRawData() async throws {
+/// Failing the `history_transfer` insert puts the transfer's data blob among the failing
+/// statement's arguments; failing the `transfer_observation` insert (which runs first) puts its
+/// header, length and fetch time there. Neither may reach the result.
+@Test(.timeLimit(.minutes(1)), arguments: ["transfer_observation", "history_transfer"])
+func resultOfAStoreFailureInsidePersistHoldsNoRawData(_ table: String) async throws {
     let (store, id) = try await makeStore()
-    try failInserts(into: "transfer_observation", when: "NEW.kind = 'heartRate'", store)
+    try failInserts(into: table, when: "NEW.kind = 'heartRate'", store)
     // Readings of 173 and 187 bpm (0xAD, 0xBB) at ring times ending in recognisable bytes.
     let data = heartBytes(ring(-3600) | 0xC3, bpm: 173) + heartBytes(ring(-3000), bpm: 187)
     var fetches = syntheticHistory.mapValues { FakeRing.Fetch.data($0) }
