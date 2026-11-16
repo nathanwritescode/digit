@@ -9,6 +9,25 @@ import RingProtocol
 ///
 /// No health data is ever logged from here. Errors thrown by SQLite itself surface as GRDB's
 /// `DatabaseError`; the store's own failures are `RingStoreError`.
+///
+/// **The public database API is `async` only, except initialisation.** Every function that touches
+/// an open database is `async throws` and runs off the caller's thread. `init(url:)` (and
+/// `init()`) are synchronous: they open the file, run every migration and set file protection on
+/// the calling thread, so call them off the main actor (an async opener is a follow-up for when
+/// the app links the store, #13). The synchronous same-name forms (`internal`,
+/// used by tests through `@testable import`) block the calling thread; they are not public because
+/// a same-name synchronous overload is chosen silently in any synchronous context and in any
+/// closure without an `await`, where it would block. Each pair calls one `static` implementation,
+/// so the two cannot drift. (The sleep queries in `SleepQueries.swift` were already async only.)
+///
+/// **Cancellation.** An `async` call can throw `CancellationError` when its task is cancelled. A
+/// write that is cancelled is rolled back, so nothing it did is kept: cancelling `ingest` or
+/// `rebuild` discards the work done so far and leaves the typed tables as they were. Callers that
+/// need the result must call again.
+///
+/// **Errors.** A call naming a ring that is not stored throws `RingStoreError.unknownRing`, except
+/// the reads (`ring(id:)`, `transfer(id:)`), which return `nil`, and the typed and sleep reads,
+/// which return an empty list.
 public final class RingStore: Sendable {
     // Internal, not private, so tests can inspect the schema and issue raw SQL.
     let writer: any DatabaseWriter
@@ -20,6 +39,9 @@ public final class RingStore: Sendable {
     /// of the App Group container). On iOS the directory itself is given file protection
     /// `completeUntilFirstUserAuthentication`, because SQLite recreates the `-wal` and `-shm`
     /// files and only a protected directory covers the new ones.
+    ///
+    /// Synchronous: opening, migrating and setting file protection all happen on the calling
+    /// thread, so call it off the main actor.
     public init(url: URL) throws {
         try Self.prepareFile(at: url)
         let pool = try DatabasePool(path: url.path, configuration: Self.configuration())
@@ -49,44 +71,160 @@ public final class RingStore: Sendable {
 
     // MARK: Rings
 
-    /// Registers a new ring under a freshly generated identifier.
+    /// Blocking form of `registerRing(protocolFamily:model:firmware:now:)` (internal, for tests).
     @discardableResult
-    public func registerRing(
+    func registerRing(
         protocolFamily: String, model: String? = nil, firmware: String? = nil, now: Date = Date()
     ) throws -> StoredRing {
-        let firstSeen = HistoryTransfer.millisecondsSince1970(now)
-        let ring = StoredRing(
-            id: UUID(), protocolFamily: protocolFamily, model: model, firmware: firmware,
-            firstSeenAt: HistoryTransfer.date(millisecondsSince1970: firstSeen))
-        try writer.write { db in
-            try db.execute(
-                sql: "INSERT INTO ring (id, protocol_family, model, firmware, first_seen_at) VALUES (?, ?, ?, ?, ?)",
-                arguments: [ring.id.uuidString, ring.protocolFamily, ring.model, ring.firmware, firstSeen])
-        }
+        let ring = Self.newRing(protocolFamily: protocolFamily, model: model, firmware: firmware, now: now)
+        try writer.write { db in try Self.insertRing(db, ring) }
         return ring
     }
 
-    public func ring(id: UUID) throws -> StoredRing? {
-        try writer.read { db in
-            try Row.fetchOne(db, sql: "SELECT * FROM ring WHERE id = ?", arguments: [id.uuidString]).map(Self.ring)
-        }
+    /// Registers a new ring under a freshly generated identifier and returns it. `firstSeenAt` is
+    /// `now` rounded down to whole milliseconds, which is also what is stored, so the returned value
+    /// equals what `ring(id:)` reads back. `peripheralIdentifier` starts `nil`. Never throws
+    /// `unknownRing`; can throw `CancellationError` (nothing is registered then).
+    @discardableResult
+    public func registerRing(
+        protocolFamily: String, model: String? = nil, firmware: String? = nil, now: Date = Date()
+    ) async throws -> StoredRing {
+        let ring = Self.newRing(protocolFamily: protocolFamily, model: model, firmware: firmware, now: now)
+        try await writer.write { db in try Self.insertRing(db, ring) }
+        return ring
     }
 
-    /// All rings, oldest first.
-    public func rings() throws -> [StoredRing] {
-        try writer.read { db in
-            try Row.fetchAll(db, sql: "SELECT * FROM ring ORDER BY first_seen_at, id").map(Self.ring)
-        }
+    private static func newRing(protocolFamily: String, model: String?, firmware: String?, now: Date) -> StoredRing {
+        StoredRing(
+            id: UUID(), protocolFamily: protocolFamily, model: model, firmware: firmware,
+            firstSeenAt: HistoryTransfer.date(millisecondsSince1970: HistoryTransfer.millisecondsSince1970(now)))
     }
 
-    /// Updates the model and firmware the ring reported (for example after a firmware update).
-    public func updateRing(id: UUID, model: String?, firmware: String?) throws {
-        try writer.write { db in
-            try db.execute(
-                sql: "UPDATE ring SET model = ?, firmware = ? WHERE id = ?",
-                arguments: [model, firmware, id.uuidString])
-            if db.changesCount == 0 { throw RingStoreError.unknownRing(id) }
+    private static func insertRing(_ db: Database, _ ring: StoredRing) throws {
+        try db.execute(
+            sql: "INSERT INTO ring (id, protocol_family, model, firmware, first_seen_at) VALUES (?, ?, ?, ?, ?)",
+            arguments: [
+                ring.id.uuidString, ring.protocolFamily, ring.model, ring.firmware,
+                HistoryTransfer.millisecondsSince1970(ring.firstSeenAt),
+            ])
+    }
+
+    /// Blocking form of `ring(id:)` (internal, for tests).
+    func ring(id: UUID) throws -> StoredRing? {
+        try writer.read { db in try Self.ring(db, id: id) }
+    }
+
+    /// The ring stored under `id`, or `nil` if there is none (not an error). A stored
+    /// `peripheral_identifier` that is not a UUID reads as `nil` rather than failing; a corrupt ring
+    /// id still throws `corruptRow`. Can throw `CancellationError`.
+    public func ring(id: UUID) async throws -> StoredRing? {
+        try await writer.read { db in try Self.ring(db, id: id) }
+    }
+
+    private static func ring(_ db: Database, id: UUID) throws -> StoredRing? {
+        try Row.fetchOne(db, sql: "SELECT * FROM ring WHERE id = ?", arguments: [id.uuidString]).map(Self.ring)
+    }
+
+    /// Blocking form of `rings()` (internal, for tests).
+    func rings() throws -> [StoredRing] {
+        try writer.read { db in try Self.rings(db) }
+    }
+
+    /// All rings, oldest first (by first-seen time, then id); empty when none. A malformed stored
+    /// peripheral identifier reads as `nil` and never hides the other rings. Can throw
+    /// `CancellationError`.
+    public func rings() async throws -> [StoredRing] {
+        try await writer.read { db in try Self.rings(db) }
+    }
+
+    private static func rings(_ db: Database) throws -> [StoredRing] {
+        try Row.fetchAll(db, sql: "SELECT * FROM ring ORDER BY first_seen_at, id").map(Self.ring)
+    }
+
+    /// Blocking form of `updateRing(id:model:firmware:)` (internal, for tests).
+    func updateRing(id: UUID, model: String?, firmware: String?) throws {
+        try writer.write { db in try Self.updateRing(db, id: id, model: model, firmware: firmware) }
+    }
+
+    /// Replaces the model and firmware the ring reported (for example after a firmware update),
+    /// both always overwritten, so `nil` clears one. Throws `unknownRing(id)` if no such ring is
+    /// stored. One write transaction; a `CancellationError` rolls it back.
+    public func updateRing(id: UUID, model: String?, firmware: String?) async throws {
+        try await writer.write { db in try Self.updateRing(db, id: id, model: model, firmware: firmware) }
+    }
+
+    private static func updateRing(_ db: Database, id: UUID, model: String?, firmware: String?) throws {
+        try db.execute(
+            sql: "UPDATE ring SET model = ?, firmware = ? WHERE id = ?",
+            arguments: [model, firmware, id.uuidString])
+        if db.changesCount == 0 { throw RingStoreError.unknownRing(id) }
+    }
+
+    /// Blocking form of `ring(peripheralIdentifier:)` (internal, for tests).
+    func ring(peripheralIdentifier: UUID) throws -> StoredRing? {
+        try writer.read { db in try Self.ring(db, peripheralIdentifier: peripheralIdentifier) }
+    }
+
+    /// The stored ring that holds this CoreBluetooth identifier, or `nil` (not an error). The
+    /// match ignores letter case, like the unique index. **The sync engine must look a connected
+    /// peripheral up here before registering a new ring, and reuse the ring it finds** (#51);
+    /// registering a second ring for a ring the store already knows would store and ingest the
+    /// same records twice. Can throw `CancellationError`.
+    public func ring(peripheralIdentifier: UUID) async throws -> StoredRing? {
+        try await writer.read { db in try Self.ring(db, peripheralIdentifier: peripheralIdentifier) }
+    }
+
+    private static func ring(_ db: Database, peripheralIdentifier: UUID) throws -> StoredRing? {
+        try Row.fetchOne(
+            db, sql: "SELECT * FROM ring WHERE peripheral_identifier = ? COLLATE NOCASE",
+            arguments: [peripheralIdentifier.uuidString]
+        ).map(Self.ring)
+    }
+
+    /// Blocking form of `setPeripheralIdentifier(_:forRing:)` (internal, for tests).
+    func setPeripheralIdentifier(_ identifier: UUID?, forRing id: UUID) throws {
+        try writer.write { db in try Self.setPeripheralIdentifier(db, identifier, forRing: id) }
+    }
+
+    /// Remembers the identifier CoreBluetooth gave this phone for the ring
+    /// (`CBPeripheral.identifier`), so the app can reconnect without scanning; `nil` clears it. It
+    /// replaces any earlier value of this ring.
+    ///
+    /// **One identifier, one ring.** An identifier names one physical ring on one phone, so if
+    /// another ring already holds it, the two are almost certainly the same ring and the caller has
+    /// made a mistake (moving it would orphan that ring's history and have this one store and
+    /// ingest the same records again). The call then throws `peripheralIdentifierInUse(holder)`,
+    /// naming the holding ring by its app id (never the identifier), and changes nothing. Setting
+    /// the value this ring already holds succeeds, and `nil` always does. A unique index (case
+    /// insensitive) backs this up. **The sync engine must look a connected peripheral up with
+    /// `ring(peripheralIdentifier:)` before registering a new ring, and reuse the ring it finds**
+    /// (#51).
+    ///
+    /// This is a per-phone device identifier assigned by CoreBluetooth. It is not the Bluetooth
+    /// address and not the ring's serial number, and it can change (for example after a
+    /// network-settings reset), so a lookup that finds nothing means rescan and overwrite it. Treat
+    /// it as a device identifier: never in exports, logs, error messages, crash or analytics
+    /// payloads, test fixtures, issues or pull requests. This is the only place it is stored, and
+    /// the column holds nothing else, never an advertised name or address.
+    ///
+    /// Throws `unknownRing(id)` first if no such ring is stored; either error leaves every row
+    /// unchanged. One write transaction; a `CancellationError` rolls it back.
+    public func setPeripheralIdentifier(_ identifier: UUID?, forRing id: UUID) async throws {
+        try await writer.write { db in try Self.setPeripheralIdentifier(db, identifier, forRing: id) }
+    }
+
+    private static func setPeripheralIdentifier(_ db: Database, _ identifier: UUID?, forRing id: UUID) throws {
+        try Self.requireRing(db, id)
+        if let identifier {
+            // Case-insensitive, matching the index: a lower-case copy written outside the API counts.
+            let holder = try String.fetchOne(
+                db, sql: "SELECT id FROM ring WHERE peripheral_identifier = ? COLLATE NOCASE AND id <> ?",
+                arguments: [identifier.uuidString, id.uuidString])
+            if let holder { throw RingStoreError.peripheralIdentifierInUse(try uuid(holder)) }
         }
+        try db.execute(
+            sql: "UPDATE ring SET peripheral_identifier = ? WHERE id = ?",
+            arguments: [identifier?.uuidString, id.uuidString])
     }
 
     // MARK: Transfers
@@ -128,6 +266,12 @@ public final class RingStore: Sendable {
         ON CONFLICT(ring_id, kind, content_hash, fetched_at) DO NOTHING
         """
 
+    /// Blocking form of `insert(_:ringID:)` (internal, for tests).
+    @discardableResult
+    func insert(_ transfer: HistoryTransfer, ringID: UUID) throws -> InsertOutcome {
+        try writer.write { db in try Self.insert(db, transfer, ringID: ringID) }
+    }
+
     /// Stores `transfer` for `ringID`, in one write transaction with any pruning.
     ///
     /// Every call records one `transfer_observation` of the incoming transfer (ring, kind, data
@@ -157,57 +301,75 @@ public final class RingStore: Sendable {
     /// must survive its deletion.
     ///
     /// Only a clash on the content hash counts as a duplicate; any other constraint failure throws.
+    ///
+    /// Throws `unknownRing(ringID)` if the ring is not stored (nothing is written, not even an
+    /// observation). A `CancellationError` rolls the whole transaction back, observation included.
     @discardableResult
-    public func insert(_ transfer: HistoryTransfer, ringID: UUID) throws -> InsertOutcome {
+    public func insert(_ transfer: HistoryTransfer, ringID: UUID) async throws -> InsertOutcome {
+        try await writer.write { db in try Self.insert(db, transfer, ringID: ringID) }
+    }
+
+    private static func insert(_ db: Database, _ transfer: HistoryTransfer, ringID: UUID) throws -> InsertOutcome {
         let hash = Self.contentHash(ringID: ringID, kind: transfer.kind, data: transfer.data)
         let kindCode = KindCode.code(for: transfer.kind)
         let data = Data(transfer.data)
-        return try writer.write { db in
-            try Self.requireRing(db, ringID)
-            try db.execute(
-                sql: Self.insertObservationSQL,
-                arguments: [
-                    ringID.uuidString, kindCode, data.count, Data(transfer.header),
-                    HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),
-                ])
-            if let existing = try Int64.fetchOne(
-                db, sql: "SELECT id FROM history_transfer WHERE content_hash = ?", arguments: [Data(hash)])
-            {
-                return .duplicate(existingID: existing)
-            }
-            if let superseder = try Int64.fetchOne(
-                db, sql: Self.findSupersederSQL,
-                arguments: [ringID.uuidString, kindCode, data.count, data.count, data])
-            {
-                return .supersededByExisting(existingID: superseder)
-            }
-            try db.execute(
-                sql: Self.insertTransferSQL,
-                arguments: [
-                    ringID.uuidString, kindCode, Data(transfer.header), data,
-                    HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),
-                ])
-            // Unreachable in practice: the hash lookup above already returned for a duplicate, and
-            // writes are serialised. The ON CONFLICT clause stays so a conflict can never turn into
-            // a thrown constraint error or a silent overwrite.
-            guard db.changesCount > 0 else {
-                throw RingStoreError.corruptRow("content hash conflict that the duplicate check did not see")
-            }
-            let id = db.lastInsertedRowID
-            try db.execute(sql: Self.pruneSupersededSQL, arguments: [ringID.uuidString, kindCode, data.count, data])
-            return .inserted(id: id, pruned: db.changesCount)
+        try Self.requireRing(db, ringID)
+        try db.execute(
+            sql: Self.insertObservationSQL,
+            arguments: [
+                ringID.uuidString, kindCode, data.count, Data(transfer.header),
+                HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),
+            ])
+        if let existing = try Int64.fetchOne(
+            db, sql: "SELECT id FROM history_transfer WHERE content_hash = ?", arguments: [Data(hash)])
+        {
+            return .duplicate(existingID: existing)
         }
+        if let superseder = try Int64.fetchOne(
+            db, sql: Self.findSupersederSQL,
+            arguments: [ringID.uuidString, kindCode, data.count, data.count, data])
+        {
+            return .supersededByExisting(existingID: superseder)
+        }
+        try db.execute(
+            sql: Self.insertTransferSQL,
+            arguments: [
+                ringID.uuidString, kindCode, Data(transfer.header), data,
+                HistoryTransfer.millisecondsSince1970(transfer.fetchedAt), transfer.timeZoneIdentifier, Data(hash),
+            ])
+        // Unreachable in practice: the hash lookup above already returned for a duplicate, and
+        // writes are serialised. The ON CONFLICT clause stays so a conflict can never turn into
+        // a thrown constraint error or a silent overwrite.
+        guard db.changesCount > 0 else {
+            throw RingStoreError.corruptRow("content hash conflict that the duplicate check did not see")
+        }
+        let id = db.lastInsertedRowID
+        try db.execute(sql: Self.pruneSupersededSQL, arguments: [ringID.uuidString, kindCode, data.count, data])
+        return .inserted(id: id, pruned: db.changesCount)
     }
 
-    /// One transfer by row id. Throws `corruptRow` if the row's kind code is not one this version
-    /// knows (for example written by a newer version).
-    public func transfer(id: Int64) throws -> StoredTransfer? {
-        try writer.read { db in
-            guard let row = try Row.fetchOne(db, sql: "SELECT * FROM history_transfer WHERE id = ?", arguments: [id])
-            else { return nil }
-            guard let stored = try Self.storedTransfer(row) else { throw RingStoreError.corruptRow("unknown history kind") }
-            return stored
-        }
+    /// Blocking form of `transfer(id:)` (internal, for tests).
+    func transfer(id: Int64) throws -> StoredTransfer? {
+        try writer.read { db in try Self.transfer(db, id: id) }
+    }
+
+    /// One transfer by row id, or `nil` if there is none (for example it was pruned). Throws
+    /// `corruptRow` if the row's kind code is not one this version knows (for example written by a
+    /// newer version). Can throw `CancellationError`.
+    public func transfer(id: Int64) async throws -> StoredTransfer? {
+        try await writer.read { db in try Self.transfer(db, id: id) }
+    }
+
+    private static func transfer(_ db: Database, id: Int64) throws -> StoredTransfer? {
+        guard let row = try Row.fetchOne(db, sql: "SELECT * FROM history_transfer WHERE id = ?", arguments: [id])
+        else { return nil }
+        guard let stored = try Self.storedTransfer(row) else { throw RingStoreError.corruptRow("unknown history kind") }
+        return stored
+    }
+
+    /// Blocking form of `observations(ringID:kind:)` (internal, for tests).
+    func observations(ringID: UUID, kind: HistoryKind? = nil) throws -> ObservationListing {
+        try writer.read { db in try Self.observations(db, ringID: ringID, kind: kind) }
     }
 
     /// The fetch log for a ring, optionally of one kind: one entry per distinct fetch (same data
@@ -215,8 +377,9 @@ public final class RingStore: Sendable {
     /// fetch time then row id. Rows with a kind code this version does not know are left out and
     /// counted in `ObservationListing.skippedUnknownKind`, so a skipped row is not read as "no
     /// fetch". (With `kind` given, no unknown row can match, so the count is 0.)
-    public func observations(ringID: UUID, kind: HistoryKind? = nil) throws -> ObservationListing {
-        try writer.read { db in try Self.observations(db, ringID: ringID, kind: kind) }
+    /// Empty for a ring that is not stored (no error). Can throw `CancellationError`.
+    public func observations(ringID: UUID, kind: HistoryKind? = nil) async throws -> ObservationListing {
+        try await writer.read { db in try Self.observations(db, ringID: ringID, kind: kind) }
     }
 
     static func observations(_ db: Database, ringID: UUID, kind: HistoryKind?) throws -> ObservationListing {
@@ -244,6 +407,13 @@ public final class RingStore: Sendable {
         return listing
     }
 
+    /// Blocking form of `transfers(ringID:kind:fetchedWithin:)` (internal, for tests).
+    func transfers(
+        ringID: UUID, kind: HistoryKind? = nil, fetchedWithin range: ClosedRange<Date>? = nil
+    ) throws -> TransferListing {
+        try writer.read { db in try Self.transfers(db, ringID: ringID, kind: kind, fetchedWithin: range) }
+    }
+
     /// Transfers for a ring, optionally of one kind and within a fetched-at range, oldest first
     /// (ties by row id). The range is inclusive at both ends and compared in whole milliseconds,
     /// each bound rounded down the same way stored times are.
@@ -254,10 +424,11 @@ public final class RingStore: Sendable {
     ///
     /// A row whose kind code this version does not know is skipped and counted in
     /// `TransferListing.skippedUnknownKind` instead of failing the whole listing.
+    /// Empty for a ring that is not stored (no error). Can throw `CancellationError`.
     public func transfers(
         ringID: UUID, kind: HistoryKind? = nil, fetchedWithin range: ClosedRange<Date>? = nil
-    ) throws -> TransferListing {
-        try writer.read { db in try Self.transfers(db, ringID: ringID, kind: kind, fetchedWithin: range) }
+    ) async throws -> TransferListing {
+        try await writer.read { db in try Self.transfers(db, ringID: ringID, kind: kind, fetchedWithin: range) }
     }
 
     static func transfers(
@@ -288,21 +459,38 @@ public final class RingStore: Sendable {
 
     // MARK: Clock sets
 
-    public func recordClockSet(_ event: ClockSetEvent) throws {
-        try writer.write { db in
-            try Self.requireRing(db, event.ringID)
-            try db.execute(
-                sql: "INSERT INTO clock_set (ring_id, instant, time_zone_identifier, utc_offset_seconds) VALUES (?, ?, ?, ?)",
-                arguments: [
-                    event.ringID.uuidString, HistoryTransfer.millisecondsSince1970(event.instant),
-                    event.timeZoneIdentifier, event.utcOffsetSeconds,
-                ])
-        }
+    /// Blocking form of `recordClockSet(_:)` (internal, for tests).
+    func recordClockSet(_ event: ClockSetEvent) throws {
+        try writer.write { db in try Self.recordClockSet(db, event) }
     }
 
-    /// Clock-set events for a ring in time order (ties in the order recorded).
-    public func clockSets(ringID: UUID) throws -> [ClockSetEvent] {
+    /// Logs that the app set the ring's clock, with the zone and UTC offset it sent. Every
+    /// clock-set must be logged, because time resolution reads them. Events are appended, never
+    /// merged. Throws `unknownRing(event.ringID)` if the ring is not stored. A `CancellationError`
+    /// rolls the write back, so the caller cannot assume it was logged.
+    public func recordClockSet(_ event: ClockSetEvent) async throws {
+        try await writer.write { db in try Self.recordClockSet(db, event) }
+    }
+
+    private static func recordClockSet(_ db: Database, _ event: ClockSetEvent) throws {
+        try Self.requireRing(db, event.ringID)
+        try db.execute(
+            sql: "INSERT INTO clock_set (ring_id, instant, time_zone_identifier, utc_offset_seconds) VALUES (?, ?, ?, ?)",
+            arguments: [
+                event.ringID.uuidString, HistoryTransfer.millisecondsSince1970(event.instant),
+                event.timeZoneIdentifier, event.utcOffsetSeconds,
+            ])
+    }
+
+    /// Blocking form of `clockSets(ringID:)` (internal, for tests).
+    func clockSets(ringID: UUID) throws -> [ClockSetEvent] {
         try writer.read { db in try Self.clockSets(db, ringID: ringID) }
+    }
+
+    /// Clock-set events for a ring in time order (ties in the order recorded); empty for a ring that
+    /// is not stored. Can throw `CancellationError`.
+    public func clockSets(ringID: UUID) async throws -> [ClockSetEvent] {
+        try await writer.read { db in try Self.clockSets(db, ringID: ringID) }
     }
 
     static func clockSets(_ db: Database, ringID: UUID) throws -> [ClockSetEvent] {
@@ -490,6 +678,17 @@ public final class RingStore: Sendable {
                 ) STRICT;
                 """)
         }
+        // After v4-vitals, which is the released order. GRDB tracks applied migrations by name.
+        // The CoreBluetooth peripheral identifier is a per-phone device identifier and the only link
+        // from a connected peripheral to a stored ring, so it is unique among rings (partial: many
+        // rings have none) and case-insensitive, since reads accept lower case.
+        migrator.registerMigration("v5-ring-peripheral") { db in
+            try db.execute(sql: """
+                ALTER TABLE ring ADD COLUMN peripheral_identifier TEXT;
+                CREATE UNIQUE INDEX ring_peripheral_identifier ON ring(peripheral_identifier COLLATE NOCASE)
+                    WHERE peripheral_identifier IS NOT NULL;
+                """)
+        }
         return migrator
     }
 
@@ -540,8 +739,10 @@ public final class RingStore: Sendable {
         }
     }
 
-    static func uuid(_ text: String) throws -> UUID {
-        guard let id = UUID(uuidString: text) else { throw RingStoreError.corruptRow("ring id") }
+    /// `column` names what failed in `corruptRow`; it defaults to the ring id, which every
+    /// identifier column except the peripheral identifier is.
+    static func uuid(_ text: String, column: String = "ring id") throws -> UUID {
+        guard let id = UUID(uuidString: text) else { throw RingStoreError.corruptRow(column) }
         return id
     }
 
@@ -554,7 +755,12 @@ public final class RingStore: Sendable {
         StoredRing(
             id: try uuid(try column(row, "id")), protocolFamily: try column(row, "protocol_family"),
             model: try column(row, "model"), firmware: try column(row, "firmware"),
-            firstSeenAt: HistoryTransfer.date(millisecondsSince1970: try column(row, "first_seen_at")))
+            firstSeenAt: HistoryTransfer.date(millisecondsSince1970: try column(row, "first_seen_at")),
+            // A stored value that is not a UUID reads as nil instead of throwing: the identifier only
+            // saves a rescan, and one bad value must not make `ring(id:)` and `rings()` fail for
+            // every ring. The error would also be the wrong place to carry the value.
+            peripheralIdentifier: ((try? column(row, "peripheral_identifier") as String?) ?? nil)
+                .flatMap { try? uuid($0, column: "peripheral identifier") })
     }
 
     /// Nil when the row's kind code is not known to this version.

@@ -49,4 +49,40 @@ public enum PrivateFile {
             throw failed
         }
     }
+
+    /// Writes `data` to `path` with mode 0600, replacing an existing file. The data goes to a new
+    /// file beside it first (through `write`, so it is never readable by other accounts) and is
+    /// then renamed over `path`, so readers see either the old file or the whole new one. A
+    /// symbolic link at `path` is replaced, not followed. The containing directory is synced after
+    /// the rename, on a best-effort basis, so the replacement survives a crash.
+    ///
+    /// The temporary name adds 41 bytes to the file's name (a dot, a UUID and `.tmp`), so a file
+    /// name longer than 255 - 41 = 214 bytes (the usual per-name limit) fails to be created and
+    /// nothing is replaced.
+    public static func replace(_ data: Data, at path: String) throws {
+        let temporary = temporaryPath(for: path)
+        try write(data, to: temporary)
+        guard rename(temporary, path) == 0 else {
+            let error = failure("replace", path)
+            unlink(temporary)
+            throw error
+        }
+        syncDirectory(containing: path)
+    }
+
+    /// A new, unpredictable name beside `path`.
+    public static func temporaryPath(for path: String) -> String {
+        path + ".\(UUID().uuidString).tmp"
+    }
+
+    /// Best effort, and its failure is ignored on purpose: by now the file is in place, so
+    /// reporting an error would turn a completed save into a failure. Some filesystems and
+    /// unreadable directories cannot be synced.
+    private static func syncDirectory(containing path: String) {
+        let directory = (path as NSString).deletingLastPathComponent
+        let fd = open(directory.isEmpty ? "." : directory, O_RDONLY)
+        guard fd >= 0 else { return }
+        _ = fsync(fd)
+        close(fd)
+    }
 }
