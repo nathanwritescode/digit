@@ -49,4 +49,18 @@ public enum PrivateFile {
             throw failed
         }
     }
+
+    /// Writes `data` to `path` with mode 0600, replacing an existing file. The data goes to a new
+    /// file beside it first (through `write`, so it is never readable by other accounts) and is
+    /// then renamed over `path`, so readers see either the old file or the whole new one. A
+    /// symbolic link at `path` is replaced, not followed.
+    public static func replace(_ data: Data, at path: String) throws {
+        let temporary = path + ".\(UUID().uuidString).tmp"
+        try write(data, to: temporary)
+        guard rename(temporary, path) == 0 else {
+            let error = failure("replace", path)
+            unlink(temporary)
+            throw error
+        }
+    }
 }

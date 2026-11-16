@@ -4,7 +4,7 @@ import Testing
 
 // Synthetic devices only: made-up identifiers and names, no real advertisements.
 
-private let ycbt = "BE940000-7333-BE46-B7AE-689E71722BD5"
+private let ycbt = YCBT.service.uuidString
 
 private func device(_ n: Int, name: String? = nil, rssi: Int = -60, services: [String] = []) -> DiscoveredDevice {
     DiscoveredDevice(
@@ -89,4 +89,73 @@ private func device(_ n: Int, name: String? = nil, rssi: Int = -60, services: [S
 @Test func mergingDoesNotDuplicateServices() {
     let merged = device(1, services: [ycbt]).merging(device(1, services: [ycbt.lowercased()]))
     #expect(merged.serviceUUIDs == [ycbt])
+}
+
+@Test func emptyLaterNameDoesNotReplaceEarlierName() {
+    #expect(device(1, name: "R99 0000").merging(device(1, name: "")).name == "R99 0000")
+    #expect(device(1, name: "").merging(device(1, name: "R99 0000")).name == "R99 0000")
+}
+
+@Test func publicCandidateRuleMatchesDiscovery() {
+    // `ringprobe scan` labels devices with the public rule; it must agree with `discoverRings`.
+    let devices = [device(1, name: "R99 0000"), device(2, services: [ycbt]), device(3, name: "Headphones"), device(4)]
+    let viaPublic = devices.filter { $0.isCandidateRing(namePrefixes: YCBT.knownNamePrefixes) }.map(\.identifier)
+    let viaDiscovery = RingDiscovery.candidates(in: devices, service: ycbt, namePrefixes: YCBT.knownNamePrefixes)
+        .map(\.identifier)
+    #expect(Set(viaPublic) == Set(viaDiscovery))
+    #expect(viaPublic == [devices[0].identifier, devices[1].identifier])
+}
+
+@Test func knownNamePrefixesAcceptTheRing() {
+    #expect(device(1, name: "R99 0000").isCandidateRing(namePrefixes: YCBT.knownNamePrefixes))
+}
+
+// Scan ownership: one CoreBluetooth scan, so nothing starts while a connect is pending or a
+// listing scan runs.
+
+@Test func scanMayStartWhenIdle() {
+    #expect(RingDiscovery.scanConflict(owner: nil, connectPending: false) == nil)
+}
+
+@Test func nothingStartsWhileListing() {
+    #expect(RingDiscovery.scanConflict(owner: .listing, connectPending: false) != nil)
+}
+
+@Test func nothingStartsWhileConnectPending() {
+    // Scanning, or connecting to a retrieved peripheral without a scan.
+    #expect(RingDiscovery.scanConflict(owner: .connect, connectPending: true) != nil)
+    #expect(RingDiscovery.scanConflict(owner: nil, connectPending: true) != nil)
+}
+
+// Which error a connect reports when its deadline passes.
+
+private func isTimeout(_ error: RingError) -> Bool { if case .timeout = error { true } else { false } }
+private func isNotFound(_ error: RingError) -> Bool { if case .notFound = error { true } else { false } }
+private func isUnknownIdentifier(_ error: RingError) -> Bool { if case .unknownIdentifier = error { true } else { false } }
+
+@Test func matchingTimeoutDependsOnWhetherTheDeviceWasHeard() {
+    #expect(isNotFound(RingDiscovery.connectTimeoutError(.matching, heard: false, connected: false)))
+    #expect(isTimeout(RingDiscovery.connectTimeoutError(.matching, heard: true, connected: false)))
+    #expect(isTimeout(RingDiscovery.connectTimeoutError(.matching, heard: true, connected: true)))
+}
+
+@Test func knownIdentifierIsNotFoundUnlessItConnected() {
+    // A retrieved peripheral exists whether or not the ring is in range, so `heard` says nothing.
+    #expect(isNotFound(RingDiscovery.connectTimeoutError(.knownIdentifier, heard: true, connected: false)))
+    #expect(isNotFound(RingDiscovery.connectTimeoutError(.knownIdentifier, heard: false, connected: false)))
+    #expect(isTimeout(RingDiscovery.connectTimeoutError(.knownIdentifier, heard: true, connected: true)))
+}
+
+@Test func unknownIdentifierNeverHeardIsDistinct() {
+    #expect(isUnknownIdentifier(RingDiscovery.connectTimeoutError(.unknownIdentifier, heard: false, connected: false)))
+    // Heard by the fallback scan: in range, so a setup timeout, as for a name match.
+    #expect(isTimeout(RingDiscovery.connectTimeoutError(.unknownIdentifier, heard: true, connected: false)))
+}
+
+@Test func errorDescriptionsCarryNoIdentifier() {
+    // Synthetic identifier; the descriptions must not interpolate any identifier at all.
+    for error in [RingError.notFound, .unknownIdentifier] {
+        #expect(!error.description.contains("-"))
+        #expect(!error.description.contains(device(1).identifier.uuidString))
+    }
 }

@@ -5,7 +5,12 @@ import RingTransport
 let usage = """
 ringprobe: talk to a YCBT smart ring from a Mac.
 
-  ringprobe scan [seconds]              list nearby Bluetooth devices with their identifiers
+  ringprobe scan [seconds]              list nearby Bluetooth devices, with identifiers for
+                                        candidate rings (and devices matching --name) only
+  ringprobe scan [seconds] --save-id <file>
+                                        save the identifier of the one candidate ring to <file>
+                                        (owner-only, replacing it) without printing it.
+                                        Suggested: ../../captures/ring-id (git-ignored)
   ringprobe info                        firmware and battery (device id and today's activity with --show)
   ringprobe settime                     set the ring's clock to this Mac's local time
   ringprobe history <kind>|all --save <dir>
@@ -13,10 +18,16 @@ ringprobe: talk to a YCBT smart ring from a Mac.
   ringprobe raw <GGKK[:payloadhex]>...  send frames and print the replies
 
 Options:
-  --name <text>     match rings whose advertised name contains <text> (default "R99")
+  --name <text>     match rings whose advertised name contains <text> (default "R99"). Given
+                    with scan, it also shows identifiers of matching devices and narrows --save-id.
   --id <uuid>       connect to the device with this identifier (as printed by scan) instead
                     of matching by name, without scanning if this Mac already knows it.
-                    Identifiers are specific to this Mac. Do not paste them into issues.
+                    Identifiers are specific to this Mac but identify the ring here: never
+                    paste them into issues, pull requests, commits or the repository. Prefer
+                    --id-file, which keeps them out of command lines and transcripts.
+  --id-file <file>  like --id, reading the identifier from <file> (as written by scan --save-id).
+                    --id, --id-file and --name cannot be combined, and none of --id and
+                    --id-file works with scan.
   --save <dir>      required with history: write each transfer (raw bytes as hex,
                     plus header, fetch time and time zone) to <dir>/<kind>-<timestamp>.json.
                     The bytes are written before the transfer is acknowledged to the ring.
@@ -57,14 +68,40 @@ let allowUnknown = flag("--allow-unknown")
 
 let nameOption = option("--name")
 let ringName = nameOption ?? "R99"
-let ringID: UUID? = option("--id").map { text in
-    guard let id = UUID(uuidString: text) else { fail("--id needs a UUID, as printed by scan") }
-    return id
-}
-if ringID != nil, nameOption != nil { fail("use either --id or --name, not both") }
+let idOption = option("--id")
+let idFile = option("--id-file")
+let saveIDFile = option("--save-id")
 let saveDirectory = option("--save")
 
 guard let command = arguments.first else { print(usage); exit(0) }
+
+if [idOption != nil, idFile != nil, nameOption != nil].filter({ $0 }).count > 1 {
+    fail("use only one of --id, --id-file and --name")
+}
+if command == "scan", idOption != nil || idFile != nil {
+    fail("--id and --id-file choose a ring to connect to; scan does not connect")
+}
+if command != "scan", saveIDFile != nil { fail("--save-id works only with scan") }
+
+/// Reads an identifier saved by `scan --save-id`. Never echoes the file's contents: they are the
+/// identifier, which must stay out of terminal logs and transcripts.
+func readIdentifier(from path: String) -> UUID {
+    guard let data = FileManager.default.contents(atPath: path) else { fail("cannot read \(path)") }
+    guard data.count <= 64, let text = String(data: data, encoding: .utf8),
+          let id = UUID(uuidString: text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        fail("\(path) does not hold a ring identifier; write one with scan --save-id")
+    }
+    return id
+}
+
+// Resolved before anything connects, so a malformed --id or --id-file fails first.
+let ringID: UUID? = {
+    if let idOption {
+        guard let id = UUID(uuidString: idOption) else { fail("--id needs a UUID, as printed by scan") }
+        return id
+    }
+    return idFile.map(readIdentifier)
+}()
 let operands = Array(arguments.dropFirst())
 @Sendable func traceBytes(_ outgoing: Bool, _ bytes: [UInt8]) {
     print("  \(outgoing ? ">>" : "<<") \(bytes.map { String(format: "%02x", $0) }.joined())")
@@ -138,15 +175,45 @@ do {
     switch command {
     case "scan":
         let seconds = operands.first.flatMap(Double.init) ?? 8
-        for device in try await connection.scan(for: seconds) {
+        let devices = try await connection.scan(for: seconds)
+        // The same rule as `discoverRings`, so scan and the app cannot disagree on what a ring is.
+        func isCandidate(_ device: DiscoveredDevice) -> Bool {
+            device.isCandidateRing(namePrefixes: YCBT.knownNamePrefixes)
+        }
+        func matchesName(_ device: DiscoveredDevice) -> Bool {
+            nameOption.map { (device.name ?? "").localizedCaseInsensitiveContains($0) } ?? false
+        }
+        if let saveIDFile {
+            let chosen = devices.filter { isCandidate($0) && (nameOption == nil || matchesName($0)) }
+            guard chosen.count == 1 else {
+                fail(chosen.isEmpty
+                     ? "no candidate ring was heard; nothing saved"
+                     : "\(chosen.count) candidate rings were heard; narrow with --name; nothing saved")
+            }
+            do {
+                try PrivateFile.createDirectory(URL(fileURLWithPath: saveIDFile).deletingLastPathComponent().path)
+                try PrivateFile.replace(Data((chosen[0].identifier.uuidString + "\n").utf8), at: saveIDFile)
+            } catch {
+                fail("cannot save the identifier: \(error)")
+            }
+            // Only that it was saved: the identifier stays out of the terminal.
+            print("saved the ring's identifier to \(saveIDFile)")
+            break
+        }
+        for device in devices {
             let services = device.serviceUUIDs.isEmpty ? "" : "  services: \(device.serviceUUIDs.joined(separator: ","))"
+            let candidate = isCandidate(device), named = matchesName(device)
             // Advertised names identify devices (the ring's suffix, other people's gadgets), so
-            // they are shown only with --show.
-            let matches = (device.name ?? "").localizedCaseInsensitiveContains(ringName)
-            let label = show ? (device.name ?? "(unnamed)") : (matches ? "\(ringName) (matching ring)" : "(other device)")
-            // The identifier is what --id takes. It is assigned by this Mac's Bluetooth stack, but
-            // still identifies the device here: keep it out of issues and pull requests.
-            print("\(String(format: "%4d", device.rssi)) dBm  \(device.identifier.uuidString)  \(label)\(services)")
+            // they are shown only with --show; without it the label says only why a row matters.
+            let label = show ? (device.name ?? "(unnamed)")
+                : candidate ? "(candidate ring)" : named ? "(matches --name)" : "(other device)"
+            // The identifier is what --id takes. It is assigned by this Mac's Bluetooth system but
+            // still identifies the device here, so other people's devices get one only with --show.
+            // Keep every identifier out of the repository, issues and pull requests.
+            let identifier = candidate || named || show
+                ? device.identifier.uuidString
+                : "(hidden; --show)".padding(toLength: 36, withPad: " ", startingAt: 0)
+            print("\(String(format: "%4d", device.rssi)) dBm  \(identifier)  \(label)\(services)")
         }
 
     case "info":

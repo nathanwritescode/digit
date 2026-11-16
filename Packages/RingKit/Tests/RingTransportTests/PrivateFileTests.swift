@@ -39,3 +39,22 @@ import Testing
     #expect(throws: PrivateFile.Failure.self) { try PrivateFile.write(Data([1, 2, 3]), to: missing) }
     #expect(!FileManager.default.fileExists(atPath: missing))
 }
+
+@Test func replaceOverwritesAndKeepsTheFileOwnerOnly() throws {
+    let base = FileManager.default.temporaryDirectory.appendingPathComponent("privatefile-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: base) }
+    try PrivateFile.createDirectory(base.path)
+    let path = base.appendingPathComponent("ring-id").path
+
+    try PrivateFile.replace(Data("first\n".utf8), at: path)
+    #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == Data("first\n".utf8))
+
+    // An existing file readable by others is replaced by an owner-only one.
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path)
+    try PrivateFile.replace(Data("second\n".utf8), at: path)
+    #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == Data("second\n".utf8))
+    #expect(try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? Int == 0o600)
+
+    // No temporary file is left beside it.
+    #expect(try FileManager.default.contentsOfDirectory(atPath: base.path) == ["ring-id"])
+}
