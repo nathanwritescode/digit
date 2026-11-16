@@ -40,8 +40,19 @@ jobs:
       - name: Build
         run: swift build
 
+      # Running the suite takes seconds (this step also builds the tests), so a step that runs for
+      # many minutes has hung; it is cut off instead of holding the job until the job's timeout.
       - name: Test
+        timeout-minutes: 10
         run: swift test
+
+      # Again with a one-thread concurrency pool, which catches code that keeps a thread and
+      # starves the tasks and timers that should run beside it. Already built by the step above.
+      - name: Test with a one-thread concurrency pool
+        timeout-minutes: 5
+        env:
+          LIBDISPATCH_COOPERATIVE_POOL_STRICT: "1"
+        run: swift test --skip-build
 
   app:
     name: App build (iOS simulator)
