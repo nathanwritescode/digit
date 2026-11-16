@@ -152,29 +152,53 @@ extension RingStore {
     /// undelivered value is kept, so the consumer always ends on the latest state. Observing stops when the consumer stops iterating or its task
     /// is cancelled. Errors end the stream.
     ///
-    /// Suspension: starting to iterate while suspended ends the stream with
-    /// `RingStoreError.suspended`, and so does an interruption caused by a suspension later. While
-    /// the app is suspended no write commits, so an observation that is already running yields
-    /// nothing new until the app resumes.
+    /// Suspension (file-backed stores): the check runs when the stream is created, not when
+    /// iteration starts, so a stream created while suspended ends at once with
+    /// `RingStoreError.suspended`. An active stream counts as a call in progress, and
+    /// `appWillSuspend()` ends it with `suspended` and cancels the observation, then waits until its
+    /// task has stopped. A fetch already running when the announcement came finishes first. Whether
+    /// GRDB can still start a fetch it had scheduled after that task stops is not established; such
+    /// a fetch would be refused by the store's check inside it, but only after GRDB had begun its
+    /// read transaction (not tested). (A commit can still happen after the
+    /// announcement, from a write that only had its commit left; the stream has ended by then.)
+    /// To observe again after `appDidResume()`, create a new stream.
     public func observeLatestSleepNight(ringID: UUID) -> AsyncThrowingStream<SleepNightDetail?, Error> {
         let writer = self.writer
         let observesSuspension = self.observesSuspension
         return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            let task = Task {
-                var epoch: UInt64 = 0
+            let handle = ObservationTaskHandle()
+            let registration: (epoch: UInt64, id: UInt64)?
+            if observesSuspension {
                 do {
-                    if observesSuspension { epoch = try SuspensionState.enter() }
+                    registration = try SuspensionState.enterObservation {
+                        continuation.finish(throwing: RingStoreError.suspended)
+                        handle.cancel()
+                    }
+                } catch {
+                    continuation.finish(throwing: error)
+                    return
+                }
+            } else {
+                registration = nil
+            }
+            let task = Task {
+                // Counted until the observation has actually stopped, so a drain waits for it.
+                defer { if let registration { SuspensionState.leaveObservation(id: registration.id) } }
+                do {
                     let observation = ValueObservation.tracking { db in
-                        try Self.latestSleepNight(db, ringID: ringID)
+                        try SuspensionState.check(since: registration?.epoch)
+                        return try Self.latestSleepNight(db, ringID: ringID)
                     }.removeDuplicates()
                     for try await value in observation.values(in: writer, bufferingPolicy: .bufferingNewest(1)) {
                         continuation.yield(value)
                     }
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: observesSuspension ? Self.mapSuspension(error, since: epoch) : error)
+                    // A no-op if the announcement already ended the stream.
+                    continuation.finish(throwing: registration.map { Self.mapSuspension(error, since: $0.epoch) } ?? error)
                 }
             }
+            handle.set(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }

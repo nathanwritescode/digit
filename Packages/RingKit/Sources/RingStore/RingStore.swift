@@ -34,7 +34,8 @@ import SQLite3
 /// which return an empty list.
 ///
 /// **Suspension.** A file-backed store observes `appWillSuspend()` and `appDidResume()`: while
-/// suspended every call throws `RingStoreError.suspended` and takes no database lock (see those two
+/// suspended every new call throws `RingStoreError.suspended` without touching the database, and
+/// `appWillSuspend()` returns only once the calls in progress have finished (see those two
 /// functions and `Suspension.swift`). In-memory stores ignore suspension.
 public final class RingStore: Sendable {
     // Internal, not private, so tests can inspect the schema and issue raw SQL.
@@ -69,26 +70,38 @@ public final class RingStore: Sendable {
     ///
     /// Synchronous: opening, migrating and setting file protection all happen on the calling
     /// thread. The app uses `open(at:)` instead. Throws `RingStoreError.suspended` while the app is
-    /// suspended (see `appWillSuspend()`), since migrating takes a write lock.
+    /// suspended (see `appWillSuspend()`), since migrating takes a write lock, and
+    /// `RingStoreError.schemaTooNew` if a newer build has migrated the file.
     public convenience init(url: URL) throws {
         try self.init(url: url, observesSuspension: true)
+    }
+
+    /// Points in opening that tests can observe or act at. Production uses the defaults.
+    struct OpenHooks: Sendable {
+        /// Sets file protection on one path. The default sets it on iOS and does nothing elsewhere.
+        var protect: @Sendable (String) throws -> Void = RingStore.setFileProtection
+        /// Runs after the first suspension check inside coordination and just before
+        /// `DatabasePool.init`: the window in which GRDB would not yet see an announcement.
+        var beforePoolCreated: @Sendable () -> Void = {}
     }
 
     /// `observesSuspension: false` is for tests only: suspension is process-wide, so the tests that
     /// suspend run in one serialised suite and every other file-backed test opens its store this
     /// way, so a suspension in one test cannot fail another running in parallel.
-    init(url: URL, observesSuspension: Bool) throws {
+    init(url: URL, observesSuspension: Bool, hooks: OpenHooks = OpenHooks()) throws {
         if observesSuspension {
-            // Opening migrates, which takes the write lock, so it is refused while suspended, and a
-            // suspension during it surfaces as `suspended` like any other write.
+            // Opening migrates, which takes the write lock, so it is refused while suspended, counts
+            // as a call in progress for `appWillSuspend()`'s wait, and a suspension during it
+            // surfaces as `suspended` like any other write.
             let epoch = try SuspensionState.enter()
+            defer { SuspensionState.leave() }
             do {
-                writer = try Self.openPool(at: url, observesSuspension: true)
+                writer = try Self.openPool(at: url, observesSuspension: true, epoch: epoch, hooks: hooks)
             } catch {
                 throw Self.mapSuspension(error, since: epoch)
             }
         } else {
-            writer = try Self.openPool(at: url, observesSuspension: false)
+            writer = try Self.openPool(at: url, observesSuspension: false, epoch: nil, hooks: hooks)
         }
         self.observesSuspension = observesSuspension
     }
@@ -104,19 +117,42 @@ public final class RingStore: Sendable {
     /// GRDB's "Sharing a Database" guide (section "Use the WAL mode") opens a shared database
     /// inside an `NSFileCoordinator` write coordination, because several processes (the app and,
     /// later, a widget) may open it at the same time, and one of them may be creating or
-    /// migrating it. Coordination takes no SQLite lock and writes no file.
-    private static func openPool(at url: URL, observesSuspension: Bool) throws -> DatabasePool {
+    /// migrating it. Coordination takes no SQLite lock and writes no file. Its wait has no
+    /// timeout: another process holding a coordinated access to the file (a widget opening it)
+    /// delays this open for as long as it holds it, which is one reason migrations must stay quick.
+    ///
+    /// `epoch` is `nil` for a store that ignores suspension.
+    private static func openPool(
+        at url: URL, observesSuspension: Bool, epoch: UInt64?, hooks: OpenHooks
+    ) throws -> DatabasePool {
         let coordinator = NSFileCoordinator(filePresenter: nil)
         var coordinatorError: NSError?
         var result: Result<DatabasePool, any Error>?
         coordinator.coordinate(writingItemAt: url, options: .forMerging, error: &coordinatorError) { url in
             result = Result {
+                // The wait for coordination can be long, and an announcement made during it is not
+                // seen by GRDB, which registers its suspension observers only inside
+                // `DatabasePool.init`. So check again before creating anything.
+                try SuspensionState.check(since: epoch)
                 try Self.prepareFile(at: url)
+                // Before opening as well as after, so the `-wal` and `-shm` files SQLite creates on a
+                // first open are created inside a directory that is already protected.
+                try Self.protectFiles(at: url, hooks.protect)
+                hooks.beforePoolCreated()
                 let pool = try DatabasePool(
                     path: url.path, configuration: Self.fileConfiguration(observesSuspension: observesSuspension))
+                // And again now that GRDB observes suspension: one announced between the check
+                // above and `DatabasePool.init` would otherwise go unseen, and migrating takes the
+                // write lock. Throwing here releases the pool, which closes it, before any migration.
+                try SuspensionState.check(since: epoch)
+                // Guide, "Use the WAL mode" (the writer sample): never write into a schema a newer
+                // build created; an older build would not know its tables or rules.
+                if try pool.read({ db in try Self.migrator.hasBeenSuperseded(db) }) {
+                    throw RingStoreError.schemaTooNew
+                }
                 try Self.migrator.migrate(pool)
                 // After migrating, so the -wal and -shm files exist and get the same treatment.
-                try Self.protectFiles(at: url)
+                try Self.protectFiles(at: url, hooks.protect)
                 return pool
             }
         }
@@ -152,20 +188,31 @@ public final class RingStore: Sendable {
         // `Suspension.swift`.
         configuration.observesSuspensionNotifications = observesSuspension
         configuration.prepareDatabase { db in
+            guard !db.configuration.readonly else { return }
             // Guide, "Use the WAL mode" and "The Specific Case of Read-Only Connections": a
             // read-only connection (the widget's, later) fails unless the `-wal` and `-shm` files
-            // exist, and SQLite may delete them when the last connection closes. Persistent WAL
-            // keeps them. Set on writable connections only, as the guide does.
-            if !db.configuration.readonly {
-                var flag: CInt = 1
-                let code = withUnsafeMutablePointer(to: &flag) { pointer in
-                    sqlite3_file_control(db.sqliteConnection, nil, SQLITE_FCNTL_PERSIST_WAL, pointer)
-                }
-                guard code == SQLITE_OK else { throw DatabaseError(resultCode: ResultCode(rawValue: code)) }
+            // exist. The guide says SQLite may delete them when the last connection closes,
+            // depending on the SQLite and OS versions. On Apple platforms this overstates it: the
+            // system SQLite has persistent WAL on by default (with this call removed the flag still
+            // reads back as 1 and the files are kept; seen on macOS in review of #64). That is a
+            // platform default, not a promise, so the flag is set explicitly. Set on writable
+            // connections only, as the guide does.
+            var flag: CInt = 1
+            let code = withUnsafeMutablePointer(to: &flag) { pointer in
+                sqlite3_file_control(db.sqliteConnection, nil, SQLITE_FCNTL_PERSIST_WAL, pointer)
             }
+            guard code == SQLITE_OK else { throw DatabaseError(resultCode: ResultCode(rawValue: code)) }
+            // With persistent WAL the `-wal` file is never deleted, and SQLite does not shrink it
+            // on its own: it would stay at the size of the largest transaction ever written,
+            // holding old page images (rows since deleted included) on disk and in device backups.
+            // This limit has SQLite truncate it to 4 MB whenever it is reset after a checkpoint.
+            try db.execute(sql: "PRAGMA journal_size_limit = \(Self.journalSizeLimit)")
         }
         return configuration
     }
+
+    /// Bytes the `-wal` file is truncated to after a checkpoint (`PRAGMA journal_size_limit`).
+    static let journalSizeLimit = 4 * 1024 * 1024
 
     // MARK: Rings
 
@@ -808,32 +855,31 @@ public final class RingStore: Sendable {
     /// `completeUntilFirstUserAuthentication` on the files and their directory: background sync
     /// can then write while the phone is locked after the first unlock (the stricter `complete`
     /// would make that fail), and the data stays encrypted before first unlock. The directory
-    /// setting is what covers `-wal`/`-shm` files SQLite creates later. Not verified on a device;
-    /// the simulator does not enforce data protection.
-    private static func protectFiles(at url: URL) throws {
+    /// setting is what covers `-wal`/`-shm` files SQLite creates later. Called with
+    /// `setFileProtection` in production; tests inject a recorder through `OpenHooks`. Not verified
+    /// on a device; the simulator does not enforce data protection.
+    private static func protectFiles(at url: URL, _ protect: (String) throws -> Void) throws {
         for suffix in ["-wal", "-shm"] {
             let path = url.path + suffix
             if chmod(path, 0o600) != 0, errno != ENOENT {
                 throw RingStoreError.fileAccess(path: path, errno: errno)
             }
         }
-        #if os(iOS)
-        let protection: [FileAttributeKey: Any] = [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
-        try applyProtection(at: url) { path in
-            try FileManager.default.setAttributes(protection, ofItemAtPath: path)
-        }
-        #endif
-    }
-
-    /// Calls `protect` on the database's directory and on the database, `-wal` and `-shm` files
-    /// that exist, in that order. Split out of `protectFiles` so a test can check which paths get
-    /// the attribute on macOS, where the store does not set it.
-    static func applyProtection(at url: URL, _ protect: (String) throws -> Void) rethrows {
+        // The directory first, then the database, `-wal` and `-shm` files that exist.
         var paths = [url.deletingLastPathComponent().path]
         for suffix in ["", "-wal", "-shm"] { paths.append(url.path + suffix) }
         for path in paths where FileManager.default.fileExists(atPath: path) {
             try protect(path)
         }
+    }
+
+    /// `completeUntilFirstUserAuthentication` on one path, on iOS only (macOS, where the tests run,
+    /// is left alone).
+    @Sendable static func setFileProtection(_ path: String) throws {
+        #if os(iOS)
+        try FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: path)
+        #endif
     }
 
     // MARK: Row conversion
