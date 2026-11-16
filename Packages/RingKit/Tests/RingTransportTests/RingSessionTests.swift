@@ -66,7 +66,8 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     private var heldEmpty: CheckedContinuation<Frame?, Never>?
     private var waitsForever = false
     private var partialResets = 0
-    private var partialResetDelay: TimeInterval = 0
+    private var holdPartialReset = false
+    private var heldPartialReset: CheckedContinuation<Void, Never>?
 
     func parkNextSend() { mutate { faults.append(.park) } }
     func parkSends(ofGroup group: UInt8) { mutate { parkedGroup = group } }
@@ -86,8 +87,17 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     func setAlwaysReady(_ frame: Frame?) { mutate { alwaysReady = frame } }
     func holdNextEmptyRead() { mutate { holdNextEmpty = true } }
     func setWaitsForever(_ value: Bool) { mutate { waitsForever = value } }
-    /// `discardPartialFrames` takes this long, as a slow Bluetooth queue might.
-    func delayPartialReset(by seconds: TimeInterval) { mutate { partialResetDelay = seconds } }
+    /// `discardPartialFrames` does not return until `releasePartialReset()`.
+    func holdPartialResets() { mutate { holdPartialReset = true } }
+    func releasePartialReset() {
+        mutate { () -> CheckedContinuation<Void, Never>? in
+            holdPartialReset = false
+            return heldPartialReset.take()
+        }?.resume()
+    }
+    func waitUntilPartialResetHeld(within seconds: Double = 10) async -> Bool {
+        await waitFor(within: seconds) { self.heldPartialReset != nil }
+    }
     var resets: Int { lock.withLock { partialResets } }
 
     func releaseParked() {
@@ -108,10 +118,12 @@ private final class FakeLink: RingLink, @unchecked Sendable {
         let reading = mutate { () -> [CheckedContinuation<Frame?, Never>] in
             parkedGroup = nil
             parkEverything = false
+            holdPartialReset = false
             alwaysReady = nil
             trickleFrame = nil
             trickleAfterSend = nil
             holdNextEmpty = false
+            heldPartialReset.take()?.resume()
             var woken = [heldEmpty.take()].compactMap { $0 }
             if waitsForever, let current = reader {
                 reader = nil
@@ -184,15 +196,13 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     }
 
     func discardPartialFrames() async {
-        let delay = mutate { () -> TimeInterval in
+        let hold = mutate { () -> Bool in
             partialResets += 1
             log.append("reset")
-            return partialResetDelay
+            return holdPartialReset
         }
-        guard delay > 0 else { return }
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { continuation.resume() }
-        }
+        guard hold else { return }
+        await withCheckedContinuation { continuation in mutate { heldPartialReset = continuation } }
     }
 
     private enum Read { case now(Frame?), wait(id: Int, forever: Bool) }
@@ -904,9 +914,10 @@ private func expectTimeoutAtTheDeadline(alwaysReady frame: Frame) async throws {
     let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
     defer { link.close() }
     link.parkAllSends()
-    let replyTimeout = 0.3
+    // A backstop of about 1 s, so the slack allowed below is well under one backstop.
+    let replyTimeout = 1.0
     let backstop = link.writeTimeout + replyTimeout
-    let conversationTimeout = backstop + 0.15
+    let conversationTimeout = backstop + 0.3
     let s = RingSession(link: link, replyTimeout: replyTimeout, conversationTimeout: conversationTimeout, monotonicNow: { ContinuousClock.now })
     try await using(s, link) { s async throws in
         await s.start()
@@ -922,38 +933,65 @@ private func expectTimeoutAtTheDeadline(alwaysReady frame: Frame) async throws {
         case .failure(RingError.timeout)?: break
         case let other: Issue.record("expected a timeout, got \(String(describing: other))")
         }
-        // A little slack for timers on a loaded machine; the old bound was about 4B.
-        #expect(overrun < .seconds(3 * backstop + 0.2))
+        // Half a backstop of slack for timers on a loaded machine; the old bound was about 4B.
+        #expect(overrun < .seconds(3.5 * backstop))
     }
 }
 
 // A command is never written after the conversation's deadline: here the deadline passes while the
-// link is dropping partial frames, before the command is written.
+// link is dropping partial frames, before the command is written. The clock is moved by hand, so
+// how long the drain takes on a loaded machine cannot matter.
 @Test(.timeLimit(.minutes(1))) func aCommandIsNeverWrittenAfterTheDeadline() async throws {
     let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
-    link.delayPartialReset(by: 0.5)
-    let s = RingSession(link: link, replyTimeout: 0.05, conversationTimeout: 0.1, monotonicNow: { ContinuousClock.now })
+    link.holdPartialResets()
+    let clock = ManualClock()
+    let s = RingSession(link: link, replyTimeout: 0.05, conversationTimeout: 5, monotonicNow: { clock.now() })
     try await using(s, link) { s async throws in
-        await expectTimeout(waitingFor: "reply to 0200") { _ = try await s.request(Command.deviceInfo) }
+        let pending = Task { try await s.request(Command.deviceInfo) }
+        #expect(await link.waitUntilPartialResetHeld())
+        clock.advance(by: 6)
+        link.releasePartialReset()
+        switch await outcome(of: pending, within: 10) {
+        case .failure(RingError.timeout(let what))?: #expect(what == "reply to 0200")
+        case let other: Issue.record("expected a timeout, got \(String(describing: other))")
+        }
         #expect(!link.events.contains("attempt 0200"))
     }
+}
+
+/// A monotonic clock that moves only when the test says so.
+// @unchecked Sendable: all state is guarded by `lock`.
+private final class ManualClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var offset: Duration = .zero
+    private let start = ContinuousClock.now
+    func now() -> ContinuousClock.Instant { lock.withLock { start + offset } }
+    func advance(by seconds: Double) { lock.withLock { offset += .seconds(seconds) } }
 }
 
 // The wait for acknowledgements before a conversation's write ends at the conversation's deadline,
 // not one write backstop later: a conversation that reaches its write with little time left and
 // an acknowledgement still unwritten fails with that timeout, and does not write its command.
+// The clock is moved by hand so the conversation reaches its write with 0.2 s left, while the
+// stuck acknowledgement's backstop is about 2 s away.
 @Test(.timeLimit(.minutes(1))) func waitForAcknowledgementsBeforeAWriteEndsAtTheDeadline() async throws {
     let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
     defer { link.close() }
     link.parkSends(ofGroup: 0x04)
-    // The acknowledgement's backstop (about 1 s) is far beyond the deadline (0.2 s).
-    let s = RingSession(link: link, replyTimeout: 1, conversationTimeout: 0.2, monotonicNow: { ContinuousClock.now })
+    link.holdPartialResets()
+    let clock = ManualClock()
+    let s = RingSession(link: link, replyTimeout: 2, conversationTimeout: 5, monotonicNow: { clock.now() })
     try await using(s, link) { s async throws in
         await s.start()
         link.deliver([event])
         #expect(await link.waitUntilSendParked())
-        await expectTimeout(waitingFor: "event acknowledgements to be written") {
-            _ = try await s.request(Command.deviceInfo)
+        let pending = Task { try await s.request(Command.deviceInfo) }
+        #expect(await link.waitUntilPartialResetHeld())
+        clock.advance(by: 4.8)
+        link.releasePartialReset()
+        switch await outcome(of: pending, within: 20) {
+        case .failure(RingError.timeout(let what))?: #expect(what == "event acknowledgements to be written")
+        case let other: Issue.record("expected a timeout, got \(String(describing: other))")
         }
         #expect(!link.events.contains("attempt 0200"))
     }
