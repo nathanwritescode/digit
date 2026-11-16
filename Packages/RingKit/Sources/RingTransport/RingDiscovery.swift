@@ -10,8 +10,9 @@ enum RingDiscovery {
     /// name starts with one of `namePrefixes` (ignoring case). Empty prefixes are ignored, so they
     /// cannot accept every device.
     ///
-    /// Both tests are needed because it is not yet known whether the R99 puts the YCBT service in
-    /// its advertisement at all (a 128-bit UUID takes 18 of the 31 advertising bytes).
+    /// Both tests are needed: the R99 does not list the YCBT service in what it advertises (seen
+    /// from a Mac; a 128-bit UUID takes 18 of the 31 advertising bytes), so it is matched by name,
+    /// and the service test is for other rings of the family that may.
     static func isCandidate(_ device: DiscoveredDevice, service: String, namePrefixes: [String]) -> Bool {
         if device.serviceUUIDs.contains(where: { $0.caseInsensitiveCompare(service) == .orderedSame }) {
             return true
