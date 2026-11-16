@@ -12,7 +12,7 @@ func onEachStoreAsync(_ body: (RingStore) async throws -> Void) async throws {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: dir) }
-    try await body(RingStore(url: dir.appendingPathComponent("ring.sqlite")))
+    try await body(RingStore(url: dir.appendingPathComponent("ring.sqlite"), observesSuspension: false))
 }
 
 /// The internal blocking forms, reachable from an `async` test or closure: inside an async context
@@ -64,7 +64,7 @@ private func rawExecute(_ store: RingStore, _ sql: String, _ arguments: Statemen
     try store.writer.write { db in try db.execute(sql: sql, arguments: arguments) }
 }
 
-struct AsyncTwinTests {
+@Suite(.timeLimit(.minutes(1))) struct AsyncTwinTests {
     /// A `now` that is not a whole millisecond: the returned ring equals what is read back.
     @Test func registerRingWithFractionalMillisecondReturnsWhatIsStored() async throws {
         try await onEachStoreAsync { store in
@@ -249,7 +249,7 @@ struct AsyncTwinTests {
     }
 }
 
-struct PeripheralIdentifierTests {
+@Suite(.timeLimit(.minutes(1))) struct PeripheralIdentifierTests {
     /// The registered migrations, in order. Applied migrations are tracked by name, so a rename
     /// or reorder would break existing databases.
     @Test func migrationNamesAndOrderArePinned() {
@@ -371,7 +371,7 @@ struct PeripheralIdentifierTests {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = try RingStore(url: dir.appendingPathComponent("ring.sqlite"))
+        let store = try RingStore(url: dir.appendingPathComponent("ring.sqlite"), observesSuspension: false)
         var ids: [UUID] = []
         for _ in 0..<12 { ids.append(try await store.registerRing(protocolFamily: "ycbt").id) }
         let x = UUID()
@@ -514,7 +514,7 @@ struct PeripheralIdentifierTests {
                     arguments: [id.uuidString])
             }
         }
-        let store = try RingStore(url: url)
+        let store = try RingStore(url: url, observesSuspension: false)
         let ring = try #require(try store.ring(id: id))
         #expect(ring.model == "M" && ring.firmware == "1")
         #expect(ring.peripheralIdentifier == nil)
@@ -534,7 +534,7 @@ struct PeripheralIdentifierTests {
         let id = UUID(), other = UUID()
         let data = hrBytes(1000, bpm: 60)
         try makeV4Database(at: url, id: id, other: other, data: data)
-        let store = try RingStore(url: url)
+        let store = try RingStore(url: url, observesSuspension: false)
         #expect(try await store.rings().count == 2)
         #expect(try await store.rings().allSatisfy { $0.peripheralIdentifier == nil })
         #expect(try await store.transfers(ringID: id).transfers.map(\.transfer.data) == [data])

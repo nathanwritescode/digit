@@ -2,6 +2,10 @@ import CryptoKit
 import Foundation
 import GRDB
 import RingProtocol
+// Only for `sqlite3_file_control` (persistent WAL). GRDB links the system SQLite library, so this
+// is the same library GRDB's connections use; importing GRDB's own `GRDBSQLite` module instead
+// would need a new product dependency in Package.swift.
+import SQLite3
 
 /// The app's on-device history: raw ring data exactly as received. Anything derived can be rebuilt
 /// from it. The caller chooses the file location (the app passes a URL inside an App Group
@@ -10,11 +14,11 @@ import RingProtocol
 /// No health data is ever logged from here. Errors thrown by SQLite itself surface as GRDB's
 /// `DatabaseError`; the store's own failures are `RingStoreError`.
 ///
-/// **The public database API is `async` only, except initialisation.** Every function that touches
-/// an open database is `async throws` and runs off the caller's thread. `init(url:)` (and
+/// **The public database API is `async` only, except the synchronous initialisers.** Every function
+/// that touches an open database is `async throws` and runs off the caller's thread. The app opens
+/// its store with `open(at:)`, which does the work off the caller's thread; `init(url:)` (and
 /// `init()`) are synchronous: they open the file, run every migration and set file protection on
-/// the calling thread, so call them off the main actor (an async opener is a follow-up for when
-/// the app links the store, #13). The synchronous same-name forms (`internal`,
+/// the calling thread. The synchronous same-name forms (`internal`,
 /// used by tests through `@testable import`) block the calling thread; they are not public because
 /// a same-name synchronous overload is chosen silently in any synchronous context and in any
 /// closure without an `await`, where it would block. Each pair calls one `static` implementation,
@@ -28,34 +32,96 @@ import RingProtocol
 /// **Errors.** A call naming a ring that is not stored throws `RingStoreError.unknownRing`, except
 /// the reads (`ring(id:)`, `transfer(id:)`), which return `nil`, and the typed and sleep reads,
 /// which return an empty list.
+///
+/// **Suspension.** A file-backed store observes `appWillSuspend()` and `appDidResume()`: while
+/// suspended every call throws `RingStoreError.suspended` and takes no database lock (see those two
+/// functions and `Suspension.swift`). In-memory stores ignore suspension.
 public final class RingStore: Sendable {
     // Internal, not private, so tests can inspect the schema and issue raw SQL.
     let writer: any DatabaseWriter
+    /// Whether this store follows `appWillSuspend()`/`appDidResume()`. True for every file-backed
+    /// store the public API opens; false for in-memory stores, which hold no file lock.
+    let observesSuspension: Bool
 
-    /// Opens (creating if needed) the database at `url` and migrates it. The database runs in WAL
-    /// mode, so SQLite also creates and recreates `-wal` and `-shm` files beside it.
+    /// Opens (creating if needed) the database at `url` and migrates it, off the caller's thread.
+    /// **This is the opener the app uses.** It does what `init(url:)` does on a background
+    /// dispatch queue, so neither the main actor nor a Swift concurrency thread is blocked by file
+    /// coordination, migration or file protection. It cannot be cancelled once started: a
+    /// cancelled caller still waits for the open to finish.
+    ///
+    /// Throws what `init(url:)` throws, including `RingStoreError.suspended` if called between
+    /// `appWillSuspend()` and `appDidResume()`.
+    public static func open(at url: URL) async throws -> RingStore {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(with: Result { try RingStore(url: url) })
+            }
+        }
+    }
+
+    /// Opens (creating if needed) the database at `url` and migrates it. The database runs in
+    /// persistent WAL mode, so SQLite also creates `-wal` and `-shm` files beside it and keeps them.
     ///
     /// `url` must be inside a directory dedicated to this database (for the app, a subdirectory
     /// of the App Group container). On iOS the directory itself is given file protection
-    /// `completeUntilFirstUserAuthentication`, because SQLite recreates the `-wal` and `-shm`
+    /// `completeUntilFirstUserAuthentication`, because SQLite can recreate the `-wal` and `-shm`
     /// files and only a protected directory covers the new ones.
     ///
     /// Synchronous: opening, migrating and setting file protection all happen on the calling
-    /// thread, so call it off the main actor.
-    public init(url: URL) throws {
-        try Self.prepareFile(at: url)
-        let pool = try DatabasePool(path: url.path, configuration: Self.configuration())
-        try Self.migrator.migrate(pool)
-        // After migrating, so the -wal and -shm files exist and get the same treatment.
-        try Self.protectFiles(at: url)
-        writer = pool
+    /// thread. The app uses `open(at:)` instead. Throws `RingStoreError.suspended` while the app is
+    /// suspended (see `appWillSuspend()`), since migrating takes a write lock.
+    public convenience init(url: URL) throws {
+        try self.init(url: url, observesSuspension: true)
     }
 
-    /// An empty in-memory database, for tests and previews.
+    /// `observesSuspension: false` is for tests only: suspension is process-wide, so the tests that
+    /// suspend run in one serialised suite and every other file-backed test opens its store this
+    /// way, so a suspension in one test cannot fail another running in parallel.
+    init(url: URL, observesSuspension: Bool) throws {
+        if observesSuspension {
+            // Opening migrates, which takes the write lock, so it is refused while suspended, and a
+            // suspension during it surfaces as `suspended` like any other write.
+            let epoch = try SuspensionState.enter()
+            do {
+                writer = try Self.openPool(at: url, observesSuspension: true)
+            } catch {
+                throw Self.mapSuspension(error, since: epoch)
+            }
+        } else {
+            writer = try Self.openPool(at: url, observesSuspension: false)
+        }
+        self.observesSuspension = observesSuspension
+    }
+
+    /// An empty in-memory database, for tests and previews. It ignores suspension.
     public init() throws {
         let queue = try DatabaseQueue(configuration: Self.configuration())
         try Self.migrator.migrate(queue)
         writer = queue
+        observesSuspension = false
+    }
+
+    /// GRDB's "Sharing a Database" guide (section "Use the WAL mode") opens a shared database
+    /// inside an `NSFileCoordinator` write coordination, because several processes (the app and,
+    /// later, a widget) may open it at the same time, and one of them may be creating or
+    /// migrating it. Coordination takes no SQLite lock and writes no file.
+    private static func openPool(at url: URL, observesSuspension: Bool) throws -> DatabasePool {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        var coordinatorError: NSError?
+        var result: Result<DatabasePool, any Error>?
+        coordinator.coordinate(writingItemAt: url, options: .forMerging, error: &coordinatorError) { url in
+            result = Result {
+                try Self.prepareFile(at: url)
+                let pool = try DatabasePool(
+                    path: url.path, configuration: Self.fileConfiguration(observesSuspension: observesSuspension))
+                try Self.migrator.migrate(pool)
+                // After migrating, so the -wal and -shm files exist and get the same treatment.
+                try Self.protectFiles(at: url)
+                return pool
+            }
+        }
+        if let result { return try result.get() }
+        throw coordinatorError ?? CocoaError(.fileWriteUnknown)
     }
 
     private static func configuration() -> Configuration {
@@ -69,6 +135,38 @@ public final class RingStore: Sendable {
         return configuration
     }
 
+    /// The settings a database in an App Group container needs, from GRDB's "Sharing a Database"
+    /// guide (GRDB 7.12, `GRDB/Documentation.docc/DatabaseSharing.md`). Only file-backed stores
+    /// use them; the in-memory store has no file to share.
+    static func fileConfiguration(observesSuspension: Bool) -> Configuration {
+        var configuration = configuration()
+        // Guide, "How to limit the SQLITE_BUSY error": without a busy timeout a write fails at once
+        // with SQLITE_BUSY ("database is locked") whenever another connection to the file holds
+        // the write lock: another process (a future widget or extension), or a second `RingStore`
+        // on the same file in this process. With it the write waits up to this long. Five seconds
+        // covers a normal write transaction and stays well inside an iOS background window; a
+        // longer wait still fails with SQLITE_BUSY.
+        configuration.busyMode = .timeout(5)
+        // Guide, "How to limit the 0xDEAD10CC exception": the store must stop taking database locks
+        // once the app announces it is about to be suspended, or iOS kills the app. See
+        // `Suspension.swift`.
+        configuration.observesSuspensionNotifications = observesSuspension
+        configuration.prepareDatabase { db in
+            // Guide, "Use the WAL mode" and "The Specific Case of Read-Only Connections": a
+            // read-only connection (the widget's, later) fails unless the `-wal` and `-shm` files
+            // exist, and SQLite may delete them when the last connection closes. Persistent WAL
+            // keeps them. Set on writable connections only, as the guide does.
+            if !db.configuration.readonly {
+                var flag: CInt = 1
+                let code = withUnsafeMutablePointer(to: &flag) { pointer in
+                    sqlite3_file_control(db.sqliteConnection, nil, SQLITE_FCNTL_PERSIST_WAL, pointer)
+                }
+                guard code == SQLITE_OK else { throw DatabaseError(resultCode: ResultCode(rawValue: code)) }
+            }
+        }
+        return configuration
+    }
+
     // MARK: Rings
 
     /// Blocking form of `registerRing(protocolFamily:model:firmware:now:)` (internal, for tests).
@@ -77,7 +175,7 @@ public final class RingStore: Sendable {
         protocolFamily: String, model: String? = nil, firmware: String? = nil, now: Date = Date()
     ) throws -> StoredRing {
         let ring = Self.newRing(protocolFamily: protocolFamily, model: model, firmware: firmware, now: now)
-        try writer.write { db in try Self.insertRing(db, ring) }
+        try writeBlocking { db in try Self.insertRing(db, ring) }
         return ring
     }
 
@@ -90,7 +188,7 @@ public final class RingStore: Sendable {
         protocolFamily: String, model: String? = nil, firmware: String? = nil, now: Date = Date()
     ) async throws -> StoredRing {
         let ring = Self.newRing(protocolFamily: protocolFamily, model: model, firmware: firmware, now: now)
-        try await writer.write { db in try Self.insertRing(db, ring) }
+        try await write { db in try Self.insertRing(db, ring) }
         return ring
     }
 
@@ -111,14 +209,14 @@ public final class RingStore: Sendable {
 
     /// Blocking form of `ring(id:)` (internal, for tests).
     func ring(id: UUID) throws -> StoredRing? {
-        try writer.read { db in try Self.ring(db, id: id) }
+        try readBlocking { db in try Self.ring(db, id: id) }
     }
 
     /// The ring stored under `id`, or `nil` if there is none (not an error). A stored
     /// `peripheral_identifier` that is not a UUID reads as `nil` rather than failing; a corrupt ring
     /// id still throws `corruptRow`. Can throw `CancellationError`.
     public func ring(id: UUID) async throws -> StoredRing? {
-        try await writer.read { db in try Self.ring(db, id: id) }
+        try await read { db in try Self.ring(db, id: id) }
     }
 
     private static func ring(_ db: Database, id: UUID) throws -> StoredRing? {
@@ -127,14 +225,14 @@ public final class RingStore: Sendable {
 
     /// Blocking form of `rings()` (internal, for tests).
     func rings() throws -> [StoredRing] {
-        try writer.read { db in try Self.rings(db) }
+        try readBlocking { db in try Self.rings(db) }
     }
 
     /// All rings, oldest first (by first-seen time, then id); empty when none. A malformed stored
     /// peripheral identifier reads as `nil` and never hides the other rings. Can throw
     /// `CancellationError`.
     public func rings() async throws -> [StoredRing] {
-        try await writer.read { db in try Self.rings(db) }
+        try await read { db in try Self.rings(db) }
     }
 
     private static func rings(_ db: Database) throws -> [StoredRing] {
@@ -143,14 +241,14 @@ public final class RingStore: Sendable {
 
     /// Blocking form of `updateRing(id:model:firmware:)` (internal, for tests).
     func updateRing(id: UUID, model: String?, firmware: String?) throws {
-        try writer.write { db in try Self.updateRing(db, id: id, model: model, firmware: firmware) }
+        try writeBlocking { db in try Self.updateRing(db, id: id, model: model, firmware: firmware) }
     }
 
     /// Replaces the model and firmware the ring reported (for example after a firmware update),
     /// both always overwritten, so `nil` clears one. Throws `unknownRing(id)` if no such ring is
     /// stored. One write transaction; a `CancellationError` rolls it back.
     public func updateRing(id: UUID, model: String?, firmware: String?) async throws {
-        try await writer.write { db in try Self.updateRing(db, id: id, model: model, firmware: firmware) }
+        try await write { db in try Self.updateRing(db, id: id, model: model, firmware: firmware) }
     }
 
     private static func updateRing(_ db: Database, id: UUID, model: String?, firmware: String?) throws {
@@ -162,7 +260,7 @@ public final class RingStore: Sendable {
 
     /// Blocking form of `ring(peripheralIdentifier:)` (internal, for tests).
     func ring(peripheralIdentifier: UUID) throws -> StoredRing? {
-        try writer.read { db in try Self.ring(db, peripheralIdentifier: peripheralIdentifier) }
+        try readBlocking { db in try Self.ring(db, peripheralIdentifier: peripheralIdentifier) }
     }
 
     /// The stored ring that holds this CoreBluetooth identifier, or `nil` (not an error). The
@@ -171,7 +269,7 @@ public final class RingStore: Sendable {
     /// registering a second ring for a ring the store already knows would store and ingest the
     /// same records twice. Can throw `CancellationError`.
     public func ring(peripheralIdentifier: UUID) async throws -> StoredRing? {
-        try await writer.read { db in try Self.ring(db, peripheralIdentifier: peripheralIdentifier) }
+        try await read { db in try Self.ring(db, peripheralIdentifier: peripheralIdentifier) }
     }
 
     private static func ring(_ db: Database, peripheralIdentifier: UUID) throws -> StoredRing? {
@@ -183,7 +281,7 @@ public final class RingStore: Sendable {
 
     /// Blocking form of `setPeripheralIdentifier(_:forRing:)` (internal, for tests).
     func setPeripheralIdentifier(_ identifier: UUID?, forRing id: UUID) throws {
-        try writer.write { db in try Self.setPeripheralIdentifier(db, identifier, forRing: id) }
+        try writeBlocking { db in try Self.setPeripheralIdentifier(db, identifier, forRing: id) }
     }
 
     /// Remembers the identifier CoreBluetooth gave this phone for the ring
@@ -210,7 +308,7 @@ public final class RingStore: Sendable {
     /// Throws `unknownRing(id)` first if no such ring is stored; either error leaves every row
     /// unchanged. One write transaction; a `CancellationError` rolls it back.
     public func setPeripheralIdentifier(_ identifier: UUID?, forRing id: UUID) async throws {
-        try await writer.write { db in try Self.setPeripheralIdentifier(db, identifier, forRing: id) }
+        try await write { db in try Self.setPeripheralIdentifier(db, identifier, forRing: id) }
     }
 
     private static func setPeripheralIdentifier(_ db: Database, _ identifier: UUID?, forRing id: UUID) throws {
@@ -269,7 +367,7 @@ public final class RingStore: Sendable {
     /// Blocking form of `insert(_:ringID:)` (internal, for tests).
     @discardableResult
     func insert(_ transfer: HistoryTransfer, ringID: UUID) throws -> InsertOutcome {
-        try writer.write { db in try Self.insert(db, transfer, ringID: ringID) }
+        try writeBlocking { db in try Self.insert(db, transfer, ringID: ringID) }
     }
 
     /// Stores `transfer` for `ringID`, in one write transaction with any pruning.
@@ -306,7 +404,7 @@ public final class RingStore: Sendable {
     /// observation). A `CancellationError` rolls the whole transaction back, observation included.
     @discardableResult
     public func insert(_ transfer: HistoryTransfer, ringID: UUID) async throws -> InsertOutcome {
-        try await writer.write { db in try Self.insert(db, transfer, ringID: ringID) }
+        try await write { db in try Self.insert(db, transfer, ringID: ringID) }
     }
 
     private static func insert(_ db: Database, _ transfer: HistoryTransfer, ringID: UUID) throws -> InsertOutcome {
@@ -350,14 +448,14 @@ public final class RingStore: Sendable {
 
     /// Blocking form of `transfer(id:)` (internal, for tests).
     func transfer(id: Int64) throws -> StoredTransfer? {
-        try writer.read { db in try Self.transfer(db, id: id) }
+        try readBlocking { db in try Self.transfer(db, id: id) }
     }
 
     /// One transfer by row id, or `nil` if there is none (for example it was pruned). Throws
     /// `corruptRow` if the row's kind code is not one this version knows (for example written by a
     /// newer version). Can throw `CancellationError`.
     public func transfer(id: Int64) async throws -> StoredTransfer? {
-        try await writer.read { db in try Self.transfer(db, id: id) }
+        try await read { db in try Self.transfer(db, id: id) }
     }
 
     private static func transfer(_ db: Database, id: Int64) throws -> StoredTransfer? {
@@ -369,7 +467,7 @@ public final class RingStore: Sendable {
 
     /// Blocking form of `observations(ringID:kind:)` (internal, for tests).
     func observations(ringID: UUID, kind: HistoryKind? = nil) throws -> ObservationListing {
-        try writer.read { db in try Self.observations(db, ringID: ringID, kind: kind) }
+        try readBlocking { db in try Self.observations(db, ringID: ringID, kind: kind) }
     }
 
     /// The fetch log for a ring, optionally of one kind: one entry per distinct fetch (same data
@@ -379,7 +477,7 @@ public final class RingStore: Sendable {
     /// fetch". (With `kind` given, no unknown row can match, so the count is 0.)
     /// Empty for a ring that is not stored (no error). Can throw `CancellationError`.
     public func observations(ringID: UUID, kind: HistoryKind? = nil) async throws -> ObservationListing {
-        try await writer.read { db in try Self.observations(db, ringID: ringID, kind: kind) }
+        try await read { db in try Self.observations(db, ringID: ringID, kind: kind) }
     }
 
     static func observations(_ db: Database, ringID: UUID, kind: HistoryKind?) throws -> ObservationListing {
@@ -411,7 +509,7 @@ public final class RingStore: Sendable {
     func transfers(
         ringID: UUID, kind: HistoryKind? = nil, fetchedWithin range: ClosedRange<Date>? = nil
     ) throws -> TransferListing {
-        try writer.read { db in try Self.transfers(db, ringID: ringID, kind: kind, fetchedWithin: range) }
+        try readBlocking { db in try Self.transfers(db, ringID: ringID, kind: kind, fetchedWithin: range) }
     }
 
     /// Transfers for a ring, optionally of one kind and within a fetched-at range, oldest first
@@ -428,7 +526,7 @@ public final class RingStore: Sendable {
     public func transfers(
         ringID: UUID, kind: HistoryKind? = nil, fetchedWithin range: ClosedRange<Date>? = nil
     ) async throws -> TransferListing {
-        try await writer.read { db in try Self.transfers(db, ringID: ringID, kind: kind, fetchedWithin: range) }
+        try await read { db in try Self.transfers(db, ringID: ringID, kind: kind, fetchedWithin: range) }
     }
 
     static func transfers(
@@ -461,7 +559,7 @@ public final class RingStore: Sendable {
 
     /// Blocking form of `recordClockSet(_:)` (internal, for tests).
     func recordClockSet(_ event: ClockSetEvent) throws {
-        try writer.write { db in try Self.recordClockSet(db, event) }
+        try writeBlocking { db in try Self.recordClockSet(db, event) }
     }
 
     /// Logs that the app set the ring's clock, with the zone and UTC offset it sent. Every
@@ -469,7 +567,7 @@ public final class RingStore: Sendable {
     /// merged. Throws `unknownRing(event.ringID)` if the ring is not stored. A `CancellationError`
     /// rolls the write back, so the caller cannot assume it was logged.
     public func recordClockSet(_ event: ClockSetEvent) async throws {
-        try await writer.write { db in try Self.recordClockSet(db, event) }
+        try await write { db in try Self.recordClockSet(db, event) }
     }
 
     private static func recordClockSet(_ db: Database, _ event: ClockSetEvent) throws {
@@ -484,13 +582,13 @@ public final class RingStore: Sendable {
 
     /// Blocking form of `clockSets(ringID:)` (internal, for tests).
     func clockSets(ringID: UUID) throws -> [ClockSetEvent] {
-        try writer.read { db in try Self.clockSets(db, ringID: ringID) }
+        try readBlocking { db in try Self.clockSets(db, ringID: ringID) }
     }
 
     /// Clock-set events for a ring in time order (ties in the order recorded); empty for a ring that
     /// is not stored. Can throw `CancellationError`.
     public func clockSets(ringID: UUID) async throws -> [ClockSetEvent] {
-        try await writer.read { db in try Self.clockSets(db, ringID: ringID) }
+        try await read { db in try Self.clockSets(db, ringID: ringID) }
     }
 
     static func clockSets(_ db: Database, ringID: UUID) throws -> [ClockSetEvent] {
@@ -698,7 +796,8 @@ public final class RingStore: Sendable {
     /// was ever looser is tightened. `O_CREAT` without `O_EXCL` covers both cases in one call and
     /// is created with 0600 from the start, so it is never briefly readable by others.
     private static func prepareFile(at url: URL) throws {
-        let fd = open(url.path, O_WRONLY | O_CREAT, 0o600)
+        // Qualified: the store's own `open(at:)` would otherwise shadow the system call.
+        let fd = Darwin.open(url.path, O_WRONLY | O_CREAT, 0o600)
         guard fd >= 0 else { throw RingStoreError.fileAccess(path: url.path, errno: errno) }
         defer { close(fd) }
         guard fchmod(fd, 0o600) == 0 else { throw RingStoreError.fileAccess(path: url.path, errno: errno) }
@@ -720,12 +819,21 @@ public final class RingStore: Sendable {
         }
         #if os(iOS)
         let protection: [FileAttributeKey: Any] = [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
-        var paths = [url.deletingLastPathComponent().path]
-        for suffix in ["", "-wal", "-shm"] { paths.append(url.path + suffix) }
-        for path in paths where FileManager.default.fileExists(atPath: path) {
+        try applyProtection(at: url) { path in
             try FileManager.default.setAttributes(protection, ofItemAtPath: path)
         }
         #endif
+    }
+
+    /// Calls `protect` on the database's directory and on the database, `-wal` and `-shm` files
+    /// that exist, in that order. Split out of `protectFiles` so a test can check which paths get
+    /// the attribute on macOS, where the store does not set it.
+    static func applyProtection(at url: URL, _ protect: (String) throws -> Void) rethrows {
+        var paths = [url.deletingLastPathComponent().path]
+        for suffix in ["", "-wal", "-shm"] { paths.append(url.path + suffix) }
+        for path in paths where FileManager.default.fileExists(atPath: path) {
+            try protect(path)
+        }
     }
 
     // MARK: Row conversion

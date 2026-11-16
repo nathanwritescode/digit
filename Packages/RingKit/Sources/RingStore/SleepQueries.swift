@@ -114,7 +114,7 @@ extension RingStore {
     /// The main sleep of the latest day that has one, with its stages; `nil` if the ring has no
     /// sessions.
     public func latestSleepNight(ringID: UUID) async throws -> SleepNightDetail? {
-        try await writer.read { db in try Self.latestSleepNight(db, ringID: ringID) }
+        try await read { db in try Self.latestSleepNight(db, ringID: ringID) }
     }
 
     /// Every night whose day is in `first...last` (inclusive), naps included and flagged, ordered
@@ -124,7 +124,7 @@ extension RingStore {
     public func sleepNights(ringID: UUID, from first: SleepDay, through last: SleepDay) async throws
         -> [SleepNightSummary]
     {
-        try await writer.read { db in
+        try await read { db in
             try Self.sleepNightGroups(db, ringID: ringID)
                 .map(\.summary)
                 .filter { first <= $0.day && $0.day <= last }
@@ -138,7 +138,7 @@ extension RingStore {
     /// in a summary; a value that has lost precision (for example after a round trip through text)
     /// will not match. A stable night identifier is tracked separately.
     public func sleepNightDetail(ringID: UUID, startingAt start: Date) async throws -> SleepNightDetail? {
-        try await writer.read { db in
+        try await read { db in
             guard let night = try Self.sleepNightGroups(db, ringID: ringID).first(where: { $0.summary.start == start })
             else { return nil }
             return try Self.detail(db, night)
@@ -151,11 +151,19 @@ extension RingStore {
     /// state goes A, B, A before the consumer reads, A can be delivered twice. Only the newest
     /// undelivered value is kept, so the consumer always ends on the latest state. Observing stops when the consumer stops iterating or its task
     /// is cancelled. Errors end the stream.
+    ///
+    /// Suspension: starting to iterate while suspended ends the stream with
+    /// `RingStoreError.suspended`, and so does an interruption caused by a suspension later. While
+    /// the app is suspended no write commits, so an observation that is already running yields
+    /// nothing new until the app resumes.
     public func observeLatestSleepNight(ringID: UUID) -> AsyncThrowingStream<SleepNightDetail?, Error> {
         let writer = self.writer
+        let observesSuspension = self.observesSuspension
         return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let task = Task {
+                var epoch: UInt64 = 0
                 do {
+                    if observesSuspension { epoch = try SuspensionState.enter() }
                     let observation = ValueObservation.tracking { db in
                         try Self.latestSleepNight(db, ringID: ringID)
                     }.removeDuplicates()
@@ -164,7 +172,7 @@ extension RingStore {
                     }
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: observesSuspension ? Self.mapSuspension(error, since: epoch) : error)
                 }
             }
             continuation.onTermination = { _ in task.cancel() }

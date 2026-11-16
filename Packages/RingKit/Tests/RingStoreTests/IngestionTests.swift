@@ -285,7 +285,7 @@ struct IngestionTests {
                 #expect(tables.isEmpty)
             }
         }
-        let store = try RingStore(url: url)
+        let store = try RingStore(url: url, observesSuspension: false)
         #expect(try store.transfers(ringID: ringID).transfers.map(\.transfer.data) == [data])
         #expect(try store.observations(ringID: ringID).observations.count == 1)
         #expect(try store.clockSets(ringID: ringID).count == 2)
