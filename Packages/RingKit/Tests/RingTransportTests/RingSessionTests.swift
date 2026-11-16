@@ -867,7 +867,9 @@ private func expectTimeoutAtTheDeadline(alwaysReady frame: Frame) async throws {
         case .failure(RingError.timeout)?: break
         case let other: Issue.record("expected a timeout, got \(String(describing: other))")
         }
-        #expect(ContinuousClock.now - start < .seconds(3))
+        // Well under the ten seconds the timers alone would take, with room for a loaded CI
+        // runner: a run there took 3.2 s while the rest of the package's tests ran beside it.
+        #expect(ContinuousClock.now - start < .seconds(7))
         link.setAlwaysReady(nil)
     }
 }
