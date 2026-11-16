@@ -299,12 +299,12 @@ struct RingStoreTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = try RingStore(url: dir.appendingPathComponent("ring.sqlite"))
-        let ring = try sync(store).registerRing(protocolFamily: "ycbt")
+        let ring = try blocking(store).registerRing(protocolFamily: "ycbt")
         let ringID = ring.id
         let outcomes = try await withThrowingTaskGroup(of: InsertOutcome.self) { group in
             for i in 0..<32 {
                 group.addTask {
-                    try store.insert(transfer(at: t0.addingTimeInterval(Double(i))), ringID: ringID)
+                    try blocking(store).insert(transfer(at: t0.addingTimeInterval(Double(i))), ringID: ringID)
                 }
             }
             var all: [InsertOutcome] = []
@@ -314,6 +314,6 @@ struct RingStoreTests {
         let inserted = outcomes.filter { if case .inserted = $0 { true } else { false } }
         #expect(inserted.count == 1)
         #expect(outcomes.count == 32)
-        #expect(try sync(store).transfers(ringID: ringID).transfers.count == 1)
+        #expect(try blocking(store).transfers(ringID: ringID).transfers.count == 1)
     }
 }
