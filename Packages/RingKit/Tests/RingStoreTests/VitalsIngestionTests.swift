@@ -13,7 +13,7 @@ private func at(_ seconds: Double) -> Date { t0.addingTimeInterval(seconds) }
 /// Time u32, steps u16, heart rate, systolic, diastolic, SpO2, respiration, HRV, CVRR, temperature
 /// (2 bytes), body fat (2 bytes), glucose, 2 trailing bytes. The estimate and unused fields are
 /// parameters so tests can fill them with non-zero values.
-private func combinedBytes(
+func combinedBytes(
     _ ringSeconds: UInt32, steps: Int = 0, hr: UInt8 = 0, systolic: UInt8 = 0, diastolic: UInt8 = 0,
     spo2: UInt8 = 0, resp: UInt8 = 0, hrv: UInt8 = 0, cvrr: UInt8 = 0,
     temperature: [UInt8] = [0, 0], bodyFat: [UInt8] = [0, 0], glucose: UInt8 = 0, trailing: [UInt8] = [0, 0]
