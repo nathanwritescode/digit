@@ -8,6 +8,7 @@ let package = Package(
         .library(name: "RingProtocol", targets: ["RingProtocol"]),
         .library(name: "RingTransport", targets: ["RingTransport"]),
         .library(name: "RingStore", targets: ["RingStore"]),
+        .library(name: "RingSync", targets: ["RingSync"]),
         .executable(name: "ringprobe", targets: ["ringprobe"]),
     ],
     dependencies: [
@@ -30,6 +31,12 @@ let package = Package(
                 .product(name: "GRDB", package: "GRDB.swift"),
             ]
         ),
+        // One sync against a connected ring: fetch and store history, set the clock, send the
+        // monitoring interval, ingest. No Bluetooth import, no UI, no network.
+        .target(
+            name: "RingSync",
+            dependencies: ["RingProtocol", "RingTransport", "RingStore"]
+        ),
         // macOS command-line tool for probing a ring and capturing raw data.
         .executableTarget(
             name: "ringprobe",
@@ -43,5 +50,13 @@ let package = Package(
             dependencies: ["RingProtocol", "RingStore", .product(name: "GRDB", package: "GRDB.swift")]
         ),
         .testTarget(name: "RingTransportTests", dependencies: ["RingProtocol", "RingTransport"]),
+        // GRDB only so tests can install SQL triggers that make one kind's store write fail.
+        .testTarget(
+            name: "RingSyncTests",
+            dependencies: [
+                "RingProtocol", "RingTransport", "RingStore", "RingSync",
+                .product(name: "GRDB", package: "GRDB.swift"),
+            ]
+        ),
     ]
 )
