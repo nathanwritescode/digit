@@ -22,7 +22,8 @@ public enum RingTime {
 }
 
 /// Reply to `Command.deviceInfo`. Firmware version verified on an R99 (`… 20 02 …` is 2.32).
-/// The battery byte is unverified: it has read 100% at every check so far.
+/// The battery byte is verified on an R99 (firmware 2.32): it fell with use and returned to 100
+/// after a charge. The state byte read 0 off the charger and 2 on it; other values are unknown.
 public struct DeviceInfo: Equatable, Sendable {
     public var deviceID: UInt16
     public var firmwareVersion: String
