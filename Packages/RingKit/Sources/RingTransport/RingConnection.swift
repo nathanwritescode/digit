@@ -15,6 +15,13 @@ public enum RingError: Error, CustomStringConvertible {
     case refusedDestructive(Frame)
     /// A second connect or write was started while one was still in progress.
     case busy(String)
+    /// `RingSession.stop()` was called; the link itself may still be up.
+    case stopped
+    /// More frames arrived for a conversation than it could hold while it was not reading.
+    case tooManyFrames(Int)
+    /// A request in the event (`0x04`) or live-value (`0x06`) group, whose reply the session's
+    /// reader would deliver to subscribers instead of the request.
+    case refusedUploadGroup(Frame)
 
     public var description: String {
         switch self {
@@ -28,6 +35,9 @@ public enum RingError: Error, CustomStringConvertible {
         case .checksumMismatch: "history transfer failed its checksum"
         case .busy(let what): "busy: \(what)"
         case .refusedDestructive(let frame): String(format: "refused to send %04X: it erases history from the ring", frame.type)
+        case .stopped: "the session was stopped"
+        case .tooManyFrames(let limit): "more than \(limit) frames arrived while the conversation was not reading"
+        case .refusedUploadGroup(let frame): String(format: "refused to send %04X: replies in group %02X are treated as ring uploads", frame.type, frame.group)
         }
     }
 }
@@ -197,11 +207,28 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     }
 
     /// Drops frames and partial frames left over from an earlier conversation.
+    ///
+    /// `RingSession` never calls this: it drops queued ring-initiated events, which must still be
+    /// acknowledged. Do not call it on a link a session is reading; the session drains the link
+    /// itself and uses `discardPartialFrames()`.
     public func discardPendingFrames() async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             queue.async {
                 self.assemblers = [:]
                 self.inbox.clear()
+                continuation.resume()
+            }
+        }
+    }
+
+    /// Resets the assembler of the command characteristic, which carries the replies, and nothing
+    /// else: queued complete frames stay, and so do partial frames on the upload characteristic,
+    /// which carries no replies, so a stale partial there cannot be misread as one. The cost is
+    /// that a misaligned upload stream is not recovered by this (only by reconnecting).
+    public func discardPartialFrames() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            queue.async {
+                self.assemblers[YCBT.command]?.reset()
                 continuation.resume()
             }
         }

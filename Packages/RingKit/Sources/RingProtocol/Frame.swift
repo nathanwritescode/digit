@@ -69,7 +69,8 @@ public struct FrameAssembler: Sendable {
             let length = Int(buffer[2]) | Int(buffer[3]) << 8
             guard length >= Frame.overhead, length <= FrameAssembler.maxFrameLength else {
                 // Not a frame header. A length-prefixed stream cannot be resynchronised reliably,
-                // so drop what is buffered; the transport also calls `reset()` before each request.
+                // so drop what is buffered; the transport also resets the reply channel's
+                // assembler before each conversation (`RingLink.discardPartialFrames`).
                 buffer.removeAll()
                 break
             }
