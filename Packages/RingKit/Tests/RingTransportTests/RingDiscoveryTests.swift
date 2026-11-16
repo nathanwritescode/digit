@@ -184,3 +184,15 @@ private func isUnknownIdentifier(_ error: RingError) -> Bool { if case .unknownI
         #expect(!error.description.contains(device(1).identifier.uuidString))
     }
 }
+
+@Test func printingOrDumpingADeviceHidesItsIdentifierAndName() {
+    let secret = device(7, name: "SECRETNAME 1234", rssi: -42, services: [ycbt])
+    var dumped = ""
+    dump(secret, to: &dumped)
+    for text in ["\(secret)", String(reflecting: secret), String(describing: secret), dumped, "\([secret])"] {
+        #expect(!text.contains(secret.identifier.uuidString))
+        #expect(!text.contains("SECRETNAME"))
+        #expect(!text.contains("000000000007"))
+    }
+    #expect("\(secret)".contains("-42"))
+}

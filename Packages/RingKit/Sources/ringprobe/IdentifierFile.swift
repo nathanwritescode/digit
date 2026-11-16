@@ -1,4 +1,5 @@
 import Foundation
+import RingTransport
 
 // Reading and writing the ring's CoreBluetooth identifier. The identifier identifies the owner's
 // ring on this Mac, so it never appears in terminal output or error messages.
@@ -52,61 +53,133 @@ func readRingIdentifier(path: String) -> Result<UUID, IdentifierFileError> {
 struct GitOutcome: Equatable {
     let status: Int32
     let output: String
+    var errorOutput = ""
 }
 
 typealias GitRunner = (_ directory: String, _ arguments: [String]) -> GitOutcome?
 
 /// Runs `git -C <directory> <arguments>` through `env`. Returns nil if git could not be started
-/// or was not found. Standard error is discarded.
+/// or was not found. The child's environment has the variables that redirect git's discovery
+/// removed, so the answer is about the directory and not about this process's environment, and
+/// `LC_ALL=C` so the messages `saveIDRefusal` matches on are stable.
 func runGit(directory: String, arguments: [String]) -> GitOutcome? {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
     process.arguments = ["git", "-C", directory] + arguments
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    process.standardError = FileHandle.nullDevice
+    var environment = ProcessInfo.processInfo.environment
+    for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM"] {
+        environment[key] = nil
+    }
+    environment["LC_ALL"] = "C"
+    process.environment = environment
+    let out = Pipe(), err = Pipe()
+    process.standardOutput = out
+    process.standardError = err
     process.standardInput = FileHandle.nullDevice
     do { try process.run() } catch { return nil }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    // Read both pipes concurrently so neither can fill and block git.
+    final class Collected: @unchecked Sendable { var data = Data() }
+    let collected = Collected()
+    let done = DispatchSemaphore(value: 0)
+    Thread { collected.data = err.fileHandleForReading.readDataToEndOfFile(); done.signal() }.start()
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    done.wait()
     process.waitUntilExit()
     // `env` exits 127 when it cannot find git.
     if process.terminationStatus == 127 { return nil }
-    return GitOutcome(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
+    return GitOutcome(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self),
+                      errorOutput: String(decoding: collected.data, as: UTF8.self))
 }
 
-/// Decides whether `scan --save-id` may write to `path`. The identifier must not be committed by
-/// accident, so a target inside a git work tree is refused unless git ignores that path.
-/// Returns nil if the write is allowed, or the reason it is refused. Nothing is written.
-func saveIDRefusal(path: String, git: GitRunner = runGit) -> String? {
-    let target = URL(fileURLWithPath: path).standardizedFileURL
-    // The directory may not exist yet: ask git from the nearest one that does, and resolve
-    // symbolic links there so git sees the same path as the work tree's own.
-    var directory = target.deletingLastPathComponent()
-    var tail = [target.lastPathComponent]
-    var isDirectory: ObjCBool = false
-    while directory.path != "/",
-          !(FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory) && isDirectory.boolValue) {
-        tail.insert(directory.lastPathComponent, at: 0)
-        directory = directory.deletingLastPathComponent()
-    }
-    directory = directory.resolvingSymlinksInPath()
-    let resolved = tail.reduce(directory) { $0.appendingPathComponent($1) }
+struct SaveTargetRefusal: Error, Equatable {
+    let message: String
+}
 
-    let suggestion = "choose a path outside the repository or one it ignores, for example ../../captures/ring-id (captures/ is git-ignored)"
-    guard let inside = git(directory.path, ["rev-parse", "--is-inside-work-tree"]) else {
-        return "cannot check whether \(path) could be committed (git could not be run); \(suggestion)"
+private let saveTargetAdvice = "choose a path outside the repository, or in a directory it ignores as a whole, for example ../../captures/ring-id (captures/ is git-ignored)"
+
+/// Turns the path given to `--save-id` into ONE physical path, used for both the git check and
+/// the write, so they cannot disagree. The nearest existing ancestor of the file's directory is
+/// resolved with `realpath` (symbolic links followed, and `..` after a link resolved the way the
+/// kernel does, not as text); what does not exist yet is appended, and may not contain `..`.
+/// A component that exists but is not a directory is refused.
+func resolveSaveTarget(path: String) -> Result<String, SaveTargetRefusal> {
+    func refuse(_ why: String) -> Result<String, SaveTargetRefusal> {
+        .failure(SaveTargetRefusal(message: "cannot use \(path): \(why)"))
     }
-    if inside.status == 128 { return nil } // not inside a git repository
+    let absolute = path.hasPrefix("/") ? path : FileManager.default.currentDirectoryPath + "/" + path
+    let components = absolute.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+    guard let name = components.last, name != "..", name != "." else { return refuse("it does not name a file") }
+    let parent = components.dropLast()
+
+    func isDirectory(_ path: String) -> Bool? {
+        var info = stat()
+        guard stat(path, &info) == 0 else { return nil }
+        return (info.st_mode & S_IFMT) == S_IFDIR
+    }
+    // The longest leading part of the directory that exists (as the kernel sees it).
+    var existing = parent.count
+    while existing > 0, isDirectory("/" + parent.prefix(existing).joined(separator: "/")) == nil { existing -= 1 }
+    let existingPath = "/" + parent.prefix(existing).joined(separator: "/")
+    guard isDirectory(existingPath) == true else { return refuse("a part of its directory is not a directory") }
+    let remaining = Array(parent.dropFirst(existing))
+    guard !remaining.contains(where: { $0 == ".." }) else { return refuse("it goes up (..) from a directory that does not exist") }
+    guard let real = realpath(existingPath, nil) else { return refuse("cannot resolve its directory") }
+    defer { free(real) }
+    let base = String(cString: real)
+    return .success(([base == "/" ? "" : base] + remaining.filter { $0 != "." } + [name]).joined(separator: "/"))
+}
+
+/// Decides whether `scan --save-id` may write to `path`, and where. The identifier must not be
+/// committed by accident, so a target inside a git work tree is refused unless git ignores both
+/// the target and the temporary file `PrivateFile.replace` writes beside it (a process that dies
+/// before the rename leaves that file behind, so the directory has to be ignored as a whole).
+/// On success returns the one resolved path to write; nothing is written here.
+func checkSaveTarget(path: String, git: GitRunner = runGit) -> Result<String, SaveTargetRefusal> {
+    let resolved: String
+    switch resolveSaveTarget(path: path) {
+    case .success(let value): resolved = value
+    case .failure(let refusal): return .failure(refusal)
+    }
+    func refuse(_ why: String) -> Result<String, SaveTargetRefusal> {
+        .failure(SaveTargetRefusal(message: "\(why); \(saveTargetAdvice)"))
+    }
+    // git runs from the nearest existing directory of the resolved path.
+    var directory = (resolved as NSString).deletingLastPathComponent
+    var isDirectory: ObjCBool = false
+    while directory != "/", !(FileManager.default.fileExists(atPath: directory, isDirectory: &isDirectory) && isDirectory.boolValue) {
+        directory = (directory as NSString).deletingLastPathComponent
+    }
+
+    guard let inside = git(directory, ["rev-parse", "--is-inside-work-tree"]) else {
+        return refuse("cannot check whether \(path) could be committed (git could not be run)")
+    }
+    // Only git's plain "no repository here" answer allows the write. Status 128 is also used for
+    // a broken .git, dubious ownership and more, none of which say the path is safe.
+    if inside.status == 128, inside.errorOutput.contains("not a git repository (or any of the parent directories)") {
+        return .success(resolved)
+    }
     guard inside.status == 0 else {
-        return "cannot check whether \(path) could be committed (git failed); \(suggestion)"
+        return refuse("git could not judge whether \(path) could be committed")
     }
     // "false" means inside a .git directory: still part of a repository, so refuse.
     guard inside.output.trimmingCharacters(in: .whitespacesAndNewlines) == "true" else {
-        return "\(path) is inside a git directory; \(suggestion)"
+        return refuse("\(path) is inside a git directory")
     }
-    guard let ignored = git(directory.path, ["check-ignore", "-q", "--", resolved.path]) else {
-        return "cannot check whether \(path) could be committed (git could not be run); \(suggestion)"
+    let samples = [resolved, PrivateFile.temporaryPath(for: resolved)]
+    for (index, sample) in samples.enumerated() {
+        guard let ignored = git(directory, ["check-ignore", "-q", "--", sample]) else {
+            return refuse("cannot check whether \(path) could be committed (git could not be run)")
+        }
+        if ignored.status == 0 { continue }
+        if ignored.status != 1 { return refuse("git could not judge whether \(path) could be committed") }
+        return refuse(index == 0
+            ? "\(path) is inside a git work tree and not ignored, so it could be committed"
+            : "\(path) is ignored, but the temporary file written beside it is not, and a crash could leave it there: ignore the containing directory as a whole")
     }
-    if ignored.status == 0 { return nil }
-    return "\(path) is inside a git work tree and not ignored, so it could be committed; \(suggestion)"
+    return .success(resolved)
+}
+
+/// The refusal for `path`, or nil if `checkSaveTarget` allows it.
+func saveIDRefusal(path: String, git: GitRunner = runGit) -> String? {
+    if case .failure(let refusal) = checkSaveTarget(path: path, git: git) { refusal.message } else { nil }
 }

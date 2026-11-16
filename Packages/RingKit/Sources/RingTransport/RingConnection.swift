@@ -67,6 +67,17 @@ public struct DiscoveredDevice: Sendable {
     }
 }
 
+// A device's identifier and name identify the owner's ring and neighbours' devices, so printing or
+// dumping one must not show them. The fields shown are listed by hand; a field added later stays
+// hidden until someone adds it on purpose.
+extension DiscoveredDevice: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    public var description: String { "DiscoveredDevice(rssi: \(rssi), services: \(serviceUUIDs.count); identifier and name hidden)" }
+    public var debugDescription: String { description }
+    public var customMirror: Mirror {
+        Mirror(self, children: ["rssi": rssi, "serviceCount": serviceUUIDs.count], displayStyle: .struct)
+    }
+}
+
 public enum YCBT {
     public static let service = CBUUID(string: "BE940000-7333-BE46-B7AE-689E71722BD5")
     /// Advertised name prefixes of the rings in this family that digit knows, for callers to pass

@@ -80,3 +80,21 @@ private func message(_ arguments: [String]) -> String? {
     // A malformed option is reported before the monitor argument is looked at.
     #expect(message(["monitor", "7", "--id"])?.contains("--id") == true)
 }
+
+@Test func optionValuesWrittenWithAnEqualsSignAreNeverEchoed() {
+    let id = "00000000-0000-0000-0000-000000000042"
+    let text = message(["info", "--id=\(id)"])
+    #expect(text?.contains("unknown option --id") == true)
+    #expect(text?.contains("--id-file") == true)
+    #expect(text?.contains(id) == false)
+    #expect(text?.contains("0042") == false)
+    let other = message(["info", "--name=\(id)"])
+    #expect(other == "unknown option --name")
+    #expect(message(["info", "--bogus=\(id)"]) == "unknown option --bogus")
+}
+
+@Test func everyRepeatedValueOptionIsRefused() {
+    for option in ["--name", "--id-file", "--save-id", "--save"] {
+        #expect(message(["scan", option, "a", option, "b"]) == "\(option) was given more than once", "\(option)")
+    }
+}

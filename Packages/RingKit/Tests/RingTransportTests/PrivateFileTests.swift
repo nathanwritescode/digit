@@ -128,3 +128,18 @@ import Testing
     #expect(throws: PrivateFile.Failure.self) { try PrivateFile.replace(Data([1]), at: path) }
     #expect(try FileManager.default.contentsOfDirectory(atPath: base.path).isEmpty)
 }
+
+@Test func anUnsyncableDirectoryDoesNotTurnASaveIntoAnError() throws {
+    let base = FileManager.default.temporaryDirectory.appendingPathComponent("privatefile-\(UUID().uuidString)")
+    try PrivateFile.createDirectory(base.path)
+    defer {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: base.path)
+        try? FileManager.default.removeItem(at: base)
+    }
+    let path = base.appendingPathComponent("ring-id").path
+    try PrivateFile.replace(Data("old".utf8), at: path)
+    // Write and search but no read: the file can be replaced but the directory cannot be opened to sync.
+    try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: base.path)
+    try PrivateFile.replace(Data("new".utf8), at: path)
+    #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == Data("new".utf8))
+}

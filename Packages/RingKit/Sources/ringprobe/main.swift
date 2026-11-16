@@ -77,7 +77,13 @@ let ringID: UUID? = {
     }
 }()
 // Refuse a save target that could be committed now, not after an 8 second scan.
-if let path = options.saveID, let refusal = saveIDRefusal(path: path) { fail(refusal) }
+// The one resolved path is used for the check and for the write.
+let saveIDTarget: String? = options.saveID.map { path in
+    switch checkSaveTarget(path: path) {
+    case .success(let resolved): return resolved
+    case .failure(let refusal): fail(refusal.message)
+    }
+}
 let operands = options.operands
 @Sendable func traceBytes(_ outgoing: Bool, _ bytes: [UInt8]) {
     print("  \(outgoing ? ">>" : "<<") \(bytes.map { String(format: "%02x", $0) }.joined())")
@@ -167,7 +173,7 @@ do {
     case "scan":
         let seconds = operands.first.flatMap(Double.init) ?? 8
         let devices = try await connection.scan(for: seconds)
-        if let saveIDFile = options.saveID {
+        if let saveIDFile = saveIDTarget {
             // The same rule as `discoverRings`, so scan and the app cannot disagree on what a ring is.
             let chosen = devices.filter { device in
                 guard scanMatch(for: device, nameOption: nameOption) == .candidate else { return false }
@@ -185,7 +191,7 @@ do {
                 fail("cannot save the identifier: \(error)")
             }
             // Only that it was saved: the identifier stays out of the terminal.
-            print("saved the ring's identifier to \(saveIDFile)")
+            print("saved the ring's identifier to \(options.saveID ?? saveIDFile)")
             break
         }
         for device in devices {

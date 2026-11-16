@@ -39,11 +39,14 @@ func parseArguments(_ arguments: [String]) -> Result<ProbeOptions, OptionError> 
     while index < arguments.count {
         let argument = arguments[index]
         index += 1
+        // For messages only: the part before any `=`, so a value written as `--opt=value` is never
+        // echoed (it could be an identifier).
+        let key = String(argument.prefix { $0 != "=" })
         switch argument {
         case "--trace": options.trace = true
         case "--show": options.show = true
         case "--allow-unknown": options.allowUnknown = true
-        case "--id":
+        case _ where key == "--id":
             // Removed: an identifier on the command line lands in shell history and transcripts.
             return .failure(OptionError(message: "unknown option --id: connect with --id-file <file>, which scan --save-id writes"))
         case _ where valueOptions.contains(argument):
@@ -61,7 +64,7 @@ func parseArguments(_ arguments: [String]) -> Result<ProbeOptions, OptionError> 
             }
             if alreadyGiven { return .failure(OptionError(message: "\(argument) was given more than once")) }
         case _ where argument.hasPrefix("--"):
-            return .failure(OptionError(message: "unknown option \(argument)"))
+            return .failure(OptionError(message: "unknown option \(key)"))
         default:
             positional.append(argument)
         }
