@@ -37,8 +37,10 @@ jobs:
           xcodebuild -version
           swift --version
 
+      # --only-use-versions-from-resolved-file makes a missing Package.resolved or a missing pin
+      # fail the build instead of being resolved silently; it does not check that the revision matches the app's (see the app job).
       - name: Build
-        run: swift build
+        run: swift build --only-use-versions-from-resolved-file
 
       # Running the suite takes seconds (this step also builds the tests), so a step that runs for
       # many minutes has hung; it is cut off instead of holding the job until the job's timeout.
@@ -48,7 +50,7 @@ jobs:
       - name: Test
         timeout-minutes: 10
         run: |
-          swift build --build-tests
+          swift build --build-tests --only-use-versions-from-resolved-file
           Scripts/test-each-target.sh
 
       # The transport and sync tests again with a one-thread concurrency pool, which catches code that
@@ -99,8 +101,20 @@ jobs:
             exit 1
           fi
 
+      # The app and RingKit each have a lockfile (each is its own root for package resolution).
+      # The app build accepts any pin inside Package.swift's requirement, so without this a
+      # dependency bumped in one lockfile only would leave the app and `swift test` on different
+      # revisions with CI green (#58). Uses jq, which is in /usr/bin on macOS 15 and later.
+      - name: Check that the app and RingKit lockfiles pin the same revisions
+        run: Scripts/check-lockfiles.sh
+
       - name: Build for the iOS simulator
         run: |
           xcodebuild -project App/Digit.xcodeproj -scheme Digit \
             -destination 'generic/platform=iOS Simulator' \
             -disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO build
+
+      # -disableAutomaticPackageResolution should stop the build rewriting the lockfile; this
+      # catches it if it ever does, which would otherwise pass unnoticed on a runner.
+      - name: Check that the build left the app's lockfile unchanged
+        run: git diff --exit-code -- App/Digit.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
