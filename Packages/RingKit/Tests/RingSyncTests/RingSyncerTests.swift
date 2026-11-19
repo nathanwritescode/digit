@@ -406,6 +406,7 @@ func clockDefinitelyNotAppliedStaysLoggedAndSkipsTheInterval(_ error: RingError)
         #expect(result.fetches[kind] == .notAttempted(.storeSuspended), "\(kind.name)")
     }
     #expect(result.clockSet == .skipped(.storeSuspended))
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .storeSuspended))
     for kind in HistoryKind.allCases { #expect(result.ingestions[kind] == .storeSuspended) }
 }
 

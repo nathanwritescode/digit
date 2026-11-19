@@ -310,7 +310,9 @@ public struct RingSyncer: Sendable {
             return .notLogged(SyncError(error))
         }
         // The time was read before the write; the entry must stay the event sent, so it is not
-        // re-read. If the write was slow the time is stale: leave the entry as a phantom.
+        // re-read. If the write was slow the time is stale: leave the entry as a phantom. This bounds
+        // only the log write; the session's write turn and the link's `writeTimeout` can add more
+        // before the ring receives the command, bounded by the transport's own deadlines.
         let elapsed = monotonicNow() - readAt
         if elapsed > maximumLogDelay { return .notSentLogTooSlow(event, elapsed: elapsed) }
         do {

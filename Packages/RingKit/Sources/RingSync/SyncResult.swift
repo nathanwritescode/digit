@@ -98,7 +98,9 @@ public enum ClockSetOutcome: Sendable, Equatable {
     /// `refusedUploadGroup`, `busy`). The entry stays in the log (a phantom clock-set).
     case notAppliedButLogged(ClockSetEvent, error: SyncError)
     /// Logging failed, so nothing was sent (a store suspension is `skipped(.storeSuspended)`
-    /// instead). Nothing was logged or sent.
+    /// instead). Nothing was sent, and the entry was almost certainly not logged: every error the
+    /// store maps comes before commit, but a non-store error after commit (a cancellation, once
+    /// #52 adds it) could leave an entry that this case reports as not logged.
     case notLogged(SyncError)
     /// Logged, but not sent: writing the entry took longer than `RingSyncer.maximumClockLogDelay`,
     /// so the time read before logging (the one in the entry) was stale and sending it would have
