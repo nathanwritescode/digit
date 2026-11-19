@@ -49,12 +49,16 @@ public final class RingStore: Sendable {
     /// dispatch queue, so neither the main actor nor a Swift concurrency thread is blocked by file
     /// coordination, migration or file protection. It cannot be cancelled once started: a
     /// cancelled caller still waits for the open to finish.
+    /// It runs at the calling task's priority.
     ///
     /// Throws what `init(url:)` throws, including `RingStoreError.suspended` if called between
     /// `appWillSuspend()` and `appDidResume()`.
     public static func open(at url: URL) async throws -> RingStore {
-        try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
+        let qos = DispatchQoS.QoSClass(rawValue: qos_class_t(rawValue: UInt32(Task.currentPriority.rawValue))) ?? .utility
+        return try await withCheckedThrowingContinuation { continuation in
+            // The open runs at the calling task's priority, so a background-priority caller does
+            // not make the system run its open at user-initiated QoS.
+            DispatchQueue.global(qos: qos).async {
                 continuation.resume(with: Result { try RingStore(url: url) })
             }
         }
@@ -80,29 +84,22 @@ public final class RingStore: Sendable {
     struct OpenHooks: Sendable {
         /// Sets file protection on one path. The default sets it on iOS and does nothing elsewhere.
         var protect: @Sendable (String) throws -> Void = RingStore.setFileProtection
-        /// Runs after the first suspension check inside coordination and just before
+        /// Runs after the open has entered (inside coordination) and just before
         /// `DatabasePool.init`: the window in which GRDB would not yet see an announcement.
         var beforePoolCreated: @Sendable () -> Void = {}
+        /// Seconds a write waits for another connection's write lock. Tests shorten it.
+        var busyTimeout: Double = 5
     }
 
     /// `observesSuspension: false` is for tests only: suspension is process-wide, so the tests that
     /// suspend run in one serialised suite and every other file-backed test opens its store this
     /// way, so a suspension in one test cannot fail another running in parallel.
     init(url: URL, observesSuspension: Bool, hooks: OpenHooks = OpenHooks()) throws {
-        if observesSuspension {
-            // Opening migrates, which takes the write lock, so it is refused while suspended, counts
-            // as a call in progress for `appWillSuspend()`'s wait, and a suspension during it
-            // surfaces as `suspended` like any other write.
-            let epoch = try SuspensionState.enter()
-            defer { SuspensionState.leave() }
-            do {
-                writer = try Self.openPool(at: url, observesSuspension: true, epoch: epoch, hooks: hooks)
-            } catch {
-                throw Self.mapSuspension(error, since: epoch)
-            }
-        } else {
-            writer = try Self.openPool(at: url, observesSuspension: false, epoch: nil, hooks: hooks)
-        }
+        // Opening migrates, which takes the write lock, so it is refused while suspended. It counts
+        // as a call in progress for `appWillSuspend()`'s wait only once coordination has been
+        // granted (see `openPool`), and a suspension during it surfaces as `suspended` like any
+        // other write.
+        writer = try Self.openPool(at: url, observesSuspension: observesSuspension, hooks: hooks)
         self.observesSuspension = observesSuspension
     }
 
@@ -121,39 +118,45 @@ public final class RingStore: Sendable {
     /// timeout: another process holding a coordinated access to the file (a widget opening it)
     /// delays this open for as long as it holds it, which is one reason migrations must stay quick.
     ///
-    /// `epoch` is `nil` for a store that ignores suspension.
-    private static func openPool(
-        at url: URL, observesSuspension: Bool, epoch: UInt64?, hooks: OpenHooks
-    ) throws -> DatabasePool {
+    /// The open counts as a call in progress only inside the coordination block, because the wait
+    /// for coordination has no timeout and `appWillSuspend()` must not wait for it: another
+    /// process (a suspended widget) holding a coordinated read would hang the announcement. The
+    /// first check there refuses an open that was announced against during the wait.
+    private static func openPool(at url: URL, observesSuspension: Bool, hooks: OpenHooks) throws -> DatabasePool {
+        // Fail fast without waiting for coordination if already suspended.
+        try SuspensionState.checkNotSuspended(observesSuspension ? 0 : nil)
         let coordinator = NSFileCoordinator(filePresenter: nil)
         var coordinatorError: NSError?
         var result: Result<DatabasePool, any Error>?
         coordinator.coordinate(writingItemAt: url, options: .forMerging, error: &coordinatorError) { url in
             result = Result {
-                // The wait for coordination can be long, and an announcement made during it is not
-                // seen by GRDB, which registers its suspension observers only inside
-                // `DatabasePool.init`. So check again before creating anything.
-                try SuspensionState.check(since: epoch)
-                try Self.prepareFile(at: url)
-                // Before opening as well as after, so the `-wal` and `-shm` files SQLite creates on a
-                // first open are created inside a directory that is already protected.
-                try Self.protectFiles(at: url, hooks.protect)
-                hooks.beforePoolCreated()
-                let pool = try DatabasePool(
-                    path: url.path, configuration: Self.fileConfiguration(observesSuspension: observesSuspension))
-                // And again now that GRDB observes suspension: one announced between the check
-                // above and `DatabasePool.init` would otherwise go unseen, and migrating takes the
-                // write lock. Throwing here releases the pool, which closes it, before any migration.
-                try SuspensionState.check(since: epoch)
-                // Guide, "Use the WAL mode" (the writer sample): never write into a schema a newer
-                // build created; an older build would not know its tables or rules.
-                if try pool.read({ db in try Self.migrator.hasBeenSuperseded(db) }) {
-                    throw RingStoreError.schemaTooNew
+                // `enter` throws `suspended` if an announcement came during the wait for
+                // coordination; GRDB does not see such an announcement, since it registers its
+                // suspension observers only inside `DatabasePool.init`.
+                try Self.guardingSuspensionBlocking(observes: observesSuspension) { epoch in
+                    try Self.prepareFile(at: url)
+                    // Before opening as well as after, so the `-wal` and `-shm` files SQLite creates on a
+                    // first open are created inside a directory that is already protected.
+                    try Self.protectFiles(at: url, hooks.protect)
+                    hooks.beforePoolCreated()
+                    let pool = try DatabasePool(
+                        path: url.path,
+                        configuration: Self.fileConfiguration(
+                            observesSuspension: observesSuspension, busyTimeout: hooks.busyTimeout))
+                    // And again now that GRDB observes suspension: one announced between the entry
+                    // and `DatabasePool.init` would otherwise go unseen, and migrating takes the
+                    // write lock. Throwing here releases the pool, which closes it, before any migration.
+                    try SuspensionState.checkNotSuspended(epoch)
+                    // Guide, "Use the WAL mode" (the writer sample): never write into a schema a newer
+                    // build created; an older build would not know its tables or rules.
+                    if try pool.read({ db in try Self.migrator.hasBeenSuperseded(db) }) {
+                        throw RingStoreError.schemaTooNew
+                    }
+                    try Self.migrator.migrate(pool)
+                    // After migrating, so the -wal and -shm files exist and get the same treatment.
+                    try Self.protectFiles(at: url, hooks.protect)
+                    return pool
                 }
-                try Self.migrator.migrate(pool)
-                // After migrating, so the -wal and -shm files exist and get the same treatment.
-                try Self.protectFiles(at: url, hooks.protect)
-                return pool
             }
         }
         if let result { return try result.get() }
@@ -174,7 +177,7 @@ public final class RingStore: Sendable {
     /// The settings a database in an App Group container needs, from GRDB's "Sharing a Database"
     /// guide (GRDB 7.12, `GRDB/Documentation.docc/DatabaseSharing.md`). Only file-backed stores
     /// use them; the in-memory store has no file to share.
-    static func fileConfiguration(observesSuspension: Bool) -> Configuration {
+    static func fileConfiguration(observesSuspension: Bool, busyTimeout: Double = 5) -> Configuration {
         var configuration = configuration()
         // Guide, "How to limit the SQLITE_BUSY error": without a busy timeout a write fails at once
         // with SQLITE_BUSY ("database is locked") whenever another connection to the file holds
@@ -182,7 +185,7 @@ public final class RingStore: Sendable {
         // on the same file in this process. With it the write waits up to this long. Five seconds
         // covers a normal write transaction and stays well inside an iOS background window; a
         // longer wait still fails with SQLITE_BUSY.
-        configuration.busyMode = .timeout(5)
+        configuration.busyMode = .timeout(busyTimeout)
         // Guide, "How to limit the 0xDEAD10CC exception": the store must stop taking database locks
         // once the app announces it is about to be suspended, or iOS kills the app. See
         // `Suspension.swift`.

@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import os
 import SQLite3
 import Testing
 import RingProtocol
@@ -48,10 +49,9 @@ private func eventually(within seconds: Double = 10, _ condition: () -> Bool) as
 
 /// A thread-safe flag.
 private final class Flag: Sendable {
-    private let lock = NSLock()
-    nonisolated(unsafe) private var stored = false
-    var value: Bool { lock.withLock { stored } }
-    func set(_ value: Bool = true) { lock.withLock { stored = value } }
+    private let stored = OSAllocatedUnfairLock<Bool>(initialState: false)
+    var value: Bool { stored.withLock { $0 } }
+    func set(_ value: Bool = true) { stored.withLock { $0 = value } }
 }
 
 /// Starts `appWillSuspend()` in its own task. The flag is set when it returns.
@@ -130,10 +130,14 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
             }
             await wait(for: held)
             let opening = Task { try await RingStore.open(at: url) }
-            #expect(await eventually { SuspensionState.inFlightCount == 1 }, "the open never started")
+            // Fixed delay: let the open reach its wait for coordination.
+            try await Task.sleep(for: .milliseconds(200))
+            // The open is not counted while it waits, so the announcement does not wait for it.
+            #expect(SuspensionState.inFlightCount == 0)
             let announcement = startAnnouncement()
             defer { RingStore.appDidResume() }
-            #expect(await eventually { SuspensionState.isSuspended })
+            #expect(await eventually(within: 5) { announcement.done.value }, "the announcement waited for the opener")
+            #expect(SuspensionState.isSuspended)
             release.signal()
             await #expect(throws: RingStoreError.suspended) { _ = try await opening.value }
             await announcement.task.value
@@ -208,13 +212,12 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
     /// (all four). Whether iOS then enforces the attribute is for the device check (#53).
     @Test func openingProtectsTheDirectoryFirstAndThenAllThreeFiles() async throws {
         try await withDatabaseURL { url in
-            let lock = NSLock()
-            nonisolated(unsafe) var recorded: [String] = []
+            let recorded = OSAllocatedUnfairLock<[String]>(initialState: [])
             var hooks = RingStore.OpenHooks()
-            hooks.protect = { path in lock.withLock { recorded.append(path) } }
+            hooks.protect = { path in recorded.withLock { $0.append(path) } }
             _ = try RingStore(url: url, observesSuspension: true, hooks: hooks)
             let dir = url.deletingLastPathComponent().path
-            #expect(lock.withLock { recorded } == [
+            #expect(recorded.withLock { $0 } == [
                 dir, url.path,
                 dir, url.path, url.path + "-wal", url.path + "-shm",
             ])
@@ -282,19 +285,23 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
 
     /// An interruption is reported as `suspended` only when a suspension can explain it.
     @Test func interruptionIsMappedOnlyWhenSuspended() async throws {
+        let busy = DatabaseError(resultCode: .SQLITE_BUSY)
         let interrupted = DatabaseError(resultCode: .SQLITE_INTERRUPT)
         let aborted = DatabaseError(resultCode: .SQLITE_ABORT)
-        let busy = DatabaseError(resultCode: .SQLITE_BUSY)
         let epoch = try SuspensionState.enter()
         SuspensionState.leave()
         #expect((RingStore.mapSuspension(interrupted, since: epoch) as? DatabaseError)?.resultCode == .SQLITE_INTERRUPT)
         #expect((RingStore.mapSuspension(aborted, since: epoch) as? DatabaseError)?.resultCode == .SQLITE_ABORT)
+        #expect((RingStore.mapSuspension(busy, since: epoch) as? DatabaseError)?.resultCode == .SQLITE_BUSY)
         await RingStore.appWillSuspend()
         RingStore.appDidResume()
         // A suspension happened during the operation, though the app has resumed since.
         #expect(RingStore.mapSuspension(interrupted, since: epoch) as? RingStoreError == .suspended)
         #expect(RingStore.mapSuspension(aborted, since: epoch) as? RingStoreError == .suspended)
-        #expect((RingStore.mapSuspension(busy, since: epoch) as? DatabaseError)?.resultCode == .SQLITE_BUSY)
+        #expect(RingStore.mapSuspension(busy, since: epoch) as? RingStoreError == .suspended)
+        let later = try SuspensionState.enter()
+        SuspensionState.leave()
+        #expect((RingStore.mapSuspension(busy, since: later) as? DatabaseError)?.resultCode == .SQLITE_BUSY)
         #expect(RingStore.mapSuspension(CancellationError(), since: epoch) is CancellationError)
     }
 
@@ -553,6 +560,110 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
             try await waiter.value
             #expect(ranAfterRelease.value)
             #expect(Set(try await a.rings().map(\.id)) == [heldID, waitedID])
+        }
+    }
+
+    // MARK: Review fixes (second round)
+
+    /// A cancelled announcer returns promptly with a write still holding the lock; the store stays
+    /// suspended, and a later resume works.
+    @Test func cancellingTheAnnouncementEndsTheWaitButKeepsTheSuspension() async throws {
+        try await withDatabaseURL { url in
+            let store = try await RingStore.open(at: url)
+            let started = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
+            let write = Task {
+                try await store.write { db in
+                    try insertRing(db, UUID())
+                    started.signal()
+                    _ = proceed.wait(timeout: .now() + 10)
+                    try insertRing(db, UUID())
+                }
+            }
+            await wait(for: started)
+            let announcement = startAnnouncement()
+            defer { RingStore.appDidResume() }
+            #expect(await eventually { SuspensionState.isSuspended })
+            #expect(await !eventually(within: stillWaitingWindow) { announcement.done.value })
+            announcement.task.cancel()
+            #expect(await eventually(within: 5) { announcement.done.value }, "cancelling did not end the wait")
+            #expect(SuspensionState.isSuspended)
+            #expect(SuspensionState.inFlightCount == 1, "the write should still be running")
+            await #expect(throws: RingStoreError.suspended) { try await store.rings() }
+            proceed.signal()
+            await #expect(throws: RingStoreError.suspended) { try await write.value }
+            RingStore.appDidResume()
+            #expect(try await store.rings().isEmpty)
+        }
+    }
+
+    /// Write Y queues behind write X across a quick suspend and resume: the store is no longer
+    /// suspended when Y gets the lock, so Y runs and is stored.
+    @Test func writeQueuedAcrossSuspendAndResumeSucceeds() async throws {
+        try await withDatabaseURL { url in
+            let store = try await RingStore.open(at: url)
+            let xID = UUID(), yID = UUID()
+            let started = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
+            let x = Task {
+                try await store.write { db in
+                    try insertRing(db, xID)
+                    started.signal()
+                    _ = proceed.wait(timeout: .now() + 10)
+                }
+            }
+            await wait(for: started)
+            let y = Task { try await store.write { db in try insertRing(db, yID) } }
+            #expect(await eventually { SuspensionState.inFlightCount == 2 })
+            try await Task.sleep(for: .milliseconds(100))  // let Y queue behind X
+            // X has only its commit left, so it completes; announce and resume while Y waits.
+            let announcement = startAnnouncement()
+            #expect(await eventually { SuspensionState.isSuspended })
+            RingStore.appDidResume()
+            await announcement.task.value
+            proceed.signal()
+            try await x.value
+            try await y.value
+            #expect(Set(try await store.rings().map(\.id)) == [xID, yID])
+        }
+    }
+
+    /// A write whose busy timeout runs out while a suspension is in force fails with `suspended`,
+    /// not SQLITE_BUSY; without a suspension the busy error passes through unchanged.
+    @Test func busyTimeoutDuringSuspensionIsReportedAsSuspended() async throws {
+        try await withDatabaseURL { url in
+            var hooks = RingStore.OpenHooks()
+            hooks.busyTimeout = 0.5
+            let store = try RingStore(url: url, observesSuspension: true, hooks: hooks)
+            let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                do {
+                    let other = try DatabaseQueue(path: url.path)
+                    try other.inDatabase { db in
+                        try db.execute(sql: "BEGIN IMMEDIATE")
+                        held.signal()
+                        _ = release.wait(timeout: .now() + 10)
+                        try db.execute(sql: "ROLLBACK")
+                    }
+                } catch { held.signal() }
+            }
+            await wait(for: held)
+            defer { release.signal() }
+            // No suspension: plain contention is passed through.
+            do {
+                try await store.write { db in try insertRing(db, UUID()) }
+                Issue.record("expected SQLITE_BUSY")
+            } catch {
+                #expect((error as? DatabaseError)?.resultCode == .SQLITE_BUSY)
+            }
+            // Suspension announced while the write waits for the lock.
+            let ranBody = Flag()
+            let write = Task { try await store.write { db in ranBody.set(); try insertRing(db, UUID()) } }
+            #expect(await eventually { SuspensionState.inFlightCount == 1 })
+            try await Task.sleep(for: .milliseconds(100))  // let it reach SQLite's busy wait
+            let announcement = startAnnouncement()
+            defer { RingStore.appDidResume() }
+            await #expect(throws: RingStoreError.suspended) { try await write.value }
+            await announcement.task.value
+            #expect(!ranBody.value)
         }
     }
 }
