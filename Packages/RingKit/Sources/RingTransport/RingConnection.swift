@@ -16,6 +16,8 @@ public enum RingError: Error, CustomStringConvertible {
     case connectionFailed(String)
     case missingService
     case notConnected
+    /// What was waited for. The text must be built from constants and command types only, never
+    /// from ring or health data, because the sync keeps it in its results (`SyncError`).
     case timeout(String)
     case rejected(Frame)
     case checksumMismatch
@@ -240,11 +242,11 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     /// requests.
     ///
     /// The scan is unfiltered and the results are filtered afterwards. A scan filtered by service
-    /// reports only peripherals advertising one of the listed services, and it is not yet known
-    /// whether the R99 puts the YCBT service in its advertisement, so a filtered scan could miss it.
+    /// reports only peripherals advertising one of the listed services, and the R99 does not list
+    /// the YCBT service (seen from a Mac: it lists `180D` and `FEE7`), so a filtered scan misses it.
     /// Throws `RingError.busy` like `scan(for:)`, and `RingError.bluetoothUnavailable` if Bluetooth
     /// leaves powered-on before the scan ends (a partial list is never returned).
-    /// Unverified on hardware: the R99's advertisement has not been checked for the service.
+    /// What an iPhone sees in the R99's advertisement has not been checked.
     public func discoverRings(for duration: TimeInterval, namePrefixes: [String]) async throws -> [DiscoveredDevice] {
         let devices = try await scan(for: duration)
         return RingDiscovery.candidates(in: devices, service: YCBT.service.uuidString, namePrefixes: namePrefixes)
@@ -289,8 +291,9 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     ///   (as `connect(matching:)` reports a device it heard).
     /// Throws `RingError.busy` while another connect attempt is pending or a scan is running.
     ///
-    /// Unverified on hardware: connecting without a scan, the fallback scan, cancelling a pending
-    /// connection at the deadline and the wait for a cancelled link have not been tried with the R99.
+    /// On hardware, connecting by identifier worked from a Mac with an R99, but which path ran
+    /// (without a scan, or the fallback scan) was not observed. Cancelling a pending connection at
+    /// the deadline and the wait for a cancelled link have not been tried with the R99.
     public func connect(identifier: UUID, timeout: TimeInterval = 20) async throws {
         try await connect(to: .identifier(identifier), timeout: timeout)
     }

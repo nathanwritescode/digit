@@ -526,6 +526,13 @@ public actor RingSession {
         _ = try await request(Command.setTime(date ?? clock(), timeZone: timeZone()))
     }
 
+    /// Sets the ring's clock to `date` as wall-clock time in `timeZone`, ignoring the session's own
+    /// clock and zone. For a caller that must log exactly the instant and zone it sent (the sync
+    /// engine): reading the zone twice could log a different offset at a daylight-saving boundary.
+    public func setTime(_ date: Date, timeZone: TimeZone) async throws {
+        _ = try await request(Command.setTime(date, timeZone: timeZone))
+    }
+
     /// Fetches one kind of stored history with the context needed to decode it later. When nothing
     /// is stored the transfer has empty data and `persist` is not called (nothing was received, so
     /// nothing is acknowledged).
