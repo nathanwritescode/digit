@@ -2,7 +2,7 @@ import Foundation
 import GRDB
 import RingProtocol
 @testable import RingStore
-import RingSync
+@testable import RingSync
 import RingTransport
 
 // Helpers for the sync tests. Every byte here is SYNTHETIC, built from the documented record
@@ -137,6 +137,8 @@ actor FakeRing: SyncableRing {
     private(set) var clockFrame: Frame?
     /// Kinds whose transfer was in the store (by observation) when the fake acknowledged it.
     private(set) var storedWhenAcknowledged: [HistoryKind] = []
+    /// The clock-set log as it was when `setTime` was called.
+    private(set) var clockSetsWhenSent: [ClockSetEvent] = []
     /// Typed row counts seen when the interval (or, if none, the clock) was sent.
     private(set) var typedRowsDuringRingSteps: [Int] = []
 
@@ -215,6 +217,7 @@ actor FakeRing: SyncableRing {
         clockSent = (date, timeZone)
         // Built on receipt, as `RingSession.setTime` builds the frame it writes.
         clockFrame = Command.setTime(date, timeZone: timeZone)
+        clockSetsWhenSent = try await store.clockSets(ringID: ringID)
         typedRowsDuringRingSteps = try await typedRowCounts(store, ringID)
         if case .fail(let error) = clock { throw error }
     }
@@ -223,6 +226,55 @@ actor FakeRing: SyncableRing {
         record("interval \(interval.rawValue)")
         typedRowsDuringRingSteps = try await typedRowCounts(store, ringID)
         if case .fail(let error) = self.interval { throw error }
+    }
+}
+
+// MARK: Suspending store
+
+/// A store that delegates to a real one but throws `RingStoreError.suspended` where told to,
+/// standing in for the app announcing a suspension (which is process-wide, so tests here never call
+/// `RingStore.appWillSuspend()`). A call that throws changes nothing, as a refused call does not.
+/// `@unchecked Sendable`: the call log is guarded by `lock`.
+final class SuspendingStore: SyncStore, @unchecked Sendable {
+    let base: RingStore
+    private let insertFails: Set<HistoryKind>
+    private let clockSetFails: Bool
+    private let ingestFails: Set<HistoryKind>
+    private let lock = NSLock()
+    private var calls: [String] = []
+
+    /// Every call that reached the store, in order (`insert <kind>`, `clockSet`, `ingest <kind>`),
+    /// including the ones that threw.
+    var log: [String] { lock.withLock { calls } }
+
+    init(
+        _ base: RingStore, insertFails: Set<HistoryKind> = [], clockSetFails: Bool = false,
+        ingestFails: Set<HistoryKind> = []
+    ) {
+        self.base = base
+        self.insertFails = insertFails
+        self.clockSetFails = clockSetFails
+        self.ingestFails = ingestFails
+    }
+
+    private func note(_ call: String) { lock.withLock { calls.append(call) } }
+
+    func insert(_ transfer: HistoryTransfer, ringID: UUID) async throws -> InsertOutcome {
+        note("insert \(transfer.kind.name)")
+        if insertFails.contains(transfer.kind) { throw RingStoreError.suspended }
+        return try await base.insert(transfer, ringID: ringID)
+    }
+
+    func recordClockSet(_ event: ClockSetEvent) async throws {
+        note("clockSet")
+        if clockSetFails { throw RingStoreError.suspended }
+        try await base.recordClockSet(event)
+    }
+
+    func ingest(ringID: UUID, kind: HistoryKind) async throws -> IngestionResult {
+        note("ingest \(kind.name)")
+        if ingestFails.contains(kind) { throw RingStoreError.suspended }
+        return try await base.ingest(ringID: ringID, kind: kind)
     }
 }
 

@@ -115,3 +115,22 @@ private func holdsRawBytes(_ value: Any) -> Bool {
     #expect(name.hasSuffix("CarriesReading"))
     #expect(!dumped(error).contains("173"))
 }
+
+/// A clock-set that cannot be logged is reported with the sanitised error only: the failing
+/// statement's arguments (the instant and zone) must not be reachable from the result.
+@Test(.timeLimit(.minutes(1))) func resultOfAClockSetThatCannotBeLoggedHoldsNoRawData() async throws {
+    let (store, id) = try await makeStore()
+    try failInserts(into: "clock_set", store)
+    let result = await RingSyncer(
+        ring: FakeRing(store: store, ringID: id), store: store, ringID: id,
+        monitoringInterval: .tenMinutes, budget: .seconds(60), clock: { t0 }, timeZone: { london }
+    ).run()
+
+    guard case .skipped(.clockSetNotLogged(.database)) = result.clockSet else {
+        Issue.record("clock-set not reported as not logged")
+        return
+    }
+    let text = dumped(result, without: id)
+    for marker in rawErrorMarkers { #expect(!text.contains(marker), "dump contains \(marker)") }
+    #expect(!holdsRawBytes(result), "the result holds a byte buffer")
+}

@@ -32,6 +32,12 @@ public enum SyncSkipReason: Sendable, Equatable {
     case historyIncomplete
     /// Monitoring interval only: the clock-set was not acknowledged by the ring.
     case clockNotAcknowledged
+    /// The store refused with `RingStoreError.suspended` (the app is suspending), so the sync
+    /// stopped: the step was not run. Retrying after resume is the caller's business.
+    case storeSuspended
+    /// Clock only: the clock-set could not be logged, so it was not sent (it is logged before it is
+    /// sent). Carries the store's sanitised error.
+    case clockSetNotLogged(SyncError)
 }
 
 /// Where a history fetch failed.
@@ -74,42 +80,27 @@ public enum FetchOutcome: Sendable, Equatable {
 
 /// What happened to the clock-set.
 ///
-/// Time resolution treats every logged clock-set as one that happened, so a clock-set the ring
-/// may have applied is logged and one it certainly did not apply is not.
+/// The clock-set is logged before it is sent, and time resolution treats every logged clock-set as
+/// one that happened. A logged clock-set the ring did not apply therefore stays in the log, by
+/// design: a phantom entry is the safer error than a missing one.
 public enum ClockSetOutcome: Sendable, Equatable {
-    /// The ring acknowledged it and it was logged.
+    /// Logged, sent, and the ring acknowledged it.
     case acknowledgedAndLogged(ClockSetEvent)
-    /// No acknowledgement was seen and the command may have reached the ring (a timeout, a stop,
-    /// a lost connection or another transport error), so it was logged as if it happened. Some of
-    /// these errors are in fact raised before anything is written (see `RingSyncer`); those log a
-    /// clock-set that never happened.
+    /// Logged and sent, but no acknowledgement was seen and the command may have reached the ring
+    /// (a timeout, a stop, a lost connection or another transport error). Some of these errors are
+    /// in fact raised before anything is written (see `RingSyncer`), so the entry may be phantom.
     case unknownAndLogged(ClockSetEvent, error: SyncError)
-    /// The ring certainly did not apply it: it answered with an error reply, or the session or the
-    /// link refused the command before writing it (`RingError.refusedDestructive`,
-    /// `refusedUploadGroup`, `busy`). Not logged.
-    case notApplied(error: SyncError)
+    /// Logged, but the ring certainly did not apply it: it answered with an error reply, or the
+    /// session or the link refused the command before writing it (`RingError.refusedDestructive`,
+    /// `refusedUploadGroup`, `busy`). The entry stays in the log (a phantom clock-set).
+    case notAppliedButLogged(ClockSetEvent, error: SyncError)
+    /// Not sent. See `SyncSkipReason`, including `clockSetNotLogged` (logging failed, so nothing
+    /// was sent) and `storeSuspended`.
     case skipped(SyncSkipReason)
-    /// The ring acknowledged it but logging it failed. **The clock-set log is now incomplete**,
-    /// which breaks the `resolved` guarantee of time resolution. Reported here only; nothing
-    /// persists it yet. Not retried.
-    case acknowledgedButNotLogged(ClockSetEvent, logError: SyncError)
-    /// The outcome was unknown and logging it failed too. The log may be incomplete, as above.
-    case unknownAndNotLogged(ClockSetEvent, error: SyncError, logError: SyncError)
 
-    /// Whether the ring acknowledged the clock-set, logged or not.
+    /// Whether the ring acknowledged the clock-set.
     public var wasAcknowledged: Bool {
-        switch self {
-        case .acknowledgedAndLogged, .acknowledgedButNotLogged: true
-        case .unknownAndLogged, .notApplied, .skipped, .unknownAndNotLogged: false
-        }
-    }
-
-    /// Whether the clock-set log may now miss a clock-set the ring applied.
-    public var leftLogIncomplete: Bool {
-        switch self {
-        case .acknowledgedButNotLogged, .unknownAndNotLogged: true
-        case .acknowledgedAndLogged, .unknownAndLogged, .notApplied, .skipped: false
-        }
+        if case .acknowledgedAndLogged = self { true } else { false }
     }
 }
 
@@ -129,6 +120,8 @@ public enum MonitoringIntervalOutcome: Sendable, Equatable {
 public enum IngestionOutcome: Sendable, Equatable {
     case ingested(IngestionResult)
     case failed(SyncError)
+    /// Not started: the store was suspended (`SyncSkipReason.storeSuspended`).
+    case notAttempted(SyncSkipReason)
 
     public var succeeded: Bool {
         if case .ingested = self { true } else { false }
@@ -166,6 +159,9 @@ public struct RingPhaseResult: Sendable, Equatable {
     public let fetches: PerKind<FetchOutcome>
     public let clockSet: ClockSetOutcome
     public let monitoringInterval: MonitoringIntervalOutcome
+
+    /// Whether the phase ended because the store was suspended, so the derive phase should not run.
+    public var endedBecauseStoreSuspended: Bool { clockSet == .skipped(.storeSuspended) }
 }
 
 /// The result of one sync: the ring phase and the ingestion phase together.
@@ -196,8 +192,4 @@ public struct SyncResult: Sendable, Equatable {
         }
         return fetched && clocked && interval && ingestions.values.allSatisfy(\.succeeded)
     }
-
-    /// Whether the clock-set log may now miss a clock-set the ring applied. The app should report
-    /// this prominently: time resolution can no longer be trusted to call a record `resolved`.
-    public var clockSetLogIncomplete: Bool { clockSet.leftLogIncomplete }
 }
