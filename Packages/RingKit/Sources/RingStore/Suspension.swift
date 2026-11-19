@@ -26,12 +26,16 @@ import os
 //   way. So every call, reads included, is refused before touching SQLite while suspended. This
 //   is a choice of interface, stricter than GRDB (which lets WAL reads through), not a claim that
 //   WAL reads are a 0xdead10cc hazard.
-// - A drain: `appWillSuspend()` returns only once every call that was already in progress has
-//   finished, so when it returns the store holds no lock. Each guarded call is counted while it
+// - A drain: `appWillSuspend()` returns normally only once every call that was already in
+//   progress has finished (so the store holds no lock), or once `appDidResume()` ends the wait; it
+//   throws `CancellationError` if its task is cancelled first, when a lock may still be held. Each guarded call is counted while it
 //   runs, and checks again for a suspension as the first thing inside its transaction, so one that
 //   only got the lock after the announcement (the busy-wait case) does no work.
-// - Error mapping: GRDB's interruption errors become `RingStoreError.suspended` only when a
-//   suspension can explain them, so the app never has to import GRDB to recognise them.
+// - Error mapping, so the app never has to import GRDB to recognise a suspension: GRDB's
+//   interruption errors (`SQLITE_ABORT`, `SQLITE_INTERRUPT`) become `RingStoreError.suspended` when
+//   a suspension was announced since the call started; `SQLITE_BUSY` (any, not only a write whose
+//   busy timeout ran out) becomes it only while the store is suspended at the moment the error is
+//   mapped, so contention that outlasts a suspension and a resume stays a plain busy error.
 
 /// Process-wide suspension state. GRDB's notifications are process-wide (posted on
 /// `NotificationCenter.default` and observed with no sender filter), so suspension is too: it
@@ -46,7 +50,7 @@ enum SuspensionState {
         var inFlight = 0
         /// Announcements waiting for `inFlight` to reach zero, by waiter id (so a cancelled wait can
         /// take itself out).
-        var drainWaiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
+        var drainWaiters: [UInt64: CheckedContinuation<Bool, Never>] = [:]
         var nextWaiterID: UInt64 = 0
         /// How to end each active sleep observation, by registration id.
         var observationEnders: [UInt64: @Sendable () -> Void] = [:]
@@ -82,28 +86,33 @@ enum SuspensionState {
         for end in enders { end() }
     }
 
-    /// Waits until no guarded call is in progress, or until the app resumes, or until the calling
-    /// task is cancelled. A cancelled wait returns early, leaving the suspension in force.
-    static func drain() async {
+    /// Waits until no guarded call is in progress, or until the app resumes. Throws
+    /// `CancellationError` if the calling task is cancelled first, leaving the suspension in force
+    /// (a lock may still be held).
+    static func drain() async throws {
         let id = state.withLock { state in
             state.nextWaiterID &+= 1
             return state.nextWaiterID
         }
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                let now = state.withLock { state in
+        // The continuation's value is whether the wait was cancelled.
+        let cancelled = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                let now: Bool? = state.withLock { state in
                     // Checked under the lock: a cancellation that arrives later finds the waiter
                     // registered, and one that arrived earlier is seen here, so neither is lost.
-                    if state.inFlight == 0 || !state.suspended || Task.isCancelled { return true }
+                    // Already drained (or resumed) wins over a cancellation.
+                    if state.inFlight == 0 || !state.suspended { return false }
+                    if Task.isCancelled { return true }
                     state.drainWaiters[id] = continuation
-                    return false
+                    return nil
                 }
-                if now { continuation.resume() }
+                if let now { continuation.resume(returning: now) }
             }
         } onCancel: {
             let waiter = state.withLock { state in state.drainWaiters.removeValue(forKey: id) }
-            waiter?.resume()
+            waiter?.resume(returning: true)
         }
+        if cancelled { throw CancellationError() }
     }
 
     static func resume() {
@@ -116,7 +125,7 @@ enum SuspensionState {
                 return Array(state.drainWaiters.values)
             }
         }
-        for waiter in waiters { waiter.resume() }
+        for waiter in waiters { waiter.resume(returning: false) }
     }
 
     /// Starts a guarded call: `RingStoreError.suspended` if suspended now, otherwise counts the
@@ -133,11 +142,11 @@ enum SuspensionState {
     static func leave() {
         let waiters = state.withLock { state in
             state.inFlight -= 1
-            guard state.inFlight == 0 else { return [CheckedContinuation<Void, Never>]() }
+            guard state.inFlight == 0 else { return [CheckedContinuation<Bool, Never>]() }
             defer { state.drainWaiters = [:] }
             return Array(state.drainWaiters.values)
         }
-        for waiter in waiters { waiter.resume() }
+        for waiter in waiters { waiter.resume(returning: false) }
     }
 
     /// `enter` for a sleep observation, registering how to end it in the same critical section,
@@ -157,8 +166,9 @@ enum SuspensionState {
         leave()
     }
 
-    /// Whether a suspension can explain an interruption seen by a call that entered at `epoch`:
-    /// the store is suspended now, or was suspended at some point since.
+    /// Whether a suspension can explain an interruption (`SQLITE_ABORT`, `SQLITE_INTERRUPT`) seen by
+    /// a call that entered at `epoch`: the store is suspended now, or was suspended at some point
+    /// since.
     static func hasSuspended(since epoch: UInt64) -> Bool {
         state.withLock { state in state.suspended || state.epoch != epoch }
     }
@@ -166,10 +176,10 @@ enum SuspensionState {
     /// Throws `suspended` if the store is suspended now. Used inside transactions and during
     /// opening: a call that queued across a suspension and a resume must not be refused, because
     /// nothing is suspended any more. (Interruptions that happened during a call still map to
-    /// `suspended` through `hasSuspended(since:)`.) `nil` (a store that does not observe
-    /// suspension) never throws.
-    static func checkNotSuspended(_ epoch: UInt64?) throws {
-        if epoch != nil, isSuspended { throw RingStoreError.suspended }
+    /// `suspended` through `hasSuspended(since:)`.) A store that does not observe suspension
+    /// (`observes: false`) never throws.
+    static func checkNotSuspended(observes: Bool) throws {
+        if observes, isSuspended { throw RingStoreError.suspended }
     }
 
     /// Throws `suspended` if a suspension was announced since `epoch`, even if the app has resumed
@@ -207,22 +217,24 @@ extension RingStore {
     ///   commit left completes instead. Either way it is never half-applied;
     /// - a write still waiting for the lock (another connection holds it) is not woken: when it gets
     ///   the lock it fails with `suspended` before doing any work, and releases it; if its busy
-    ///   timeout runs out first it fails with `suspended` too;
+    ///   timeout runs out first, the busy error becomes `suspended` only if the store is still
+    ///   suspended at that moment (after a resume it is plain contention and passes through);
     /// - a read in progress completes normally.
     ///
     /// So the wait lasts as long as the slowest call in progress takes to reach its next statement
     /// or finish: a long `ingest` delays it. **There is no timeout here**; the caller decides how
-    /// long it can wait, by cancelling the task that awaits it. A cancelled wait returns early with
-    /// the suspension still in force and a lock possibly still held, so the caller must not treat
-    /// the return as "no lock is held". Calling it again while one is waiting is harmless (both
+    /// long it can wait, by cancelling the task that awaits it. **Cancelling it throws
+    /// `CancellationError`**, with the suspension still in force and a lock possibly still held; a
+    /// normal return means the calls drained (no lock is held), or `appDidResume()` ended the wait
+    /// (the store is no longer suspended). Calling it again while one is waiting is harmless (both
     /// return when the calls drain), and `appDidResume()` ends every wait at once.
     ///
     /// Posts GRDB's `Database.suspendNotification`, which is process-wide, so the app does not need
     /// to import GRDB. In-memory stores are not affected. Unverified on a device: tests cannot
     /// suspend a process.
-    public static func appWillSuspend() async {
+    public static func appWillSuspend() async throws {
         SuspensionState.announce()
-        await SuspensionState.drain()
+        try await SuspensionState.drain()
     }
 
     /// Call when the app has resumed: when it returns to the foreground, and at the start of every
@@ -236,17 +248,17 @@ extension RingStore {
     // MARK: Guarded database access
 
     // Every read and write on an open store goes through these four, so the suspension check, the
-    // in-progress count and the error mapping cannot be skipped by one call. Two paths use the same
-    // pieces (`SuspensionState.enter` and `leave`, `check(since:)`, `mapSuspension`) directly
-    // instead: opening (`init(url:observesSuspension:hooks:)`) and the sleep observation
-    // (`observeLatestSleepNight`). The blocking pair serves the internal blocking forms used by
+    // in-progress count and the error mapping cannot be skipped by one call. The opener goes
+    // through the same blocking guard (`guardingSuspensionBlocking(observes:_:)`); only the sleep
+    // observation (`observeLatestSleepNight`) uses the pieces (`SuspensionState.enterObservation`
+    // and `leaveObservation`, `check(since:)`, `mapSuspension`) directly. The blocking pair serves the internal blocking forms used by
     // tests; distinct names keep a synchronous overload from being picked silently in an async
     // context.
 
     func read<T: Sendable>(_ value: @Sendable (Database) throws -> T) async throws -> T {
         try await guardingSuspension { epoch in
             try await writer.read { db in
-                try SuspensionState.checkNotSuspended(epoch)
+                try SuspensionState.checkNotSuspended(observes: epoch != nil)
                 return try value(db)
             }
         }
@@ -257,7 +269,7 @@ extension RingStore {
             try await writer.write { db in
                 // First thing inside the transaction: a write that only got the lock after the
                 // announcement (it was waiting in the busy timeout) does no work and rolls back.
-                try SuspensionState.checkNotSuspended(epoch)
+                try SuspensionState.checkNotSuspended(observes: epoch != nil)
                 return try updates(db)
             }
         }
@@ -266,7 +278,7 @@ extension RingStore {
     func readBlocking<T>(_ value: (Database) throws -> T) throws -> T {
         try guardingSuspensionBlocking { epoch in
             try writer.read { db in
-                try SuspensionState.checkNotSuspended(epoch)
+                try SuspensionState.checkNotSuspended(observes: epoch != nil)
                 return try value(db)
             }
         }
@@ -275,7 +287,7 @@ extension RingStore {
     func writeBlocking<T>(_ updates: (Database) throws -> T) throws -> T {
         try guardingSuspensionBlocking { epoch in
             try writer.write { db in
-                try SuspensionState.checkNotSuspended(epoch)
+                try SuspensionState.checkNotSuspended(observes: epoch != nil)
                 return try updates(db)
             }
         }
@@ -310,18 +322,20 @@ extension RingStore {
     }
 
     /// `SQLITE_ABORT` and `SQLITE_INTERRUPT` are what GRDB throws for a suspended database (its
-    /// guide, "How to limit the 0xDEAD10CC exception"). `SQLITE_BUSY` is what a write throws when
-    /// it waited out the busy timeout for a lock that never came; GRDB's interrupt does not wake
-    /// such a wait, so when a suspension happened meanwhile it is the suspension's doing. They
-    /// become `suspended` only if a suspension happened since the call started; otherwise (for
-    /// example an interrupt from elsewhere, or plain contention) GRDB's error is passed on
-    /// unchanged. Task cancellation reaches here as
-    /// `CancellationError`, which GRDB checks before suspension, so it is never mapped.
+    /// guide, "How to limit the 0xDEAD10CC exception"); they become `suspended` if a suspension was
+    /// announced since the call started, even if the app has resumed since, because the interrupt
+    /// happened during it. `SQLITE_BUSY` (any, whatever its cause) becomes `suspended` only if the
+    /// store is suspended at the moment the error is mapped: GRDB's interrupt does not wake a write
+    /// waiting in the busy timeout, so a busy error that arrives during a suspension is most
+    /// plausibly the suspension's doing, but one that arrives after the app resumed is contention
+    /// and is passed on unchanged. Everything else, and a task's `CancellationError` (which GRDB
+    /// checks before suspension), is never mapped.
     static func mapSuspension(_ error: any Error, since epoch: UInt64) -> any Error {
-        if let error = error as? DatabaseError,
-           error.isInterruptionError || error.resultCode == .SQLITE_BUSY,
-           SuspensionState.hasSuspended(since: epoch)
-        {
+        guard let error = error as? DatabaseError else { return error }
+        if error.isInterruptionError, SuspensionState.hasSuspended(since: epoch) {
+            return RingStoreError.suspended
+        }
+        if error.resultCode == .SQLITE_BUSY, SuspensionState.isSuspended {
             return RingStoreError.suspended
         }
         return error

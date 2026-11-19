@@ -35,7 +35,8 @@ import SQLite3
 ///
 /// **Suspension.** A file-backed store observes `appWillSuspend()` and `appDidResume()`: while
 /// suspended every new call throws `RingStoreError.suspended` without touching the database, and
-/// `appWillSuspend()` returns only once the calls in progress have finished (see those two
+/// `appWillSuspend()` returns only once the calls in progress have finished, or throws
+/// `CancellationError` if its task is cancelled first (see those two
 /// functions and `Suspension.swift`). In-memory stores ignore suspension.
 public final class RingStore: Sendable {
     // Internal, not private, so tests can inspect the schema and issue raw SQL.
@@ -54,10 +55,17 @@ public final class RingStore: Sendable {
     /// Throws what `init(url:)` throws, including `RingStoreError.suspended` if called between
     /// `appWillSuspend()` and `appDidResume()`.
     public static func open(at url: URL) async throws -> RingStore {
-        let qos = DispatchQoS.QoSClass(rawValue: qos_class_t(rawValue: UInt32(Task.currentPriority.rawValue))) ?? .utility
+        // The open runs at the calling task's priority, so a background-priority caller does not
+        // make the system run its open at user-initiated QoS.
+        let qos: DispatchQoS.QoSClass
+        switch Task.currentPriority {
+        case .high, .userInitiated: qos = .userInitiated
+        case .medium: qos = .default
+        case .low, .utility: qos = .utility
+        case .background: qos = .background
+        default: qos = .default
+        }
         return try await withCheckedThrowingContinuation { continuation in
-            // The open runs at the calling task's priority, so a background-priority caller does
-            // not make the system run its open at user-initiated QoS.
             DispatchQueue.global(qos: qos).async {
                 continuation.resume(with: Result { try RingStore(url: url) })
             }
@@ -87,6 +95,9 @@ public final class RingStore: Sendable {
         /// Runs after the open has entered (inside coordination) and just before
         /// `DatabasePool.init`: the window in which GRDB would not yet see an announcement.
         var beforePoolCreated: @Sendable () -> Void = {}
+        /// Runs just before the open asks for file coordination, which can wait without a timeout.
+        /// A test holds a coordinated read and learns here that the open is about to wait.
+        var beforeCoordination: @Sendable () -> Void = {}
         /// Seconds a write waits for another connection's write lock. Tests shorten it.
         var busyTimeout: Double = 5
     }
@@ -124,7 +135,8 @@ public final class RingStore: Sendable {
     /// first check there refuses an open that was announced against during the wait.
     private static func openPool(at url: URL, observesSuspension: Bool, hooks: OpenHooks) throws -> DatabasePool {
         // Fail fast without waiting for coordination if already suspended.
-        try SuspensionState.checkNotSuspended(observesSuspension ? 0 : nil)
+        try SuspensionState.checkNotSuspended(observes: observesSuspension)
+        hooks.beforeCoordination()
         let coordinator = NSFileCoordinator(filePresenter: nil)
         var coordinatorError: NSError?
         var result: Result<DatabasePool, any Error>?
@@ -146,7 +158,7 @@ public final class RingStore: Sendable {
                     // And again now that GRDB observes suspension: one announced between the entry
                     // and `DatabasePool.init` would otherwise go unseen, and migrating takes the
                     // write lock. Throwing here releases the pool, which closes it, before any migration.
-                    try SuspensionState.checkNotSuspended(epoch)
+                    try SuspensionState.checkNotSuspended(observes: epoch != nil)
                     // Guide, "Use the WAL mode" (the writer sample): never write into a schema a newer
                     // build created; an older build would not know its tables or rules.
                     if try pool.read({ db in try Self.migrator.hasBeenSuperseded(db) }) {
