@@ -12,10 +12,18 @@ import RingProtocol
 /// which returns a frame without suspending at all; it exists only for the tests that check the
 /// session cannot be starved by such a link.
 ///
+/// Time: the fake's own write deadline (`timeOutNextSend`) runs on `clock`, the same `TestClock`
+/// that sessions made by `session(_:)` use, so no session or link timer fires until the test moves
+/// that clock. The reader's idle poll (`nextFrame` with nothing queued) still ends on a real timer:
+/// it only decides how soon an idle reader notices a drain or `stop()`, never whether a wait
+/// times out. A frame that is queued is handed over on another thread as before; however long
+/// that takes under load, the timer it races cannot fire meanwhile.
+///
 /// Every wait the fake offers ends after a time limit and on task cancellation, so a regression
 /// fails a test instead of hanging it.
 /// `@unchecked Sendable` because all state is guarded by `lock`.
 private final class FakeLink: RingLink, @unchecked Sendable {
+    let clock: TestClock
     private let lock = NSLock()
     private var inbox: [Frame]
     private var log: [String] = []
@@ -24,7 +32,12 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     private var reader: (id: Int, continuation: CheckedContinuation<Frame?, Never>)?
     private var lastReaderID = 0
 
-    init(stale: [Frame] = [], guardWrites: Bool = false, writeTimeout: TimeInterval = 0.02, onSend: @escaping @Sendable (Frame) -> [Frame] = { _ in [] }) {
+    init(
+        stale: [Frame] = [], guardWrites: Bool = false, writeTimeout: TimeInterval = 0.02, clock: TestClock = TestClock(),
+        onSend: @escaping @Sendable (Frame) -> [Frame] = { _ in [] }
+    ) {
+        if ThreadLoad.enabledForWholeRun { ThreadLoad.wholeRun }
+        self.clock = clock
         inbox = stale
         self.guardWrites = guardWrites
         self.writeTimeout = writeTimeout
@@ -41,9 +54,9 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     // never returns (the real CheckedContinuation behaviour): the test must call `releaseParked()`
     // at the end. `parkSends(ofGroup:)` does the same for every send in a group, and
     // `parkAllSends()` for every send, until `releaseAll()`. After `close()` every send, including
-    // one parked, throws at once, as a link that has gone away does. `timeOutNextSend` models a compliant link like the real connection: it holds
-    // the write in flight for its own `writeTimeout`, ignoring cancellation, then clears the
-    // in-flight state and throws.
+    // one parked, throws at once, as a link that has gone away does. `timeOutNextSend` models a
+    // compliant link like the real connection: it holds the write in flight for its own
+    // `writeTimeout` on `clock`, ignoring cancellation, then clears the in-flight state and throws.
     // With `guardWrites`, a send while an earlier one is still in flight throws `busy` (and is
     // logged), as the real connection does. `trickle` is returned by `nextFrame` whenever nothing
     // else is queued; `setTrickleOnNextSend` turns it on once the next frame has been written.
@@ -66,6 +79,8 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     private var heldEmpty: CheckedContinuation<Frame?, Never>?
     private var waitsForever = false
     private var partialResets = 0
+    /// A frame taken from the inbox has not yet been followed by the reader's next read.
+    private var handingOver = false
     private var holdPartialReset = false
     private var heldPartialReset: CheckedContinuation<Void, Never>?
 
@@ -151,15 +166,9 @@ private final class FakeLink: RingLink, @unchecked Sendable {
         }
         switch fault {
         case .ownTimeout:
-            await withCheckedContinuation { continuation in
-                DispatchQueue.global().asyncAfter(deadline: .now() + writeTimeout) {
-                    // The link clears its own in-flight state before reporting, so the next send is
-                    // accepted. Done here, not after resuming, so task scheduling delay cannot let
-                    // the session's backstop observe a write that has already timed out.
-                    self.mutate { self.inFlight = false }
-                    continuation.resume()
-                }
-            }
+            await clock.sleepIgnoringCancellation(until: clock.now() + .seconds(writeTimeout))
+            // The link clears its own in-flight state before reporting, so the next send is accepted.
+            mutate { inFlight = false }
             throw RingError.timeout("write confirmation")
         case .park:
             await withCheckedContinuation { continuation in mutate { parked.append(continuation) } }
@@ -208,6 +217,8 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     private enum Read { case now(Frame?), wait(id: Int, forever: Bool) }
 
     func nextFrame(timeout: TimeInterval) async -> Frame? {
+        // The reader routes each frame before it asks for the next.
+        lock.withLock { handingOver = false }
         // Deliberately does not suspend: see `setAlwaysReady`. Not logged, as it is read in a tight loop.
         if let ready = lock.withLock({ alwaysReady }) { return ready }
         return await withCheckedContinuation { (continuation: CheckedContinuation<Frame?, Never>) in
@@ -247,6 +258,7 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     /// Takes the first queued frame. Call with the lock held.
     private func take() -> Frame {
         let frame = inbox.removeFirst()
+        handingOver = true
         log.append("take \(String(format: "%04X", frame.type))")
         return frame
     }
@@ -321,15 +333,35 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     func waitUntilReaderWaits(within seconds: Double = 10) async -> Bool {
         await waitFor(within: seconds) { self.reader != nil }
     }
+
+    /// Whether every frame delivered so far has been handed to the reader and routed: nothing is
+    /// queued, and the reader has asked for another frame since it took the last one.
+    var isHandedOver: Bool { lock.withLock { inbox.isEmpty && !handingOver } }
 }
 
 // Synthetic frames: the layout matches the protocol notes, the contents are made up.
-private func session(_ link: FakeLink) -> RingSession { RingSession(link: link, replyTimeout: 0.05) }
 
-/// Runs `body` with `s`, then stops the session, whether `body` returned or threw, so no reader
-/// outlives its test. If `body` threw or the test is cancelled (its time limit), the fake's holds
-/// are released first, so `stop()` cannot wait on a reader the fake is holding and the session's
-/// own deadlines can end what is still running. The cancellation handler covers `stop()` too.
+/// A session whose deadlines and timers run on the link's `TestClock`. The timeouts are those in
+/// virtual time: nothing times out until the test moves `link.clock`.
+private func session(
+    _ link: FakeLink,
+    replyTimeout: TimeInterval = 0.05,
+    conversationTimeout: TimeInterval = 60,
+    clock: @escaping @Sendable () -> Date = { Date() },
+    timeZone: @escaping @Sendable () -> TimeZone = { TimeZone.autoupdatingCurrent }
+) -> RingSession {
+    RingSession(link: link, replyTimeout: replyTimeout, conversationTimeout: conversationTimeout,
+                monotonicClock: link.clock.session, clock: clock, timeZone: timeZone)
+}
+
+/// The session's write backstop: the link's write timeout plus the reply timeout.
+private func backstop(_ link: FakeLink, _ s: RingSession) -> Double { link.writeTimeout + s.replyTimeout }
+
+/// Runs `body` with `s`, then closes the link and stops the session, whether `body` returned or
+/// threw, so no reader outlives its test. Closing first makes any write still held fail at once,
+/// so `stop()` does not wait for a write backstop on a clock nobody is moving any more. If `body`
+/// threw or the test is cancelled (its time limit), the fake's holds are released first, so
+/// `stop()` cannot wait on a reader the fake is holding. The cancellation handler covers `stop()` too.
 @discardableResult
 private func using<T: Sendable>(
     _ s: RingSession,
@@ -346,6 +378,7 @@ private func using<T: Sendable>(
             link.releaseAll()
             alsoOnCancel()
         }
+        link.close()
         await s.stop()
         return try result.get()
     } onCancel: {
@@ -419,10 +452,8 @@ private struct PersistFailure: Error {}
 @Test(.timeLimit(.minutes(1))) func noReplyTimesOut() async throws {
     let link = FakeLink()
     try await using(session(link), link) { s async throws in
-        do {
-            _ = try await s.request(Command.deviceInfo)
-            Issue.record("expected a timeout")
-        } catch RingError.timeout {
+        await expectTimeout(waitingFor: "reply to 0200") {
+            _ = try await timingOutWhenWaiting(s, link) { try await s.request(Command.deviceInfo) }
         }
     }
 }
@@ -494,7 +525,7 @@ private struct PersistFailure: Error {}
     let now = Date(timeIntervalSince1970: 1_800_000_000.1234567)
     let zone = try #require(TimeZone(identifier: "Pacific/Auckland"))
     let persisted = PersistRecorder()
-    try await using(RingSession(link: link, replyTimeout: 0.05, clock: { now }, timeZone: { zone }), link) { s async throws in
+    try await using(session(link, clock: { now }, timeZone: { zone }), link) { s async throws in
         let returned = try await s.fetchHistory(kind) { await persisted.add($0) }
         let expected = HistoryTransfer(
             kind: kind, header: headerBytes(12), data: [1, 2, 3],
@@ -510,7 +541,7 @@ private struct PersistFailure: Error {}
 @Test(.timeLimit(.minutes(1))) func timeZoneIsReadForEachTransfer() async throws {
     let link = historyLink(chunks: [[1]])
     let zones = ZoneBox(["Asia/Tokyo", "America/Denver"])
-    try await using(RingSession(link: link, replyTimeout: 0.05, timeZone: { zones.next() }), link) { s async throws in
+    try await using(session(link, timeZone: { zones.next() }), link) { s async throws in
         let first = try await s.fetchHistory(kind) { _ in }
         let second = try await s.fetchHistory(kind) { _ in }
         #expect(first.timeZoneIdentifier == "Asia/Tokyo")
@@ -533,7 +564,7 @@ private final class ZoneBox: @unchecked Sendable {
     // 2027-01-15 08:00:00 UTC is 21:00 on the same day in Auckland (UTC+13 in January).
     let now = Date(timeIntervalSince1970: 1_800_000_000)
     let zone = try #require(TimeZone(identifier: "Pacific/Auckland"))
-    try await using(RingSession(link: link, replyTimeout: 0.05, clock: { now }, timeZone: { zone }), link) { s async throws in
+    try await using(session(link, clock: { now }, timeZone: { zone }), link) { s async throws in
         try await s.setTime()
         #expect(link.sent == [Command.setTime(now, timeZone: zone)])
         #expect(link.sent.first?.payload[4] == 21)
@@ -645,20 +676,6 @@ private final class ZoneBox: @unchecked Sendable {
 
 // MARK: Deadlines
 
-/// A monotonic clock that advances one second every time it is read, so a test crosses a
-/// conversation deadline after a fixed number of reads instead of after real time.
-private final class SteppingClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var reads = 0
-    private let start = ContinuousClock.now
-    func now() -> ContinuousClock.Instant {
-        lock.withLock {
-            reads += 1
-            return start + .seconds(reads)
-        }
-    }
-}
-
 private final class CallCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
@@ -689,31 +706,39 @@ private func expectTimeout(waitingFor expected: String, _ body: () async throws 
 
 private let deviceReply = Frame(group: 0x02, key: 0x00, payload: [7])
 
-/// A session whose conversation deadline is five reads of `clock`. Every wait slice reads the
-/// clock, so the reply timeout is long enough (1 s of real time) that a slice does not run out
-/// while the reader waits for a thread on a loaded machine and use up the budget early.
-private func steppingSession(_ link: FakeLink, _ clock: SteppingClock) -> RingSession {
-    RingSession(link: link, replyTimeout: 1, conversationTimeout: 5, monotonicNow: { clock.now() })
+/// A link on a clock that moves one second every time it is read, so a conversation crosses its
+/// deadline after a fixed number of reads instead of after any amount of time.
+private func steppingLink(onSend: @escaping @Sendable (Frame) -> [Frame] = { _ in [] }) -> FakeLink {
+    FakeLink(clock: TestClock(stepPerRead: .seconds(1)), onSend: onSend)
+}
+
+/// A session on a stepping link whose conversation deadline is ten reads of the clock. A wait
+/// slice of two reads lets a wait survive the read the reader makes when it routes the frame.
+private func steppingSession(_ link: FakeLink) -> RingSession {
+    session(link, replyTimeout: 2, conversationTimeout: 10)
 }
 
 // The write deadline has one owner, the link. If the session's own deadline on a write could fire
 // before the link's, the link would still have the write in flight and refuse the next one. The
 // combinations include a reply timeout much shorter than the link's write timeout.
 //
-// The session's backstop fires `replyTimeout` after the link's own deadline, and the two run on
-// different timers (a task sleep and a dispatch queue). With a margin of tens of milliseconds a
-// loaded machine could delay the link's timer past the backstop, and the test failed on CI with
-// `busy` although the code was right (#37). The reply timeouts are therefore large enough to
-// absorb scheduling delay. This is still a race between real timers, not a proof: the test fails
-// reliably if the backstop is earlier than the link's deadline, and usually (two runs in three
-// when tried) if the two are equal. A deterministic version is tracked in #39.
-@Test(.timeLimit(.minutes(1)), arguments: [0.5, 1.0], [0.05, 0.5, 2.0])
+// The session's backstop fires `replyTimeout` after the link's own deadline. Both run on the
+// link's test clock, which the test moves to the link's deadline and no further, so the order is
+// the same on every run however loaded the machine (#39, #75). With real timers this was a race.
+@Test(.timeLimit(.minutes(1)), arguments: [0.001, 0.5, 1.0], [0.05, 0.5, 2.0])
 func linkThatTimesOutItsOwnWriteLeavesTheSessionUsable(replyTimeout: Double, writeTimeout: Double) async throws {
     let link = FakeLink(guardWrites: true, writeTimeout: writeTimeout) { $0.type == 0x0200 ? [deviceReply] : [] }
-    try await using(RingSession(link: link, replyTimeout: replyTimeout), link) { s async throws in
+    try await using(session(link, replyTimeout: replyTimeout), link) { s async throws in
         link.timeOutNextSend()
-        await expectTimeout { _ = try await s.request(Command.deviceInfo) }
+        let pending = Task { try await s.request(Command.deviceInfo) }
+        #expect(await link.waitUntilAttempted(0x0200))
+        link.clock.advance(by: writeTimeout)
+        switch await outcome(of: pending, within: 10) {
+        case .failure(RingError.timeout(let what))?: #expect(what == "write confirmation")
+        case let other: Issue.record("expected the link's own write timeout, got \(String(describing: other))")
+        }
         #expect(try await s.request(Command.deviceInfo) == deviceReply)
+        #expect(!link.events.contains { $0.hasPrefix("busy") })
     }
 }
 
@@ -721,20 +746,19 @@ func linkThatTimesOutItsOwnWriteLeavesTheSessionUsable(replyTimeout: Double, wri
     // A non-compliant link: the write ignores cancellation and never returns. The session must
     // still report a timeout instead of hanging (the link itself stays stuck, which is its fault).
     let link = FakeLink(guardWrites: true) { $0.type == 0x0200 ? [deviceReply] : [] }
-    try await using(RingSession(link: link, replyTimeout: 0.05), link) { s async throws in
+    try await using(session(link), link) { s async throws in
         link.parkNextSend()
-        // Independent watchdog: without the backstop the parked write would keep this test alive past
-        // any time limit, so release it and fail instead of hanging.
-        let watchdogFired = Latch()
-        let watchdog = Task {
-            try? await Task.sleep(for: .seconds(3))
-            guard !Task.isCancelled else { return }
-            watchdogFired.open()
-            link.releaseParked()
+        let pending = Task { try await s.request(Command.deviceInfo) }
+        #expect(await link.waitUntilSendParked())
+        // Just short of the backstop the write is still waited for; at the backstop it is given up.
+        link.clock.advance(by: backstop(link, s) - 0.01)
+        let early = await outcome(of: pending, within: 0.2)
+        #expect(early == nil, "the write was given up before its backstop")
+        link.clock.advance(by: 0.01)
+        switch await outcome(of: pending, within: 10) {
+        case .failure(RingError.timeout(let what))?: #expect(what == "write confirmation")
+        case let other: Issue.record("expected the backstop to end the write, got \(String(describing: other))")
         }
-        await expectTimeout { _ = try await s.request(Command.deviceInfo) }
-        watchdog.cancel()
-        #expect(!watchdogFired.isOpen, "the session did not give up on the write by itself")
         link.releaseParked()
     }
 }
@@ -749,7 +773,9 @@ func linkThatTimesOutItsOwnWriteLeavesTheSessionUsable(replyTimeout: Double, wri
         return frame.type == 0x0200 ? [deviceReply] : []
     }
     try await using(session(link), link) { s async throws in
-        await expectTimeout { _ = try await s.fetchHistory(kind) { _ in } }
+        await expectTimeout(waitingFor: "\(kind.name) history transfer") {
+            _ = try await timingOutWhenWaiting(s, link) { try await s.fetchHistory(kind) { _ in } }
+        }
         #expect(try await s.request(Command.deviceInfo) == deviceReply)
         let transfer = try await s.fetchHistory(kind) { _ in }
         #expect(transfer.data == [1, 2])
@@ -757,13 +783,12 @@ func linkThatTimesOutItsOwnWriteLeavesTheSessionUsable(replyTimeout: Double, wri
 }
 
 @Test(.timeLimit(.minutes(1))) func transferThatKeepsTricklingPastTheOverallDeadlineTimesOut() async throws {
-    let link = FakeLink { frame in
+    let link = steppingLink { frame in
         frame.type == 0x0200 ? [deviceReply] : [header(12)]
     }
     // Every wait is satisfied, so only the overall deadline can end this transfer.
     link.setTrickle(dataFrame([1]))
-    let clock = SteppingClock()
-    try await using(steppingSession(link, clock), link) { s async throws in
+    try await using(steppingSession(link), link) { s async throws in
         await expectTimeout { _ = try await s.fetchHistory(kind) { _ in } }
         link.setTrickle(nil)
         #expect(try await s.request(Command.deviceInfo) == deviceReply)
@@ -774,12 +799,11 @@ func linkThatTimesOutItsOwnWriteLeavesTheSessionUsable(replyTimeout: Double, wri
 // and the deadline ends the conversation before it writes. These two start the trickle once the
 // command is written, so the deadline has to end the conversation while frames keep coming.
 @Test(.timeLimit(.minutes(1))) func transferThatKeepsTricklingAfterItsHeaderTimesOut() async throws {
-    let link = FakeLink { frame in
+    let link = steppingLink { frame in
         frame.type == 0x0200 ? [deviceReply] : [header(12)]
     }
     link.setTrickleOnNextSend(dataFrame([1]))
-    let clock = SteppingClock()
-    try await using(steppingSession(link, clock), link) { s async throws in
+    try await using(steppingSession(link), link) { s async throws in
         await expectTimeout(waitingFor: "\(kind.name) history transfer") { _ = try await s.fetchHistory(kind) { _ in } }
         #expect(link.sent == [Command.history(kind)])
         link.setTrickle(nil)
@@ -788,56 +812,51 @@ func linkThatTimesOutItsOwnWriteLeavesTheSessionUsable(replyTimeout: Double, wri
 }
 
 @Test(.timeLimit(.minutes(1))) func unrelatedFramesAfterTheCommandCannotKeepARequestWaiting() async throws {
-    let link = FakeLink()
+    let link = steppingLink()
     link.setTrickleOnNextSend(Frame(group: 0x02, key: 0x0C, payload: [1]))
-    let clock = SteppingClock()
-    try await using(steppingSession(link, clock), link) { s async throws in
+    try await using(steppingSession(link), link) { s async throws in
         await expectTimeout(waitingFor: "reply to 0200") { _ = try await s.request(Command.deviceInfo) }
         link.setTrickle(nil)
     }
 }
 
 @Test(.timeLimit(.minutes(1))) func unrelatedFramesCannotKeepARequestWaitingPastTheDeadline() async throws {
-    let link = FakeLink()
+    let link = steppingLink()
     link.setTrickle(Frame(group: 0x02, key: 0x0C, payload: [1]))
-    let clock = SteppingClock()
-    try await using(steppingSession(link, clock), link) { s async throws in
+    try await using(steppingSession(link), link) { s async throws in
         await expectTimeout { _ = try await s.request(Command.deviceInfo) }
     }
 }
 
 // A link whose `nextFrame` always has a frame ready and never suspends. The reader must still give
-// up its thread, and the deadline must end the conversation even if no timer gets to run. CI runs
-// the transport suite, these two included, a second time with a one-thread cooperative pool
-// (LIBDISPATCH_COOPERATIVE_POOL_STRICT=1), where without those fixes nothing else could run at all.
+// up its thread, and the deadline must end the conversation even if no timer gets to run: the
+// clock moves only when it is read, and the wait timers are 600 s away, so only the deadline check
+// on each routed frame can end the drain. CI runs the transport suite, these two included, a
+// second time with a one-thread cooperative pool (LIBDISPATCH_COOPERATIVE_POOL_STRICT=1), where
+// without those fixes nothing else could run at all.
 private func expectTimeoutAtTheDeadline(alwaysReady frame: Frame) async throws {
-    let link = FakeLink()
+    let link = steppingLink()
     link.setAlwaysReady(frame)
     // With an event always ready the session queues acknowledgements as fast as it can read, and a
     // fake that completed each write at once would let it start two tasks per write, hundreds of
     // thousands a second, which slows every other test in the process. Parked, at most one write
-    // is in flight and the session's backstop ends it every `writeTimeout + replyTimeout`, as on a
-    // link where each write takes a round trip. That leaves a queue of hundreds of thousands of
-    // acknowledgements, which the session keeps writing after it stops; at one per backstop that
-    // would go on for hours in the background of the rest of the run. Closing the link afterwards
-    // makes each of those writes fail at once, so the queue is gone within a second or so.
+    // is in flight, as on a link where each write takes a round trip. `using` closes the link at
+    // the end, which makes the queued acknowledgements fail at once.
     link.parkSends(ofGroup: 0x04)
-    defer { link.close() }
-    let conversationTimeout = 0.5
-    let s = RingSession(link: link, replyTimeout: 0.05, conversationTimeout: conversationTimeout, monotonicNow: { ContinuousClock.now })
+    let s = session(link, replyTimeout: 600, conversationTimeout: 5)
     try await using(s, link) { s async throws in
-        let start = ContinuousClock.now
-        let pending = Task { try await s.request(Command.deviceInfo) }
-        // Generous for a loaded machine; without the fixes this never returned. Bounded here so a
-        // regression fails the test instead of keeping it waiting.
-        let result = await outcome(of: pending, within: 10)
-        let elapsed = ContinuousClock.now - start
+        // Once the conversation has failed it waits up to one write backstop for the
+        // acknowledgements of the events it read; nothing reads the clock then, so move it on.
+        let result = await outcome {
+            try await whileAdvancing(link, by: backstop(link, s), when: { await s.pendingFlushes > 0 }) {
+                try await s.request(Command.deviceInfo)
+            }
+        }
         // Never empty, so the drain never completes and nothing is written.
         switch result {
-        case .failure(RingError.timeout(let what))?: #expect(what == "the link to drain")
+        case .failure(RingError.timeout(let what)): #expect(what == "the link to drain")
         case let other: Issue.record("expected a timeout, got \(String(describing: other))")
         }
-        #expect(elapsed >= .seconds(conversationTimeout))
         #expect(!link.sent.contains(Command.deviceInfo))
         link.setAlwaysReady(nil)
     }
@@ -852,24 +871,19 @@ private func expectTimeoutAtTheDeadline(alwaysReady frame: Frame) async throws {
 }
 
 // The deadline is checked on every frame routed while the conversation waits, not only when the
-// wait's timer fires: here each wait's timer is seconds away in real time, while the stepping
-// clock crosses the deadline after a few frames. Relying on the timers alone would take about
-// ten seconds (slices of 4, 3, 2 and 1 s); checking on each frame ends it at once.
+// wait's timer fires: here each wait's timer is 600 s away, while the stepping clock crosses the
+// deadline after a few frames, so the conversation can only end by the check on each frame.
 @Test(.timeLimit(.minutes(1))) func deadlineIsCheckedOnEveryFrameNotOnlyWhenATimerFires() async throws {
-    let link = FakeLink()
+    let link = steppingLink()
     link.setAlwaysReady(Frame(group: 0x02, key: 0x0C, payload: [1]))
-    let clock = SteppingClock()
-    let s = RingSession(link: link, replyTimeout: 600, conversationTimeout: 5, monotonicNow: { clock.now() })
-    try await using(s, link) { s async throws in
-        let start = ContinuousClock.now
+    try await using(session(link, replyTimeout: 600, conversationTimeout: 5), link) { s async throws in
         let pending = Task { try await s.request(Command.deviceInfo) }
         switch await outcome(of: pending, within: 20) {
         case .failure(RingError.timeout)?: break
         case let other: Issue.record("expected a timeout, got \(String(describing: other))")
         }
-        // Well under the ten seconds the timers alone would take, with room for a loaded CI
-        // runner: a run there took 3.2 s while the rest of the package's tests ran beside it.
-        #expect(ContinuousClock.now - start < .seconds(7))
+        // No wait's timer could have fired.
+        #expect(link.clock.elapsed < .seconds(600))
         link.setAlwaysReady(nil)
     }
 }
@@ -878,8 +892,7 @@ private func expectTimeoutAtTheDeadline(alwaysReady frame: Frame) async throws {
 // capped. Past the cap the conversation fails, rather than dropping a frame and carrying on.
 @Test(.timeLimit(.minutes(1))) func tooManyHeldFramesFailTheConversation() async throws {
     let link = FakeLink()
-    // Long enough that the backstop cannot cut off the parked write during the test.
-    try await using(RingSession(link: link, replyTimeout: 30), link) { s async throws in
+    try await using(session(link), link) { s async throws in
         link.parkNextSend()
         let pending = Task { try await s.request(Command.deviceInfo) }
         #expect(await link.waitUntilSendParked())
@@ -898,86 +911,104 @@ private func expectTimeoutAtTheDeadline(alwaysReady frame: Frame) async throws {
 
 // A conversation waits for the acknowledgements of events read before it ended, but only for one
 // write backstop in all: here every acknowledgement write hangs until the session's backstop cuts
-// it off, and waiting for each in turn would take twenty backstops.
+// it off, and waiting for each in turn would take twenty backstops. The clock is moved one
+// backstop, to the end of that wait, and no further.
 @Test(.timeLimit(.minutes(1))) func waitForAcknowledgementsAtTheEndOfAConversationIsBounded() async throws {
     let events = (0..<20).map { Frame(group: 0x04, key: 0x0E, payload: [UInt8($0)]) }
     let link = FakeLink { $0.type == 0x0200 ? events + [deviceReply] : [] }
     link.parkSends(ofGroup: 0x04)
-    let replyTimeout = 0.5
-    try await using(RingSession(link: link, replyTimeout: replyTimeout), link) { s async throws in
-        let start = ContinuousClock.now
-        #expect(try await s.request(Command.deviceInfo) == deviceReply)
-        let elapsed = ContinuousClock.now - start
-        // One backstop is writeTimeout + replyTimeout = 0.52 s; twenty would be over 10 s.
-        #expect(elapsed < .seconds(5))
+    try await using(session(link, replyTimeout: 0.5), link) { s async throws in
+        let pending = Task { try await s.request(Command.deviceInfo) }
+        let b = backstop(link, s)
+        // The wait for the acknowledgements, and the first acknowledgement's own backstop.
+        #expect(await link.clock.advanceToTimers(near: b, count: 2))
+        switch await outcome(of: pending, within: 10) {
+        case .success(let reply)?: #expect(reply == deviceReply)
+        case let other: Issue.record("expected the reply after one backstop, got \(String(describing: other))")
+        }
         link.releaseAll()
     }
 }
 
-/// Runs a request on a link where every write hangs until the session's backstop B ends it, and
-/// returns how far past its deadline the request ended, in backstops, and how it ended.
-/// Acknowledgement 1 is in progress when the request starts, so the request first waits for it;
-/// `conversationTimeout` decides whether that wait ends before the deadline. Once the request
-/// waits, a second event arrives, so its acknowledgement takes the write turn just ahead of the
-/// command; a third arrives during the command write, so the conversation ends waiting for it.
+/// Sets up a request on a link where every write hangs until the session's backstop B ends it.
+/// Acknowledgement 1 is in progress when the request starts, so the request first waits for it
+/// (until its backstop, or until the conversation's deadline if that comes first). Once the
+/// request waits, a second event arrives, so its acknowledgement takes the write turn just ahead
+/// of the command; a third arrives during the command write, so the conversation ends waiting for
+/// it. `script` moves the clock from timer to timer and returns the instant (in seconds after the
+/// clock's start) at which the request should have ended; the result is the overrun past the
+/// deadline in backstops, and how the request ended.
+///
+/// Every step is on the link's test clock, so the overrun is exact, not a measurement.
 private func overrunOfARequestBehindStuckWrites(
-    conversationTimeout: Double
+    conversationTimeout: Double,
+    _ script: (FakeLink, _ backstop: Double) async -> Double
 ) async throws -> (backstops: Double, result: Result<Frame, Error>?) {
     let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
-    defer { link.close() }
     link.parkAllSends()
-    // A backstop of about 1 s, so scheduling delay is small beside it.
-    let replyTimeout = 1.0
-    let backstop = link.writeTimeout + replyTimeout
-    let s = RingSession(link: link, replyTimeout: replyTimeout, conversationTimeout: conversationTimeout, monotonicNow: { ContinuousClock.now })
+    let s = session(link, replyTimeout: 1, conversationTimeout: conversationTimeout)
+    let b = backstop(link, s)
     return try await using(s, link) { s async throws in
         await s.start()
         link.deliver([event])
         #expect(await link.waitUntilSendParked())
-        let start = ContinuousClock.now
         let pending = Task { try await s.request(Command.deviceInfo) }
         await waitUntil("the request waits for acknowledgement 1") { await s.pendingFlushes == 1 }
         link.deliver([otherEvent])
+        await waitUntil("the second event is read") { await s.queuedAcknowledgements == 2 }
         let third = Frame(group: 0x04, key: 0x0B, payload: [0x03])
         let duringCommand = Task {
             if await link.waitUntilAttempted(0x0200, within: 20) { link.deliver([third]) }
         }
-        let result = await outcome(of: pending, within: 30)
-        let end = ContinuousClock.now
+        let end = await script(link, b)
+        let result = await outcome(of: pending, within: 10)
         duringCommand.cancel()
-        return ((end - start - .seconds(conversationTimeout)) / .seconds(backstop), result)
+        return ((end - conversationTimeout) / b, result)
     }
 }
 
 // The worst case for a request now: acknowledgement 1 is written just before the deadline, the
 // second acknowledgement takes the write turn ahead of the command (B), the command write hangs
-// (B), and the conversation waits for the third acknowledgement (B). Expected overrun: 3B minus
-// the 0.3 s by which acknowledgement 1 beats the deadline, about 2.7B. Allowed: up to 3.25B, so a
-// quarter of a backstop (about 0.25 s) plus that 0.3 s of slack for timers on a loaded machine.
+// (B), and the conversation waits for the third acknowledgement (B). Overrun: 3B minus the 0.3 s
+// by which acknowledgement 1 beats the deadline, about 2.7B; the bound being tested is 3B.
 @Test(.timeLimit(.minutes(1))) func requestEndsWithinThreeBackstopsOfItsDeadline() async throws {
-    let (overrun, result) = try await overrunOfARequestBehindStuckWrites(conversationTimeout: 1.02 + 0.3)
+    let (overrun, result) = try await overrunOfARequestBehindStuckWrites(conversationTimeout: 1.02 + 0.3) { link, b in
+        // Acknowledgement 1's backstop ends it; acknowledgement 2 takes the write turn.
+        #expect(await link.clock.advanceToTimers(near: b))
+        // Acknowledgement 2's backstop; the command is written, and the third event arrives.
+        #expect(await link.clock.advanceToTimers(near: 2 * b))
+        // The command's backstop; the conversation waits for acknowledgement 3, which is written.
+        #expect(await link.clock.advanceToTimers(near: 3 * b))
+        // That wait and acknowledgement 3's backstop.
+        #expect(await link.clock.advanceToTimers(near: 4 * b, count: 2))
+        return 4 * b
+    }
     switch result {
     case .failure(RingError.timeout(let what))?: #expect(what == "write confirmation")
     case let other: Issue.record("expected the command write to time out, got \(String(describing: other))")
     }
     // Above 2B shows the schedule really reached the worst case.
     #expect(overrun > 2)
-    #expect(overrun < 3.25)
+    #expect(overrun <= 3)
 }
 
 // The schedule that the old rules made worst: acknowledgement 1 is still being written when the
 // deadline passes. The wait for it now ends at the deadline and the request fails, so it ends
-// about 1B late (the end-of-conversation wait). When that wait could run a full backstop past the
+// 1B late (the end-of-conversation wait). When that wait could run a full backstop past the
 // deadline and the command could then still be written, the same schedule ended about 3.8B late.
-// Allowed: up to 3.25B, which leaves about 2.25 backstops of margin now, and would have failed the
-// old rules by about 0.5 backstops.
 @Test(.timeLimit(.minutes(1))) func requestBehindAnAcknowledgementThatOutlastsTheDeadlineDoesNotOverrunFurther() async throws {
-    let (overrun, result) = try await overrunOfARequestBehindStuckWrites(conversationTimeout: 0.2)
+    let (overrun, result) = try await overrunOfARequestBehindStuckWrites(conversationTimeout: 0.2) { link, b in
+        // The deadline ends the wait for acknowledgement 1, and the conversation fails.
+        #expect(await link.clock.advanceToTimers(near: 0.2))
+        // The end-of-conversation wait, one backstop later.
+        #expect(await link.clock.advanceToTimers(near: 0.2 + b))
+        return 0.2 + b
+    }
     switch result {
     case .failure(RingError.timeout(let what))?: #expect(what == "event acknowledgements to be written")
     case let other: Issue.record("expected the wait for acknowledgements to time out, got \(String(describing: other))")
     }
-    #expect(overrun < 3.25)
+    #expect(overrun <= 1.0001)
 }
 
 // A command is never written after the conversation's deadline: here the deadline passes while the
@@ -986,12 +1017,10 @@ private func overrunOfARequestBehindStuckWrites(
 @Test(.timeLimit(.minutes(1))) func aCommandIsNeverWrittenAfterTheDeadline() async throws {
     let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
     link.holdPartialResets()
-    let clock = ManualClock()
-    let s = RingSession(link: link, replyTimeout: 0.05, conversationTimeout: 5, monotonicNow: { clock.now() })
-    try await using(s, link) { s async throws in
+    try await using(session(link, conversationTimeout: 5), link) { s async throws in
         let pending = Task { try await s.request(Command.deviceInfo) }
         #expect(await link.waitUntilPartialResetHeld())
-        clock.advance(by: 6)
+        link.clock.advance(by: 6)
         link.releasePartialReset()
         switch await outcome(of: pending, within: 10) {
         case .failure(RingError.timeout(let what))?: #expect(what == "reply to 0200")
@@ -1007,12 +1036,11 @@ private func overrunOfARequestBehindStuckWrites(
 // made to jump between exactly those two readings.
 @Test(.timeLimit(.minutes(1))) func deadlinePassingJustBeforeTheWaitForAcknowledgementsFailsTheCommand() async throws {
     let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
-    defer { link.close() }
     link.parkSends(ofGroup: 0x04)
     link.holdPartialResets()
-    let clock = ManualClock()
-    // The stuck acknowledgement's backstop is about 2 s: waiting for it would let the command out.
-    let s = RingSession(link: link, replyTimeout: 2, conversationTimeout: 5, monotonicNow: { clock.now() })
+    // The stuck acknowledgement's backstop (about 10 s) is after the jump, so it is still
+    // unwritten when the request reaches its write; waiting for it would let the command out.
+    let s = session(link, replyTimeout: 10, conversationTimeout: 5)
     try await using(s, link) { s async throws in
         await s.start()
         link.deliver([event])
@@ -1021,65 +1049,42 @@ private func overrunOfARequestBehindStuckWrites(
         #expect(await link.waitUntilPartialResetHeld())
         // Nothing else reads the clock while the conversation is not waiting: the next read is the
         // check in `converse`, the one after it the wait for acknowledgements.
-        clock.advance(by: 6, afterReads: 1)
-        let start = ContinuousClock.now
+        link.clock.advance(by: 6, afterReads: 1)
         link.releasePartialReset()
-        switch await outcome(of: pending, within: 20) {
+        // The end-of-conversation wait, one backstop after the jump, ends the request; the
+        // acknowledgement's own backstop comes first and ends that wait early.
+        #expect(await link.clock.advanceToTimers(near: 6 + backstop(link, s)))
+        switch await outcome(of: pending, within: 10) {
         case .failure(RingError.timeout(let what))?: #expect(what == "event acknowledgements to be written")
         case let other: Issue.record("expected a timeout, got \(String(describing: other))")
         }
         #expect(!link.events.contains("attempt 0200"))
-        // Ends with the end-of-conversation wait (at most one backstop), never a second one.
-        #expect(ContinuousClock.now - start < .seconds(3))
     }
-}
-
-/// A monotonic clock that moves only when the test says so.
-// @unchecked Sendable: all state is guarded by `lock`.
-private final class ManualClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var offset: Duration = .zero
-    private var pending: (reads: Int, by: Duration)?
-    private let start = ContinuousClock.now
-    func now() -> ContinuousClock.Instant {
-        lock.withLock {
-            if let jump = pending {
-                if jump.reads == 0 {
-                    offset += jump.by
-                    pending = nil
-                } else {
-                    pending = (jump.reads - 1, jump.by)
-                }
-            }
-            return start + offset
-        }
-    }
-    func advance(by seconds: Double) { lock.withLock { offset += .seconds(seconds) } }
-    /// Moves the clock on by `seconds` just before the read that follows the next `reads` reads.
-    func advance(by seconds: Double, afterReads reads: Int) { lock.withLock { pending = (reads, .seconds(seconds)) } }
 }
 
 // The wait for acknowledgements before a conversation's write ends at the conversation's deadline,
 // not one write backstop later: a conversation that reaches its write with little time left and
 // an acknowledgement still unwritten fails with that timeout, and does not write its command.
 // The clock is moved by hand so the conversation reaches its write with 0.2 s left, while the
-// stuck acknowledgement's backstop is about 2 s away.
+// stuck acknowledgement's backstop is about 10 s away.
 @Test(.timeLimit(.minutes(1))) func waitForAcknowledgementsBeforeAWriteEndsAtTheDeadline() async throws {
     let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
-    defer { link.close() }
     link.parkSends(ofGroup: 0x04)
     link.holdPartialResets()
-    let clock = ManualClock()
-    let s = RingSession(link: link, replyTimeout: 2, conversationTimeout: 5, monotonicNow: { clock.now() })
+    let s = session(link, replyTimeout: 10, conversationTimeout: 5)
     try await using(s, link) { s async throws in
         await s.start()
         link.deliver([event])
         #expect(await link.waitUntilSendParked())
         let pending = Task { try await s.request(Command.deviceInfo) }
         #expect(await link.waitUntilPartialResetHeld())
-        clock.advance(by: 4.8)
+        link.clock.advance(by: 4.8)
         link.releasePartialReset()
-        switch await outcome(of: pending, within: 20) {
+        // The wait for the acknowledgement ends at the deadline...
+        #expect(await link.clock.advanceToTimers(near: 5))
+        // ...and the conversation then waits one backstop for it before giving up the turn.
+        #expect(await link.clock.advanceToTimers(near: 5 + backstop(link, s)))
+        switch await outcome(of: pending, within: 10) {
         case .failure(RingError.timeout(let what))?: #expect(what == "event acknowledgements to be written")
         case let other: Issue.record("expected a timeout, got \(String(describing: other))")
         }
@@ -1105,6 +1110,47 @@ private func waitUntil(_ what: String, within seconds: Double = 10, _ condition:
         try? await Task.sleep(for: .milliseconds(1))
     }
     return true
+}
+
+/// Runs `body`, moving `link.clock` on by one reply timeout whenever the conversation is waiting
+/// for a frame and every frame delivered so far has been routed, until `body` ends. For a
+/// conversation that is expected to time out waiting: the wait that times out is the one in
+/// progress once the link has nothing more to hand over, however slowly frames were handed over.
+private func timingOutWhenWaiting<T: Sendable>(
+    _ s: RingSession, _ link: FakeLink, _ body: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    try await whileAdvancing(link, by: s.replyTimeout, when: { await s.conversationIsWaiting && link.isHandedOver }, body)
+}
+
+/// Runs `body`, moving `link.clock` on by `step` whenever `condition` holds (checked about every
+/// millisecond), until `body` ends. Gives up, records an issue and cancels `body` after `seconds`
+/// of real time, so a regression fails instead of hanging.
+private func whileAdvancing<T: Sendable>(
+    _ link: FakeLink, by step: Double, within seconds: Double = 20,
+    when condition: @escaping @Sendable () async -> Bool,
+    _ body: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    let finished = Latch()
+    let task = Task {
+        defer { finished.open() }
+        return try await body()
+    }
+    let end = ContinuousClock.now + .seconds(seconds)
+    while !finished.isOpen {
+        guard !Task.isCancelled, ContinuousClock.now < end else {
+            Issue.record("the conversation did not end")
+            task.cancel()
+            break
+        }
+        if await condition() { link.clock.advance(by: step) }
+        try? await Task.sleep(for: .milliseconds(1))
+    }
+    return try await task.value
+}
+
+/// How `body` ended.
+private func outcome<T: Sendable>(_ body: () async throws -> T) async -> Result<T, Error> {
+    do { return .success(try await body()) } catch { return .failure(error) }
 }
 
 /// The outcome of `task`, or nil if it has not finished within `seconds`.
@@ -1178,8 +1224,7 @@ private func acknowledgement(of event: Frame) -> Frame { Frame(group: 0x04, key:
 // is still queued behind another one that is in progress when the conversation is ready to write.
 @Test(.timeLimit(.minutes(1))) func acknowledgementsQueuedBeforeAConversationsWriteAreWrittenFirst() async throws {
     let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
-    // Long enough that the backstop cannot cut off the parked write during the test.
-    try await using(RingSession(link: link, replyTimeout: 30), link) { s async throws in
+    try await using(session(link), link) { s async throws in
         await s.start()
         link.parkNextSend()
         link.deliver([event, otherEvent])
@@ -1211,7 +1256,9 @@ private func acknowledgement(of event: Frame) -> Frame { Frame(group: 0x04, key:
         }
     }
     try await using(session(link), link) { s async throws in
-        await expectTimeout { _ = try await s.request(Command.deviceInfo) }
+        await expectTimeout {
+            _ = try await timingOutWhenWaiting(s, link) { try await s.request(Command.deviceInfo) }
+        }
         link.deliver([late])
         #expect(try await s.request(Command.currentActivity) == activity)
         #expect(try await s.fetchHistory(kind) { _ in }.data == [1])
@@ -1258,8 +1305,7 @@ private func acknowledgement(of event: Frame) -> Frame { Frame(group: 0x04, key:
     let leftover = Frame(group: 0x02, key: 0x0C, payload: [0xAA])
     let activity = Frame(group: 0x02, key: 0x0C, payload: [0xBB])
     let link = FakeLink { $0.type == 0x020C ? [activity] : [] }
-    // Long enough that the backstop cannot cut off the parked write during the test.
-    try await using(RingSession(link: link, replyTimeout: 30), link) { s async throws in
+    try await using(session(link), link) { s async throws in
         link.parkNextSend()
         let first = Task { try await s.request(Command.deviceInfo) }
         #expect(await link.waitUntilSendParked())
@@ -1328,16 +1374,14 @@ private func acknowledgement(of event: Frame) -> Frame { Frame(group: 0x04, key:
     let duringWrite = Frame(group: 0x06, key: 0x01, payload: [60])
     let whileWaiting = Frame(group: 0x06, key: 0x01, payload: [61])
     let link = FakeLink { $0.type == 0x0601 ? [duringWrite] : [] }
-    let s = RingSession(link: link, replyTimeout: 5, conversationTimeout: 1, monotonicNow: { ContinuousClock.now })
-    try await using(s, link) { s async throws in
+    try await using(session(link), link) { s async throws in
         let stream = await s.uploads()
         let pending = Task { try await s.requestSkippingChecks(liveCommand) }
         await waitUntil("the request waits for its reply") { await s.conversationIsWaiting }
         link.deliver([whileWaiting])
-        do {
-            _ = try await pending.value
-            Issue.record("expected a timeout")
-        } catch RingError.timeout {
+        // Once the live value has been routed, the request is still waiting: time it out.
+        await expectTimeout(waitingFor: "reply to 0601") {
+            _ = try await timingOutWhenWaiting(s, link) { try await pending.value }
         }
         var iterator = stream.makeAsyncIterator()
         #expect(await iterator.next() == .live(duringWrite))
@@ -1347,8 +1391,8 @@ private func acknowledgement(of event: Frame) -> Frame { Frame(group: 0x04, key:
 
 @Test(.timeLimit(.minutes(1))) func stopEndsTheStreamAndFailsAWaitingRequest() async throws {
     let link = FakeLink()
-    // A reply timeout far beyond what the test waits: only `stop` can end this request in time.
-    try await using(RingSession(link: link, replyTimeout: 30), link) { s async throws in
+    // Nothing moves the clock, so only `stop` can end this request.
+    try await using(session(link), link) { s async throws in
         let stream = await s.uploads()
         let pending = Task { try await s.request(Command.deviceInfo) }
         // Really waiting for its reply, not merely past its write.
@@ -1431,8 +1475,7 @@ private func acknowledgement(of event: Frame) -> Frame { Frame(group: 0x04, key:
 // A conversation that is writing when `stop()` comes fails at its next wait.
 @Test(.timeLimit(.minutes(1))) func stopDuringACommandWriteFailsTheRequest() async throws {
     let link = FakeLink { $0.type == 0x0200 ? [deviceReply] : [] }
-    // Long enough that the backstop cannot cut off the parked write during the test.
-    try await using(RingSession(link: link, replyTimeout: 30), link) { s async throws in
+    try await using(session(link), link) { s async throws in
         link.parkNextSend()
         let pending = Task { try await s.request(Command.deviceInfo) }
         #expect(await link.waitUntilSendParked())
@@ -1474,8 +1517,7 @@ private func expectStopped<T>(_ result: Result<T, Error>?, sourceLocation: Sourc
 // before the write finishes, the request still fails rather than return it.
 @Test(.timeLimit(.minutes(1))) func replyHeldDuringTheWriteIsNotReturnedAfterStop() async throws {
     let link = FakeLink()
-    // Long enough that the backstop cannot cut off the parked write during the test.
-    try await using(RingSession(link: link, replyTimeout: 30), link) { s async throws in
+    try await using(session(link), link) { s async throws in
         link.parkNextSend()
         let pending = Task { try await s.request(Command.deviceInfo) }
         #expect(await link.waitUntilSendParked())
@@ -1495,7 +1537,7 @@ private func expectStopped<T>(_ result: Result<T, Error>?, sourceLocation: Sourc
 @Test(.timeLimit(.minutes(1))) func transferHeldDuringTheWriteIsNotPersistedAfterStop() async throws {
     let link = FakeLink()
     let persisted = PersistRecorder()
-    try await using(RingSession(link: link, replyTimeout: 30), link) { s async throws in
+    try await using(session(link), link) { s async throws in
         link.parkNextSend()
         let pending = Task { try await s.fetchHistory(kind) { await persisted.add($0) } }
         #expect(await link.waitUntilSendParked())
@@ -1531,30 +1573,28 @@ private func expectStopped<T>(_ result: Result<T, Error>?, sourceLocation: Sourc
     }
 }
 
-// Conversations queued for the turn when `stop()` comes all fail within about one backstop in
-// total: `stop()` waits once for the stuck acknowledgements, and the conversations failing behind
-// it do not each wait again (four stuck acknowledgements would otherwise cost one backstop each).
+// Conversations queued for the turn when `stop()` comes all fail within one backstop in total:
+// `stop()` waits once for the stuck acknowledgements, and the conversations failing behind it do
+// not each wait again (four stuck acknowledgements would otherwise cost one backstop each). The
+// clock is moved one backstop and no further, so a conversation that waited again never ends.
 @Test(.timeLimit(.minutes(1))) func conversationsQueuedAtStopDoNotEachWaitForAcknowledgements() async throws {
     let link = historyLink(chunks: [[1]])
-    defer { link.close() }
     link.parkSends(ofGroup: 0x04)
-    let replyTimeout = 1.0
-    let backstop = link.writeTimeout + replyTimeout
     let gate = Gate()
-    try await using(RingSession(link: link, replyTimeout: replyTimeout), link, alsoOnCancel: { gate.release() }) { s async throws in
+    try await using(session(link, replyTimeout: 1), link, alsoOnCancel: { gate.release() }) { s async throws in
         let holder = Task { try await s.fetchHistory(kind) { _ in await gate.park() } }
         #expect(await gate.parked.wait())
         link.deliver((0..<4).map { Frame(group: 0x04, key: 0x0E, payload: [UInt8($0)]) })
         await waitUntil("the events are read") { await s.queuedAcknowledgements == 4 }
         let queued = (0..<3).map { _ in Task { try await s.request(Command.deviceInfo) } }
         await waitUntil("three requests wait for the turn") { await s.queuedConversations == 3 }
-        let start = ContinuousClock.now
-        await s.stop()
+        let stopping = Task { await s.stop() }
+        // Stop's wait for the acknowledgements, and the first acknowledgement's own backstop.
+        #expect(await link.clock.advanceToTimers(near: backstop(link, s), count: 2))
+        await stopping.value
         gate.release()
         expectStopped(await outcome(of: holder, within: 10))
         for task in queued { expectStopped(await outcome(of: task, within: 10)) }
-        // `stop()` waits up to one backstop; allow half a backstop more for scheduling.
-        #expect(ContinuousClock.now - start < .seconds(1.5 * backstop))
     }
 }
 
@@ -1562,8 +1602,7 @@ private func expectStopped<T>(_ result: Result<T, Error>?, sourceLocation: Sourc
 // has stopped: here the second is queued behind a write that is in progress when `stop` is called.
 @Test(.timeLimit(.minutes(1))) func stopWritesQueuedAcknowledgementsBeforeReturning() async throws {
     let link = FakeLink()
-    // Long enough that the backstop cannot cut off the parked write during the test.
-    try await using(RingSession(link: link, replyTimeout: 30), link) { s async throws in
+    try await using(session(link), link) { s async throws in
         await s.start()
         link.parkNextSend()
         link.deliver([event, otherEvent])
@@ -1585,8 +1624,7 @@ private func expectStopped<T>(_ result: Result<T, Error>?, sourceLocation: Sourc
 @Test(.timeLimit(.minutes(1))) func acknowledgementWaitsForTheConversationsWriteInFlight() async throws {
     // The link refuses a second write while one is in flight, as the real connection does.
     let link = FakeLink(guardWrites: true) { $0.type == 0x0200 ? [deviceReply] : [] }
-    // Long enough that the backstop cannot cut off the parked write during the test.
-    try await using(RingSession(link: link, replyTimeout: 30), link) { s async throws in
+    try await using(session(link), link) { s async throws in
         link.parkNextSend()
         let pending = Task { try await s.request(Command.deviceInfo) }
         #expect(await link.waitUntilSendParked())
@@ -1612,18 +1650,13 @@ private func expectStopped<T>(_ result: Result<T, Error>?, sourceLocation: Sourc
         link.parkNextSend()
         link.deliver([event])
         #expect(await link.waitUntilSendParked())
-        // Independent watchdog, as in `backstopEndsAWriteOnALinkThatNeverReturns`: without the
-        // backstop the request would wait on the parked acknowledgement for ever.
-        let watchdogFired = Latch()
-        let watchdog = Task {
-            try? await Task.sleep(for: .seconds(3))
-            guard !Task.isCancelled else { return }
-            watchdogFired.open()
-            link.releaseParked()
+        let pending = Task { try await s.request(Command.deviceInfo) }
+        // Without the backstop the request would wait on the parked acknowledgement for ever.
+        #expect(await link.clock.advanceToTimers(near: backstop(link, s)))
+        switch await outcome(of: pending, within: 10) {
+        case .success(let reply)?: #expect(reply == deviceReply)
+        case let other: Issue.record("expected the reply, got \(String(describing: other))")
         }
-        #expect(try await s.request(Command.deviceInfo) == deviceReply)
-        watchdog.cancel()
-        #expect(!watchdogFired.isOpen, "the session did not give up on the acknowledgement by itself")
         #expect(link.sent == [Command.deviceInfo])
         link.releaseParked()
     }
@@ -1641,9 +1674,13 @@ private func expectStopped<T>(_ result: Result<T, Error>?, sourceLocation: Sourc
     // The operation must ignore its own cancellation, or a helper that waited for it after
     // cancelling it would pass. It is released if the test itself is cancelled (its time limit).
     let parked = ParkedOperation()
+    let clock = TestClock()
     await withTaskCancellationHandler {
-        await expectTimeout {
-            try await withDeadline(0.05, "stuck") { await parked.park() }
+        let pending = Task { try await withDeadline(0.05, "stuck", clock: clock.session) { await parked.park() } }
+        #expect(await clock.advanceToTimers(near: 0.05))
+        switch await outcome(of: pending, within: 10) {
+        case .failure(RingError.timeout(let what))?: #expect(what == "stuck")
+        case let other: Issue.record("expected a timeout, got \(String(describing: other))")
         }
     } onCancel: {
         parked.release()
@@ -1820,8 +1857,43 @@ func monitoringIntervalOtherErrorCodesMapToRejected(code: UInt8) async throws {
 }
 
 @Test(.timeLimit(.minutes(1))) func monitoringIntervalWithNoReplyTimesOut() async throws {
-    do {
-        try await setMonitoringInterval(.off, on: FakeLink())
-        Issue.record("expected an error")
-    } catch RingError.timeout {}
+    let link = FakeLink()
+    try await using(session(link), link) { s async throws in
+        await expectTimeout(waitingFor: "reply to 010C") {
+            try await timingOutWhenWaiting(s, link) { try await s.setMonitoringInterval(.off) }
+        }
+    }
+}
+
+// MARK: Thread-holding load
+
+// The transport tests used to fail when other work in the same process held the pool's threads:
+// each hop of a scripted reply was delayed past a 50 ms reply timeout running on real time (#68).
+// On the test clock no timer fires until the test moves it, so these conversations, which expect
+// replies and never move the clock, get them however long the hand-over takes. Each pool thread
+// that the load uses is held for 150 ms at a time throughout, which is beyond the delays seen in #68. Set
+// RINGKIT_THREAD_LOAD=1 to run the same load beside every test of this target instead.
+@Test(.timeLimit(.minutes(1))) func threadHoldingLoadDoesNotChangeOutcomes() async throws {
+    // With RINGKIT_THREAD_LOAD=1 the same load already runs; a second would hold every thread.
+    let load = ThreadLoad.enabledForWholeRun ? nil : await ThreadLoad.start(tasks: ThreadLoad.defaultTasks, blockMilliseconds: 150)
+    defer { load?.cancel() }
+    let live = Frame(group: 0x06, key: 0x01, payload: [60])
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        for _ in 0..<4 {
+            group.addTask {
+                let link = FakeLink { $0.type == 0x0200 ? [event, live, deviceReply] : [] }
+                try await using(session(link), link) { s async throws in
+                    for _ in 0..<5 { #expect(try await s.request(Command.deviceInfo) == deviceReply) }
+                    #expect(link.sent.filter { $0 == acknowledgement(of: event) }.count == 5)
+                }
+            }
+            group.addTask {
+                let link = historyLink(chunks: [[1, 2, 3, 4], [5, 6], [7]])
+                try await using(session(link), link) { s async throws in
+                    for _ in 0..<3 { #expect(try await s.fetchHistory(kind) { _ in }.data == Array(1...7)) }
+                }
+            }
+        }
+        try await group.waitForAll()
+    }
 }
