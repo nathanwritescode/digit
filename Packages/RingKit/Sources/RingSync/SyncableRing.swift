@@ -14,7 +14,9 @@ public protocol SyncableRing: Sendable {
     /// Fetches one history kind. `persist` runs with the verified transfer before the ring is told
     /// it was received, and only if it succeeds is the transfer acknowledged. When the ring has
     /// nothing stored the returned transfer has empty data and `persist` is not called. `persist`
-    /// runs while the ring's turn is held, so it must not call back into the ring.
+    /// runs while the ring's turn is held, so it must not call back into the ring. If `persist`
+    /// throws, `fetchHistory` must rethrow that error unchanged (`RingSession` does): the sync
+    /// recognises a store suspension on the raw error.
     func fetchHistory(
         _ kind: HistoryKind,
         persist: @Sendable (HistoryTransfer) async throws -> Void
