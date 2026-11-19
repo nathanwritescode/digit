@@ -3,7 +3,8 @@ import Foundation
 import Testing
 
 // When the store's suspension is announced and background tasks end. The process-wide
-// `RingStore.appWillSuspend()` and `appDidResume()` are never called here: fakes stand in for them.
+// `RingStore.announceSuspension()`, `drainSuspension()`, `appWillSuspend()` and `appDidResume()`
+// are never called here: `FakeSuspension` stands in for the store.
 
 /// Background tasks, recorded. `begin` hands out increasing tokens.
 @MainActor
@@ -36,25 +37,48 @@ final class FakeBackgroundTasks: BackgroundTaskRunner {
     }
 }
 
-/// The synchronous announcement (`announce`), the drain and the resume, recorded in one sequence.
-/// The drain first gives up its thread (as the real one hops off the main actor), then records
-/// `drain`, and returns (`drained`) only once released, as `appWillSuspend()` returns only when the
-/// store's calls have drained. `@unchecked Sendable`: guarded by `lock`.
+/// The store's suspension, modelled after `RingStore`: `announce` (`announceSuspension()`) suspends
+/// it, `resume` (`appDidResume()`) undoes that and ends every pending drain, and `drain`
+/// (`drainSuspension()`) first gives up its thread (as the real one hops off the main actor), then
+/// returns at once when the store is not suspended, and otherwise waits until the calls in
+/// progress finish (`gate` opens) or a resume ends the wait. The drain never announces, so any
+/// `announce` in the log came from the lifecycle. Every step is recorded in one sequence
+/// (`announce`, `resume`, `drain`, `drained`). `@unchecked Sendable`: guarded by `lock`.
 final class FakeSuspension: @unchecked Sendable {
     private let lock = NSLock()
     private var log: [String] = []
+    private var suspended = false
+    /// Opening it means the store's calls in progress have finished.
     let gate = Gate()
 
     var events: [String] { lock.withLock { log } }
-    func record(_ event: String) { lock.withLock { log.append(event) } }
+    var isSuspended: Bool { lock.withLock { suspended } }
     func count(_ event: String) -> Int { events.filter { $0 == event }.count }
+    private func record(_ event: String) { lock.withLock { log.append(event) } }
 
-    func announce() { record("announce") }
+    func announce() {
+        lock.withLock {
+            suspended = true
+            log.append("announce")
+        }
+    }
 
-    func suspend() async {
+    func resume() {
+        lock.withLock {
+            suspended = false
+            log.append("resume")
+        }
+    }
+
+    func drain() async {
         await Task.yield()
         record("drain")
-        await gate.wait()
+        // Polls in short sleeps (bounded): returns once nothing is in progress or the store has
+        // been resumed, as the real drain returns on either.
+        let end = ContinuousClock.now + .seconds(10)
+        while isSuspended, !gate.isOpen, ContinuousClock.now < end {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
         record("drained")
     }
 }
@@ -68,8 +92,8 @@ private final class Harness {
         isRingInUse: { [unowned self] in self.ringInUse },
         backgroundTasks: tasks,
         announce: { [suspension] in suspension.announce() },
-        suspend: { [suspension] in await suspension.suspend() },
-        resume: { [suspension] in suspension.record("resume") })
+        suspend: { [suspension] in await suspension.drain() },
+        resume: { [suspension] in suspension.resume() })
 
     func startWork() {
         ringInUse = true
@@ -206,20 +230,33 @@ struct SuspensionLifecycleTests {
         #expect(h.suspension.count("announce") == 0)
     }
 
-    /// The drain hops off the main actor first, so it can run after a resume. It only waits, so
-    /// the announcement (made on the main actor) always precedes the resume, and nothing after the
-    /// resume suspends again or needs a second resume.
-    @Test func aDrainAfterAResumeChangesNothing() async {
+    /// The drain hops off the main actor first, so it can run after a resume. The announcement was
+    /// made on the main actor before the resume, and the drain then neither announces nor waits
+    /// (calls are still in progress: the gate stays closed), so the store stays resumed.
+    @Test func aDrainAfterAResumeNeitherAnnouncesNorWaits() async {
         let h = Harness()
-        h.suspension.gate.open()
         h.lifecycle.sceneDidEnterBackground()
         // Back before the drain has started.
         h.lifecycle.sceneDidBecomeActive()
         #expect(await eventually { h.suspension.events == ["announce", "resume", "drain", "drained"] })
         #expect(await eventually { h.tasks.events == ["begin 1", "end 1"] })
         await h.settle()
-        #expect(h.suspension.count("resume") == 1)
         #expect(h.suspension.count("announce") == 1)
+        #expect(h.suspension.count("resume") == 1)
+        #expect(!h.suspension.isSuspended)
+    }
+
+    /// A resume ends a drain that is waiting, and its task then ends.
+    @Test func aResumeEndsAPendingDrain() async {
+        let h = Harness()
+        h.lifecycle.sceneDidEnterBackground()
+        #expect(await eventually { h.suspension.events == ["announce", "drain"] })
+        await h.settle()
+        #expect(h.tasks.events == ["begin 1"])
+        h.lifecycle.sceneDidBecomeActive()
+        #expect(await eventually { h.suspension.events == ["announce", "drain", "resume", "drained"] })
+        #expect(await eventually { h.tasks.events == ["begin 1", "end 1"] })
+        #expect(!h.suspension.isSuspended)
     }
 
     @Test func aLateDrainDoesNotResumeOverALaterAnnouncement() async {
@@ -231,9 +268,13 @@ struct SuspensionLifecycleTests {
         h.suspension.gate.open()
         #expect(await eventually { h.suspension.count("drained") == 2 })
         await h.settle()
-        // The only resume is the activation's: the store stays suspended in the background.
+        // The first period's drain runs late, during the second period, and waits like the
+        // second's; when both return, nothing resumes: the only resume is the activation's, and the store stays
+        // suspended in the background.
         #expect(h.suspension.count("resume") == 1)
         #expect(h.suspension.events.last == "drained")
+        #expect(h.suspension.isSuspended)
+        #expect(await eventually { h.tasks.events.filter { $0.hasPrefix("end") }.count == 2 })
     }
 }
 
@@ -246,7 +287,8 @@ struct RingWorkInsideABackgroundTaskTests {
         try Fixture { pairedRing in
             SuspensionLifecycle(
                 isRingInUse: { pairedRing.activity != nil }, backgroundTasks: tasks,
-                announce: { suspension.announce() }, suspend: { await suspension.suspend() }, resume: {})
+                announce: { suspension.announce() }, suspend: { await suspension.drain() },
+                resume: { suspension.resume() })
         }
     }
 
@@ -285,7 +327,8 @@ struct RingWorkInsideABackgroundTaskTests {
         #expect(tasks.events == ["begin 1", "end 1", "begin 2", "end 2"])
         await f.pairing.forget()
         #expect(tasks.events == ["begin 1", "end 1", "begin 2", "end 2", "begin 3", "end 3"])
-        #expect(suspension.events.isEmpty)
+        // Only the activation's resume: nothing announced in the foreground.
+        #expect(suspension.events == ["resume"])
     }
 
     @Test func pairingInTheBackgroundDefersTheAnnouncement() async throws {

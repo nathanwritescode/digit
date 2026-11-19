@@ -18,8 +18,9 @@ public struct BackgroundTaskToken: Hashable, Sendable {
 
 /// Decides when to announce the store's suspension and when to end background tasks.
 ///
-/// `RingStore.appWillSuspend()` is process-wide: from the announcement every store call is
-/// refused, and it returns only when the calls in progress have finished. Announcing while the
+/// The store's suspension is process-wide: from the announcement (`RingStore.announceSuspension()`)
+/// every store call is refused, and the drain (`RingStore.drainSuspension()`) returns only when the
+/// calls in progress have finished. Announcing while the
 /// ring is in use aborts that work (a sync possibly between logging a clock-set and sending it),
 /// so:
 /// - ring work (a sync, pairing or forgetting) runs inside a background task, begun when it
@@ -43,12 +44,13 @@ public struct BackgroundTaskToken: Hashable, Sendable {
 ///   (a resume ends every wait), and since the drain never announces, nothing can suspend the
 ///   store again after the resume.
 ///
-/// Every token is ended exactly once, whichever path gets there first. The announcement is never
-/// cancelled (`appWillSuspend()` throws only then). A sync still running at expiration is aborted
+/// Every token is ended exactly once, whichever path gets there first. The drain is never
+/// cancelled (`drainSuspension()` throws only then). A sync still running at expiration is aborted
 /// by the announcement: its store calls are refused, and it ends in the "interrupted" state when
 /// its ring calls return (no cancellation yet, #52).
 ///
-/// The process-wide functions are injected (`suspend`, `resume`), so tests never call them.
+/// The process-wide functions are injected (`announce`, `suspend`, `resume`), so tests never call
+/// them.
 /// Unverified on a device: whether iOS spares the app (no `0xdead10cc`), including at an expiry
 /// during the ring phase and during ingestion (the hardware check on #53).
 @MainActor

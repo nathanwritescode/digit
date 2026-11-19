@@ -49,12 +49,13 @@ final class EventLog: @unchecked Sendable {
 /// Holds a fake call until the test opens it. `@unchecked Sendable`: guarded by `lock`.
 final class Gate: @unchecked Sendable {
     private let lock = NSLock()
-    private var isOpen = false
-    func open() { lock.withLock { isOpen = true } }
+    private var opened = false
+    var isOpen: Bool { lock.withLock { opened } }
+    func open() { lock.withLock { opened = true } }
     /// Waits, in short sleeps, until opened; gives up after `seconds` so no test can hang here.
     func wait(within seconds: Double = 10) async {
         let end = ContinuousClock.now + .seconds(seconds)
-        while !lock.withLock({ isOpen }), ContinuousClock.now < end {
+        while !isOpen, ContinuousClock.now < end {
             try? await Task.sleep(for: .milliseconds(1))
         }
     }

@@ -63,7 +63,7 @@ enum SuspensionState {
     /// disagreeing. A separate `NSLock`, not `state`'s lock, so `state` is never held while
     /// observers run. It IS held while `NotificationCenter.post` runs every observer of GRDB's
     /// two notifications, and it is not reentrant: **an observer of those notifications must never
-    /// call `appWillSuspend()` or `appDidResume()`** (it would deadlock). Restructuring to post
+    /// call `announceSuspension()`, `appWillSuspend()` or `appDidResume()`** (it would deadlock). Restructuring to post
     /// outside the lock would need a hand-over protocol between racing announcements and resumes,
     /// which is not worth it for a rule that is easy to follow.
     private static let announcementLock = NSLock()
