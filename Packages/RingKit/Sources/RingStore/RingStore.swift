@@ -57,18 +57,23 @@ public final class RingStore: Sendable {
     public static func open(at url: URL) async throws -> RingStore {
         // The open runs at the calling task's priority, so a background-priority caller does not
         // make the system run its open at user-initiated QoS.
-        let qos: DispatchQoS.QoSClass
-        switch Task.currentPriority {
-        case .high, .userInitiated: qos = .userInitiated
-        case .medium: qos = .default
-        case .low, .utility: qos = .utility
-        case .background: qos = .background
-        default: qos = .default
-        }
+        let qos = dispatchQoS(for: Task.currentPriority)
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: qos).async {
                 continuation.resume(with: Result { try RingStore(url: url) })
             }
+        }
+    }
+
+    /// The dispatch QoS matching a task priority, so work moved off Swift concurrency runs at its
+    /// caller's priority (`open(at:)`, and the async `ingest` and `rebuild`).
+    static func dispatchQoS(for priority: TaskPriority) -> DispatchQoS.QoSClass {
+        switch priority {
+        case .high, .userInitiated: .userInitiated
+        case .medium: .default
+        case .low, .utility: .utility
+        case .background: .background
+        default: .default
         }
     }
 

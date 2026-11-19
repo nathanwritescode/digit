@@ -125,6 +125,14 @@ struct VariedHistory {
         try fixture.setClock(at: start.addingTimeInterval(86_350), offset: variedOffset(day: day + 1))
     }
 
+    /// A clock-set logged for the middle of day 5 (after day 5's records were fetched, but at an
+    /// instant inside that day) with offset +0 h. The afternoon's records then resolve under it and
+    /// move to other instants (their rows are deleted and inserted again), and those stamped in the
+    /// last hour before the fetch fit no clock and become `assumed`.
+    func addRetroactiveClockSet() throws {
+        try fixture.setClock(at: Self.dayStart(5).addingTimeInterval(43_200), offset: 0)
+    }
+
     mutating func addDays(_ days: Range<Int>) throws {
         for day in days { try addDay(day) }
     }

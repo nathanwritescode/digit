@@ -30,27 +30,6 @@ private func withDatabaseURL(_ body: (URL) async throws -> Void) async throws {
     try await body(dir.appendingPathComponent("ring.sqlite"))
 }
 
-/// Waits for `semaphore` on a dispatch thread, so a Swift concurrency thread is never blocked.
-/// Fails the test instead of hanging if it is not signalled within ten seconds.
-private func wait(for semaphore: DispatchSemaphore) async {
-    let signalled = await withCheckedContinuation { continuation in
-        DispatchQueue.global().async {
-            continuation.resume(returning: semaphore.wait(timeout: .now() + 10) == .success)
-        }
-    }
-    #expect(signalled, "timed out waiting for the other side")
-}
-
-/// Awaits `task` for at most ten seconds. Records an issue and returns nil on timeout, so a hung
-/// task fails its test instead of hanging the run (the task itself is left behind).
-private func finished<T: Sendable, F: Error>(_ task: Task<T, F>) async -> Result<T, F>? {
-    let box = OSAllocatedUnfairLock<Result<T, F>?>(initialState: nil)
-    Task { let result = await task.result; box.withLock { $0 = result } }
-    let ok = await eventually { box.withLock { $0 != nil } }
-    #expect(ok, "timed out waiting for a task to finish")
-    return box.withLock { $0 }
-}
-
 /// Expects `task` to finish by throwing `expected`.
 private func expectFailure<T: Sendable, E: Error & Equatable>(_ task: Task<T, any Error>, _ expected: E) async {
     guard let result = await finished(task) else { return }
@@ -58,16 +37,6 @@ private func expectFailure<T: Sendable, E: Error & Equatable>(_ task: Task<T, an
     case .success: Issue.record("expected \(expected), but the task succeeded")
     case .failure(let error): #expect(error as? E == expected, "got \(error)")
     }
-}
-
-/// Polls `condition` until it holds or `seconds` pass; returns whether it held.
-private func eventually(within seconds: Double = 10, _ condition: () -> Bool) async -> Bool {
-    let deadline = Date().addingTimeInterval(seconds)
-    while !condition() {
-        if Date() > deadline { return false }
-        try? await Task.sleep(for: .milliseconds(2))
-    }
-    return true
 }
 
 /// A thread-safe flag.

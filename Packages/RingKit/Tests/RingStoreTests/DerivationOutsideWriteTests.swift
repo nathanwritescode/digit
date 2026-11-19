@@ -11,14 +11,6 @@ import RingProtocol
 
 private func at(_ seconds: Double) -> Date { t0.addingTimeInterval(seconds) }
 
-/// A thread-safe value for hooks to write and tests to read.
-final class Locked<Value: Sendable>: Sendable {
-    private let stored: OSAllocatedUnfairLock<Value>
-    init(_ value: Value) { stored = OSAllocatedUnfairLock(initialState: value) }
-    var value: Value { stored.withLock { $0 } }
-    func update(_ change: @Sendable (inout Value) -> Void) { stored.withLock { change(&$0) } }
-}
-
 extension BlockingView {
     @discardableResult
     func ingest(ringID: UUID, kind: HistoryKind, hooks: RingStore.IngestionHooks) throws -> IngestionResult {
@@ -300,6 +292,25 @@ private func expectNoChange(_ result: IngestionResult, rows: Int) {
 
     // MARK: Cancellation and failure
 
+    /// The task is cancelled from outside while a hook holds the call at the chosen point (the
+    /// call runs on a dispatch queue, so blocking it there blocks no Swift concurrency thread).
+    private func cancel(
+        _ store: RingStore, ringID: UUID, rebuild: Bool, holdAt: (RingStore.IngestionHooks, DispatchSemaphore, DispatchSemaphore)
+    ) async -> Result<Void, any Error>? {
+        let (hooks, reached, proceed) = holdAt
+        let task = Task {
+            if rebuild {
+                _ = try await store.rebuild(ringID: ringID, hooks: hooks)
+            } else {
+                _ = try await store.ingest(ringID: ringID, kind: .heartRate, hooks: hooks)
+            }
+        }
+        await wait(for: reached)
+        task.cancel()
+        proceed.signal()
+        return await finished(task)
+    }
+
     @Test(arguments: [false, true]) func cancellingDuringDerivationNeverReachesTheWrite(rebuild: Bool) async throws {
         try await onEachStoreAsync { store in
             let (history, before) = try ingestedThenGrown(store)
@@ -308,48 +319,67 @@ private func expectNoChange(_ result: IngestionResult, rows: Int) {
             let checkpointsAfterCancel = Locked(0)
             // The last kind a rebuild derives, so every earlier kind's derivation is thrown away.
             let cancelAt: HistoryKind = rebuild ? .combined : .heartRate
-            let cancelled = Locked(false)
+            let held = Locked(false)
+            let reached = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
             let hooks = RingStore.IngestionHooks(
                 checkpoint: { kind in
-                    if cancelled.value { checkpointsAfterCancel.update { $0 += 1 } }
-                    if kind == cancelAt, !cancelled.value {
-                        cancelled.update { $0 = true }
-                        withUnsafeCurrentTask { $0?.cancel() }
+                    if held.value { checkpointsAfterCancel.update { $0 += 1 } }
+                    if kind == cancelAt, !held.value {
+                        held.update { $0 = true }
+                        reached.signal()
+                        _ = proceed.wait(timeout: .now() + 10)
                     }
                 },
                 beforeApply: { _ in reachedApply.update { $0 = true } })
-            let task = Task {
-                if rebuild {
-                    _ = try await store.rebuild(ringID: ringID, hooks: hooks)
-                } else {
-                    _ = try await store.ingest(ringID: ringID, kind: .heartRate, hooks: hooks)
-                }
-            }
-            let outcome = await task.result
+            let outcome = await cancel(store, ringID: ringID, rebuild: rebuild, holdAt: (hooks, reached, proceed))
             if case .failure(let error) = outcome { #expect(error is CancellationError, "got \(error)") }
-            else { Issue.record("a cancelled call succeeded") }
-            #expect(cancelled.value && !reachedApply.value)
+            else { Issue.record("a cancelled call succeeded or did not finish") }
+            #expect(held.value && !reachedApply.value)
             #expect(checkpointsAfterCancel.value == 0, "derivation went on after the cancellation")
             #expect(try TypedSnapshot(store, ringID: ringID) == before)
         }
     }
 
+    /// Cancelled inside the write after the freshness check, before the first statement that
+    /// applies anything (`aRebuildThatFailsPartWayLeavesEveryTableAsItWas` covers a rollback after
+    /// rows were written).
     @Test(arguments: [false, true]) func cancellingDuringTheApplyStepRollsItBack(rebuild: Bool) async throws {
         try await onEachStoreAsync { store in
             let (history, before) = try ingestedThenGrown(store)
             let ringID = history.ringID
-            let hooks = RingStore.IngestionHooks(duringApply: { withUnsafeCurrentTask { $0?.cancel() } })
-            let task = Task {
-                if rebuild {
-                    _ = try await store.rebuild(ringID: ringID, hooks: hooks)
-                } else {
-                    _ = try await store.ingest(ringID: ringID, kind: .heartRate, hooks: hooks)
-                }
-            }
-            let outcome = await task.result
+            let reached = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
+            let hooks = RingStore.IngestionHooks(duringApply: {
+                reached.signal()
+                _ = proceed.wait(timeout: .now() + 10)
+            })
+            let outcome = await cancel(store, ringID: ringID, rebuild: rebuild, holdAt: (hooks, reached, proceed))
             if case .failure(let error) = outcome { #expect(error is CancellationError, "got \(error)") }
-            else { Issue.record("a cancelled call succeeded") }
+            else { Issue.record("a cancelled call succeeded or did not finish") }
             #expect(try TypedSnapshot(store, ringID: ringID) == before)
+        }
+    }
+
+    // MARK: Executor
+
+    /// The async forms run on a dispatch queue, not on a Swift concurrency thread or the caller's
+    /// actor: no task is current anywhere in the call, derivation included.
+    @Test func asyncFormsRunOffTheCooperativePool() async throws {
+        try await onEachStoreAsync { store in
+            var history = try VariedHistory(store)
+            try history.addDays(0..<2)
+            let onATask = Locked<[String]>([])
+            @Sendable func record(_ point: String) {
+                if withUnsafeCurrentTask(body: { $0 != nil }) { onATask.update { $0.append(point) } }
+            }
+            let hooks = RingStore.IngestionHooks(
+                checkpoint: { kind in record("checkpoint \(kind.name)") },
+                beforeApply: { _ in record("before apply") },
+                duringApply: { record("during apply") })
+            for kind in RingStore.ingestibleKinds {
+                try await store.ingest(ringID: history.ringID, kind: kind, hooks: hooks)
+            }
+            try await store.rebuild(ringID: history.ringID, hooks: hooks)
+            #expect(onATask.value.isEmpty, "ran on a task at \(Set(onATask.value).sorted())")
         }
     }
 

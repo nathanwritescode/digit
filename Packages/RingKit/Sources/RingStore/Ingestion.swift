@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import os
 import RingProtocol
 
 // Typed ingestion. Raw transfers stay the source of truth; typed rows are always the full result of
@@ -26,8 +27,19 @@ extension RingStore {
 
     /// Blocking form of `ingest(ringID:kind:hooks:)` (internal, for tests).
     func ingest(ringID: UUID, kind: HistoryKind, hooks: IngestionHooks) throws -> IngestionResult {
+        try ingestBlocking(ringID: ringID, kind: kind, hooks: hooks, cancellation: nil)
+    }
+
+    private func ingestBlocking(
+        ringID: UUID, kind: HistoryKind, hooks: IngestionHooks, cancellation: DerivationCancellation?
+    ) throws -> IngestionResult {
         guard Self.ingestibleKinds.contains(kind) else { throw RingStoreError.notIngestible(kind) }
-        return try deriveAndApplyBlocking(ringID: ringID, kinds: [kind], replacing: false, hooks: hooks)[kind]!
+        let results = try deriveAndApply(
+            ringID: ringID, kinds: [kind], replacing: false, hooks: hooks, cancellation: cancellation)
+        guard let result = results.first(where: { $0.kind == kind })?.result else {
+            throw IngestionInvariantError.missingResult
+        }
+        return result
     }
 
     /// Makes the typed table for `kind` match what the stored transfers say. Combined records yield
@@ -57,8 +69,14 @@ extension RingStore {
     /// `RingStoreError.suspended` after `appWillSuspend()`, ends the call and leaves the typed
     /// table as it was: during the derivation it is checked between units of work (each transfer,
     /// and every few hundred records), so a long derivation stops promptly and never reaches the
-    /// write; during the apply step the write is rolled back as a whole. (`notIngestible` is
-    /// reserved for a future kind and cannot be thrown today.)
+    /// write; during the apply step it is checked every few hundred rows and the write is rolled
+    /// back as a whole. (`notIngestible` is reserved for a future kind and cannot be thrown today.)
+    ///
+    /// **Executor.** The whole call (read, derivation, write) runs on `ingestionQueue`, a dispatch
+    /// queue, at a QoS taken from the calling task's priority, never on a Swift concurrency thread
+    /// or the caller's actor: derivation is CPU-bound and would otherwise hold one of the few
+    /// cooperative threads for its whole length. The task's cancellation is passed to it through
+    /// `DerivationCancellation`.
     @discardableResult
     public func ingest(ringID: UUID, kind: HistoryKind) async throws -> IngestionResult {
         try await ingest(ringID: ringID, kind: kind, hooks: IngestionHooks())
@@ -66,8 +84,9 @@ extension RingStore {
 
     /// `ingest(ringID:kind:)` with test hooks.
     func ingest(ringID: UUID, kind: HistoryKind, hooks: IngestionHooks) async throws -> IngestionResult {
-        guard Self.ingestibleKinds.contains(kind) else { throw RingStoreError.notIngestible(kind) }
-        return try await deriveAndApply(ringID: ringID, kinds: [kind], replacing: false, hooks: hooks)[kind]!
+        try await offCooperativePool { cancellation in
+            try self.ingestBlocking(ringID: ringID, kind: kind, hooks: hooks, cancellation: cancellation)
+        }
     }
 
     /// Blocking form of `rebuild(ringID:)` (internal, for tests).
@@ -78,7 +97,15 @@ extension RingStore {
 
     /// Blocking form of `rebuild(ringID:hooks:)` (internal, for tests).
     func rebuild(ringID: UUID, hooks: IngestionHooks) throws -> [HistoryKind: IngestionResult] {
-        try deriveAndApplyBlocking(ringID: ringID, kinds: Self.ingestibleKinds, replacing: true, hooks: hooks)
+        try rebuildBlocking(ringID: ringID, hooks: hooks, cancellation: nil)
+    }
+
+    private func rebuildBlocking(
+        ringID: UUID, hooks: IngestionHooks, cancellation: DerivationCancellation?
+    ) throws -> [HistoryKind: IngestionResult] {
+        let results = try deriveAndApply(
+            ringID: ringID, kinds: Self.ingestibleKinds, replacing: true, hooks: hooks, cancellation: cancellation)
+        return Dictionary(results.map { ($0.kind, $0.result) }, uniquingKeysWith: { _, later in later })
     }
 
     /// Deletes the ring's typed rows for every ingestible kind (activity, sleep, heart rate and
@@ -97,7 +124,9 @@ extension RingStore {
 
     /// `rebuild(ringID:)` with test hooks.
     func rebuild(ringID: UUID, hooks: IngestionHooks) async throws -> [HistoryKind: IngestionResult] {
-        try await deriveAndApply(ringID: ringID, kinds: Self.ingestibleKinds, replacing: true, hooks: hooks)
+        try await offCooperativePool { cancellation in
+            try self.rebuildBlocking(ringID: ringID, hooks: hooks, cancellation: cancellation)
+        }
     }
 
     // MARK: Derive, then apply
@@ -120,53 +149,77 @@ extension RingStore {
     }
 
     private enum ApplyOutcome: Sendable {
-        case applied([HistoryKind: IngestionResult])
+        case applied([(kind: HistoryKind, result: IngestionResult)])
         /// These kinds' inputs changed since they were read.
         case stale([HistoryKind])
     }
 
-    /// The async driver. The blocking one below is the same loop; they share every step.
-    private func deriveAndApply(
-        ringID: UUID, kinds: [HistoryKind], replacing: Bool, hooks: IngestionHooks
-    ) async throws -> [HistoryKind: IngestionResult] {
-        var plans: [HistoryKind: IngestionPlan] = [:]
-        var pending = kinds
-        for attempt in 1...Self.maximumDerivationAttempts {
-            let toRead = pending
-            let inputs = try await read { db in try Self.loadInputs(db, ringID: ringID, kinds: toRead) }
-            for kind in pending {
-                plans[kind] = try Self.plan(inputs[kind]!, ringID: ringID, kind: kind) {
-                    try self.derivationCheckpoint(kind, hooks)
-                }
-            }
-            try hooks.beforeApply(attempt)
-            let ready = plans
-            let outcome = try await write { db in
-                try Self.applyIfFresh(db, ringID: ringID, kinds: kinds, plans: ready, replacing: replacing, hooks: hooks)
-            }
-            switch outcome {
-            case .applied(let results): return results
-            case .stale(let stale): pending = stale
-            }
-        }
-        throw RingStoreError.ingestionInputsKeptChanging
+    /// A broken internal invariant of ingestion (a kind asked for but not derived). Never expected.
+    enum IngestionInvariantError: Error {
+        case missingResult
     }
 
-    private func deriveAndApplyBlocking(
-        ringID: UUID, kinds: [HistoryKind], replacing: Bool, hooks: IngestionHooks
-    ) throws -> [HistoryKind: IngestionResult] {
-        var plans: [HistoryKind: IngestionPlan] = [:]
+    /// A task's cancellation, for work running on a dispatch queue (where `Task.isCancelled` sees no
+    /// task). Set by the async forms' cancellation handler, read at every checkpoint.
+    final class DerivationCancellation: Sendable {
+        private let cancelled = OSAllocatedUnfairLock(initialState: false)
+        var isCancelled: Bool { cancelled.withLock { $0 } }
+        func cancel() { cancelled.withLock { $0 = true } }
+    }
+
+    /// Where the async forms of `ingest` and `rebuild` run (concurrent; each call is one work item
+    /// at its caller's QoS).
+    private static let ingestionQueue = DispatchQueue(label: "RingStore.ingestion", attributes: .concurrent)
+
+    /// Runs `work` on `ingestionQueue` at the calling task's priority (as `open(at:)` does) and
+    /// awaits it. Cancelling the task sets the flag `work` is given; it does not interrupt it
+    /// otherwise.
+    private func offCooperativePool<T: Sendable>(
+        _ work: @escaping @Sendable (DerivationCancellation) throws -> T
+    ) async throws -> T {
+        let cancellation = DerivationCancellation()
+        let qos = Self.dispatchQoS(for: Task.currentPriority)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                Self.ingestionQueue.async(qos: DispatchQoS(qosClass: qos, relativePriority: 0), flags: .enforceQoS) {
+                    continuation.resume(with: Result { try work(cancellation) })
+                }
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
+
+    /// The one implementation of `ingest` and `rebuild`: blocking, so the async forms run it on a
+    /// dispatch queue. Results come back in `kinds` order.
+    private func deriveAndApply(
+        ringID: UUID, kinds: [HistoryKind], replacing: Bool, hooks: IngestionHooks,
+        cancellation: DerivationCancellation?
+    ) throws -> [(kind: HistoryKind, result: IngestionResult)] {
+        let checkCancelled = { () throws -> Void in
+            if cancellation?.isCancelled == true || Task.isCancelled { throw CancellationError() }
+        }
+        // In `kinds` order; a stale kind's plan is replaced in place.
+        var plans: [IngestionPlan] = []
         var pending = kinds
         for attempt in 1...Self.maximumDerivationAttempts {
+            try checkCancelled()
             let inputs = try readBlocking { db in try Self.loadInputs(db, ringID: ringID, kinds: pending) }
-            for kind in pending {
-                plans[kind] = try Self.plan(inputs[kind]!, ringID: ringID, kind: kind) {
-                    try self.derivationCheckpoint(kind, hooks)
+            for input in inputs {
+                let plan = try Self.plan(input, ringID: ringID) {
+                    try self.derivationCheckpoint(input.kind, hooks, checkCancelled)
+                }
+                if let index = plans.firstIndex(where: { $0.kind == plan.kind }) {
+                    plans[index] = plan
+                } else {
+                    plans.append(plan)
                 }
             }
             try hooks.beforeApply(attempt)
+            try checkCancelled()
             let outcome = try writeBlocking { db in
-                try Self.applyIfFresh(db, ringID: ringID, kinds: kinds, plans: plans, replacing: replacing, hooks: hooks)
+                try Self.applyIfFresh(
+                    db, ringID: ringID, plans: plans, replacing: replacing, hooks: hooks, checkCancelled: checkCancelled)
             }
             switch outcome {
             case .applied(let results): return results
@@ -179,9 +232,11 @@ extension RingStore {
     /// Between units of derivation: no database access is open here, so this is the only place a
     /// cancellation or a suspension can stop it. A suspension announced and lifted between two
     /// checkpoints goes unnoticed, which is harmless: the write that follows runs after the resume.
-    private func derivationCheckpoint(_ kind: HistoryKind, _ hooks: IngestionHooks) throws {
+    private func derivationCheckpoint(
+        _ kind: HistoryKind, _ hooks: IngestionHooks, _ checkCancelled: () throws -> Void
+    ) throws {
         try hooks.checkpoint(kind)
-        try Task.checkCancellation()
+        try checkCancelled()
         try SuspensionState.checkNotSuspended(observes: observesSuspension)
     }
 
@@ -201,12 +256,18 @@ extension RingStore {
     /// touches the indexes, never a transfer's data, so the check is cheap and the apply step stays
     /// short. A fingerprint of a hash instead of the lists would be smaller but would need hashing
     /// inside the write.
+    ///
+    /// **Rule:** every table `loadInputs` reads must contribute to this fingerprint, and the id-list
+    /// form holds only while those tables stay append-only as described. A change that updates or
+    /// deletes their rows (the observation migration in #32, an erase feature, recording clock-set
+    /// outcomes in #72) must extend the fingerprint.
     struct InputFingerprint: Equatable, Sendable {
         var transferIDs: [Int64]
         var observationIDs: [Int64]
         var clockSetIDs: [Int64]
     }
 
+    /// Internal only for tests.
     static func fingerprint(_ db: Database, ringID: UUID, kind: HistoryKind) throws -> InputFingerprint {
         let ring = ringID.uuidString
         let code = KindCode.code(for: kind)
@@ -223,6 +284,7 @@ extension RingStore {
 
     /// Everything derivation reads for one kind, from one snapshot, with its fingerprint.
     struct IngestionInputs: Sendable {
+        var kind: HistoryKind
         var transfers: [StoredTransfer]
         var observations: [TransferObservation]
         var clockSets: [ClockSetEvent]
@@ -230,19 +292,19 @@ extension RingStore {
     }
 
     /// Reads every kind's inputs in the caller's transaction (one snapshot), after checking that
-    /// the ring is stored. Only reads; no decoding or hashing.
-    static func loadInputs(_ db: Database, ringID: UUID, kinds: [HistoryKind]) throws -> [HistoryKind: IngestionInputs] {
+    /// the ring is stored, in `kinds` order. Only reads; no decoding or hashing. Internal only for
+    /// the tests' one-transaction reference.
+    static func loadInputs(_ db: Database, ringID: UUID, kinds: [HistoryKind]) throws -> [IngestionInputs] {
         try Self.requireRing(db, ringID)
         let clockSets = try Self.clockSets(db, ringID: ringID)
-        var inputs: [HistoryKind: IngestionInputs] = [:]
-        for kind in kinds {
-            inputs[kind] = IngestionInputs(
+        return try kinds.map { kind in
+            IngestionInputs(
+                kind: kind,
                 transfers: try Self.transfers(db, ringID: ringID, kind: kind, fetchedWithin: nil).transfers,
                 observations: try Self.observations(db, ringID: ringID, kind: kind).observations,
                 clockSets: clockSets,
                 fingerprint: try Self.fingerprint(db, ringID: ringID, kind: kind))
         }
-        return inputs
     }
 
     /// One kind's desired rows, with the counts derivation produced and the fingerprint of the
@@ -261,33 +323,35 @@ extension RingStore {
         var fingerprint: InputFingerprint
     }
 
-    /// Inside the write: if every kind's inputs are as they were read, applies every plan (after
-    /// deleting each kind's rows first when `replacing`, for `rebuild`) in `kinds` order;
-    /// otherwise applies nothing and names the stale kinds. Runs no decoding, hashing or time
-    /// resolution.
+    /// Inside the write: if every kind's inputs are as they were read, applies every plan in order
+    /// (after deleting each kind's rows first when `replacing`, for `rebuild`); otherwise applies
+    /// nothing and names the stale kinds. Runs no decoding, hashing or time resolution.
     private static func applyIfFresh(
-        _ db: Database, ringID: UUID, kinds: [HistoryKind], plans: [HistoryKind: IngestionPlan], replacing: Bool,
-        hooks: IngestionHooks
+        _ db: Database, ringID: UUID, plans: [IngestionPlan], replacing: Bool, hooks: IngestionHooks,
+        checkCancelled: () throws -> Void
     ) throws -> ApplyOutcome {
-        let stale = try kinds.filter { try fingerprint(db, ringID: ringID, kind: $0) != plans[$0]!.fingerprint }
+        let stale = try plans.filter { try fingerprint(db, ringID: ringID, kind: $0.kind) != $0.fingerprint }.map(\.kind)
         if !stale.isEmpty { return .stale(stale) }
         try hooks.duringApply()
-        var results: [HistoryKind: IngestionResult] = [:]
-        for kind in kinds {
-            if replacing { try deleteTypedRows(db, ringID: ringID, kind: kind) }
-            results[kind] = try apply(db, ringID: ringID, plans[kind]!)
-        }
-        return .applied(results)
+        try checkCancelled()
+        return .applied(try plans.map { plan in
+            if replacing { try deleteTypedRows(db, ringID: ringID, kind: plan.kind) }
+            return (plan.kind, try apply(db, ringID: ringID, plan, checkpoint: checkCancelled))
+        })
     }
 
-    /// Makes one kind's typed table match the plan. Unchanged rows are left alone.
-    static func apply(_ db: Database, ringID: UUID, _ plan: IngestionPlan) throws -> IngestionResult {
+    /// Makes one kind's typed table match the plan. Unchanged rows are left alone. `checkpoint`
+    /// runs every `checkpointInterval` rows. Internal only for the tests' one-transaction
+    /// reference: nothing else may call it without the freshness check in `applyIfFresh`.
+    static func apply(
+        _ db: Database, ringID: UUID, _ plan: IngestionPlan, checkpoint: () throws -> Void = {}
+    ) throws -> IngestionResult {
         var result = plan.result
         switch plan.rows {
-        case .heartRate(let rows): try applyHeartRate(db, ringID, rows, &result)
-        case .activity(let rows): try applyActivity(db, ringID, rows, &result)
-        case .sleep(let rows): try applySleep(db, ringID, rows, &result)
-        case .vitals(let rows): try applyVitals(db, ringID, rows, &result)
+        case .heartRate(let rows): try applyHeartRate(db, ringID, rows, &result, checkpoint)
+        case .activity(let rows): try applyActivity(db, ringID, rows, &result, checkpoint)
+        case .sleep(let rows): try applySleep(db, ringID, rows, &result, checkpoint)
+        case .vitals(let rows): try applyVitals(db, ringID, rows, &result, checkpoint)
         }
         return result
     }
@@ -351,9 +415,12 @@ extension RingStore {
     /// Derives one kind's desired rows from its inputs: all decoding, hashing and time resolution,
     /// and no database access. `checkpoint` is called between units of work and stops the
     /// derivation by throwing.
+    ///
+    /// Internal only for the tests' one-transaction reference.
     static func plan(
-        _ inputs: IngestionInputs, ringID: UUID, kind: HistoryKind, checkpoint: () throws -> Void
+        _ inputs: IngestionInputs, ringID: UUID, checkpoint: () throws -> Void
     ) throws -> IngestionPlan {
+        let kind = inputs.kind
         try checkpoint()
         let transfers = inputs.transfers
         let resolver = TimeResolver(
@@ -467,7 +534,8 @@ extension RingStore {
     }
 
 
-    /// Records (decoded, resolved or built) between two derivation checkpoints.
+    /// Records (decoded, resolved or built) between two derivation checkpoints, and rows between
+    /// two cancellation checks in the apply step.
     static let checkpointInterval = 256
 
     /// One place a record's bytes were found.
@@ -602,11 +670,13 @@ extension RingStore {
     // MARK: Applying the desired set
 
     private static func applyHeartRate(
-        _ db: Database, _ ringID: UUID, _ desired: [Int64: HeartRateReading], _ result: inout IngestionResult
+        _ db: Database, _ ringID: UUID, _ desired: [Int64: HeartRateReading], _ result: inout IngestionResult,
+        _ checkpoint: () throws -> Void
     ) throws {
         var existing = Dictionary(
             try heartRateRows(db, ringID: ringID).map { (ms($0.value.time), $0) }, uniquingKeysWith: { a, _ in a })
-        for (key, value) in desired.sorted(by: { $0.key < $1.key }) {
+        for (index, (key, value)) in desired.sorted(by: { $0.key < $1.key }).enumerated() {
+            if index % checkpointInterval == checkpointInterval - 1 { try checkpoint() }
             let args: StatementArguments = [
                 value.bpm, value.mode, value.utcOffsetSeconds, value.ringLocalSeconds, TimeSourceCode.code(for: value.timeSource),
             ]
@@ -636,11 +706,13 @@ extension RingStore {
     }
 
     private static func applyVitals(
-        _ db: Database, _ ringID: UUID, _ desired: [Int64: VitalsReading], _ result: inout IngestionResult
+        _ db: Database, _ ringID: UUID, _ desired: [Int64: VitalsReading], _ result: inout IngestionResult,
+        _ checkpoint: () throws -> Void
     ) throws {
         var existing = Dictionary(
             try vitalsRows(db, ringID: ringID).map { (ms($0.value.time), $0) }, uniquingKeysWith: { a, _ in a })
-        for (key, value) in desired.sorted(by: { $0.key < $1.key }) {
+        for (index, (key, value)) in desired.sorted(by: { $0.key < $1.key }).enumerated() {
+            if index % checkpointInterval == checkpointInterval - 1 { try checkpoint() }
             let args: StatementArguments = [
                 value.spo2, value.respirationRate, value.hrv, value.cvrr, value.utcOffsetSeconds,
                 value.ringLocalSeconds, TimeSourceCode.code(for: value.timeSource),
@@ -671,11 +743,13 @@ extension RingStore {
     }
 
     private static func applyActivity(
-        _ db: Database, _ ringID: UUID, _ desired: [Int64: ActivityInterval], _ result: inout IngestionResult
+        _ db: Database, _ ringID: UUID, _ desired: [Int64: ActivityInterval], _ result: inout IngestionResult,
+        _ checkpoint: () throws -> Void
     ) throws {
         var existing = Dictionary(
             try activityRows(db, ringID: ringID).map { (ms($0.value.start), $0) }, uniquingKeysWith: { a, _ in a })
-        for (key, value) in desired.sorted(by: { $0.key < $1.key }) {
+        for (index, (key, value)) in desired.sorted(by: { $0.key < $1.key }).enumerated() {
+            if index % checkpointInterval == checkpointInterval - 1 { try checkpoint() }
             let args: StatementArguments = [
                 ms(value.end), value.steps, value.distanceMeters, value.kilocalories, value.utcOffsetSeconds,
                 value.ringLocalSeconds, TimeSourceCode.code(for: value.timeSource),
@@ -706,11 +780,13 @@ extension RingStore {
     }
 
     private static func applySleep(
-        _ db: Database, _ ringID: UUID, _ desired: [Int64: SleepSessionRecord], _ result: inout IngestionResult
+        _ db: Database, _ ringID: UUID, _ desired: [Int64: SleepSessionRecord], _ result: inout IngestionResult,
+        _ checkpoint: () throws -> Void
     ) throws {
         var existing = Dictionary(
             try sleepRows(db, ringID: ringID).map { (ms($0.value.start), $0) }, uniquingKeysWith: { a, _ in a })
-        for (key, value) in desired.sorted(by: { $0.key < $1.key }) {
+        for (index, (key, value)) in desired.sorted(by: { $0.key < $1.key }).enumerated() {
+            if index % checkpointInterval == checkpointInterval - 1 { try checkpoint() }
             let sessionID: Int64
             if let row = existing.removeValue(forKey: key) {
                 if row.value == value { result.unchanged += 1; continue }
@@ -753,6 +829,7 @@ extension RingStore {
         }
     }
 
+    /// Internal only for the tests' one-transaction reference.
     static func deleteTypedRows(_ db: Database, ringID: UUID, kind: HistoryKind) throws {
         let table: String
         switch kind {
