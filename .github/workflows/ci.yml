@@ -64,7 +64,7 @@ jobs:
         timeout-minutes: 5
         env:
           LIBDISPATCH_COOPERATIVE_POOL_STRICT: "1"
-        run: Scripts/test-each-target.sh RingTransportTests RingSyncTests
+        run: Scripts/test-each-target.sh DigitCoreTests RingTransportTests RingSyncTests
 
   app:
     name: App build (iOS simulator)

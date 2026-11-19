@@ -9,6 +9,9 @@
 /* Begin PBXBuildFile section */
 		A10000000000000000000010 /* RingProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000021 /* RingProtocol */; };
 		A10000000000000000000011 /* RingTransport in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000022 /* RingTransport */; };
+		A10000000000000000000015 /* RingStore in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000023 /* RingStore */; };
+		A10000000000000000000016 /* RingSync in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000024 /* RingSync */; };
+		A10000000000000000000017 /* DigitCore in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000025 /* DigitCore */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -33,6 +36,9 @@
 			files = (
 				A10000000000000000000010 /* RingProtocol in Frameworks */,
 				A10000000000000000000011 /* RingTransport in Frameworks */,
+				A10000000000000000000015 /* RingStore in Frameworks */,
+				A10000000000000000000016 /* RingSync in Frameworks */,
+				A10000000000000000000017 /* DigitCore in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -88,6 +94,9 @@
 			packageProductDependencies = (
 				A10000000000000000000021 /* RingProtocol */,
 				A10000000000000000000022 /* RingTransport */,
+				A10000000000000000000023 /* RingStore */,
+				A10000000000000000000024 /* RingSync */,
+				A10000000000000000000025 /* DigitCore */,
 			);
 			productName = Digit;
 			productReference = A10000000000000000000002 /* Digit.app */;
@@ -375,6 +384,21 @@
 			isa = XCSwiftPackageProductDependency;
 			package = A10000000000000000000020 /* XCLocalSwiftPackageReference "../Packages/RingKit" */;
 			productName = RingTransport;
+		};
+		A10000000000000000000023 /* RingStore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A10000000000000000000020 /* XCLocalSwiftPackageReference "../Packages/RingKit" */;
+			productName = RingStore;
+		};
+		A10000000000000000000024 /* RingSync */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A10000000000000000000020 /* XCLocalSwiftPackageReference "../Packages/RingKit" */;
+			productName = RingSync;
+		};
+		A10000000000000000000025 /* DigitCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A10000000000000000000020 /* XCLocalSwiftPackageReference "../Packages/RingKit" */;
+			productName = DigitCore;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

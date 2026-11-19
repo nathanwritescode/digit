@@ -9,6 +9,7 @@ let package = Package(
         .library(name: "RingTransport", targets: ["RingTransport"]),
         .library(name: "RingStore", targets: ["RingStore"]),
         .library(name: "RingSync", targets: ["RingSync"]),
+        .library(name: "DigitCore", targets: ["DigitCore"]),
         .executable(name: "ringprobe", targets: ["ringprobe"]),
     ],
     dependencies: [
@@ -41,6 +42,12 @@ let package = Package(
                 .product(name: "GRDB", package: "GRDB.swift"),
             ]
         ),
+        // The app's logic, testable outside the app target: pairing, foreground sync and the store's
+        // suspension around background tasks. No SwiftUI, UIKit or networking imports.
+        .target(
+            name: "DigitCore",
+            dependencies: ["RingProtocol", "RingTransport", "RingStore", "RingSync"]
+        ),
         // macOS command-line tool for probing a ring and capturing raw data.
         .executableTarget(
             name: "ringprobe",
@@ -61,6 +68,10 @@ let package = Package(
                 "RingProtocol", "RingTransport", "RingStore", "RingSync",
                 .product(name: "GRDB", package: "GRDB.swift"),
             ]
+        ),
+        .testTarget(
+            name: "DigitCoreTests",
+            dependencies: ["RingProtocol", "RingTransport", "RingStore", "RingSync", "DigitCore"]
         ),
     ]
 )
