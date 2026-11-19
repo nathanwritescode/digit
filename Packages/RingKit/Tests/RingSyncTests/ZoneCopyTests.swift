@@ -9,8 +9,10 @@ import RingTransport
 // passes can change between uses (an auto-updating zone when the user travels or the system zone
 // changes); this fake makes that happen on every use, so the hazard is real at this level.
 
-/// A zone named "America/New_York" whose offset alternates between UTC-4 and UTC+1 on every
+/// A zone named "America/New_York" whose offset alternates between UTC+1 and UTC+2 on every
 /// query, standing in for an auto-updating zone that changes while the clock-set is built.
+/// Neither value is New York's real offset, so any offset read from this object rather than from
+/// the fixed copy differs from the copy's, whichever query it happens to be.
 /// `@unchecked Sendable`: the counter is guarded by `lock`.
 private final class ShiftingZone: NSTimeZone, @unchecked Sendable {
     private let lock = NSLock()
@@ -22,7 +24,7 @@ private final class ShiftingZone: NSTimeZone, @unchecked Sendable {
     override func secondsFromGMT(for aDate: Date) -> Int {
         lock.withLock {
             queries += 1
-            return queries % 2 == 1 ? -14_400 : 3600
+            return queries % 2 == 1 ? 3600 : 7200
         }
     }
     override func abbreviation(for aDate: Date) -> String? { nil }

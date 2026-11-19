@@ -39,7 +39,9 @@ import RingTransport
 /// before writing (`rejected`, `refusedDestructive`, `refusedUploadGroup`, `busy`) is taken to
 /// mean the command may have reached the ring, and the clock-set is logged. Some of those errors
 /// are in fact raised before anything is written (the session's deadline check before the write,
-/// its wait for event acknowledgements, a `stop()` before the write), and the session cannot tell
+/// its wait for event acknowledgements, a `stop()` before the write, and the link's own
+/// `notConnected` check before writing, probably the commonest: the ring went out of range after
+/// the last acknowledgement), and the session cannot tell
 /// the sync which; those log a clock-set that never happened. Telling them apart needs the session
 /// to report whether the command was written (a follow-up). Logging is the safer error: a
 /// `stop()` after the write, the realistic case of a ring that took the clock-set and then went

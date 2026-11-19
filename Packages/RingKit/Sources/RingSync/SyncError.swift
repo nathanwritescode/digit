@@ -5,7 +5,11 @@ import RingStore
 import RingTransport
 
 /// An error as the sync result keeps it: built where the error is caught, holding only what is
-/// safe to show or dump.
+/// safe to show or dump on the device.
+///
+/// "Safe to dump" is not "safe to send": a `SyncResult` still holds byte and record counts, the
+/// sync's time and the time-zone identifier, which describe the owner's health data. Nothing from
+/// a result may go into a crash report, analytics or any other payload that leaves the device.
 ///
 /// The errors the sync catches can carry health data where no description shows it: GRDB's
 /// `DatabaseError` keeps its statement's arguments (for a history insert, the transfer's raw bytes

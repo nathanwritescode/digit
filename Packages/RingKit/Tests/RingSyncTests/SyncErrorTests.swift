@@ -25,7 +25,10 @@ private let rawErrorMarkers = ["DatabaseError", "StatementArguments", "arguments
 
 /// Failing the `history_transfer` insert puts the transfer's data blob among the failing
 /// statement's arguments; failing the `transfer_observation` insert (which runs first) puts its
-/// header, length and fetch time there. Neither may reach the result.
+/// header, length and fetch time there. Neither may reach the result. `dump` prints a `Data`
+/// argument as "N bytes", not as hex, so for the blob it is the type-name markers ("bytes",
+/// "arguments", "DatabaseError") that would catch a kept raw error; the walk over the whole result
+/// below also checks directly that no byte buffer is held.
 @Test(.timeLimit(.minutes(1)), arguments: ["transfer_observation", "history_transfer"])
 func resultOfAStoreFailureInsidePersistHoldsNoRawData(_ table: String) async throws {
     let (store, id) = try await makeStore()
@@ -47,6 +50,7 @@ func resultOfAStoreFailureInsidePersistHoldsNoRawData(_ table: String) async thr
     for marker in rawErrorMarkers + ["173", "187", Hex.encode(data), Hex.encode(data).uppercased()] {
         #expect(!text.contains(marker), "dump contains \(marker)")
     }
+    #expect(!holdsRawBytes(result), "the result holds a byte buffer")
 }
 
 @Test(.timeLimit(.minutes(1))) func resultOfAnIngestionFailureHoldsNoReadings() async throws {
