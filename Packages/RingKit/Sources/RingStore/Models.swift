@@ -139,4 +139,9 @@ public enum RingStoreError: Error, Equatable, Sendable {
     /// The database was written by a newer build of the app: it has migrations this build does
     /// not know. Opening refuses it so an older build never writes into a newer schema.
     case schemaTooNew
+    /// `ingest` or `rebuild` found, `RingStore.maximumDerivationAttempts` times in a row, that
+    /// another write had changed its inputs (transfers, fetch log or clock-sets) between deriving
+    /// the typed rows and applying them. Nothing was applied: the typed tables are as they were.
+    /// The stored history is intact; call again once the other writer has finished.
+    case ingestionInputsKeptChanging
 }

@@ -31,27 +31,6 @@ private func withDatabaseURL(_ body: (URL) async throws -> Void) async throws {
     try await body(dir.appendingPathComponent("ring.sqlite"))
 }
 
-/// Waits for `semaphore` on a dispatch thread, so a Swift concurrency thread is never blocked.
-/// Fails the test instead of hanging if it is not signalled within ten seconds.
-private func wait(for semaphore: DispatchSemaphore) async {
-    let signalled = await withCheckedContinuation { continuation in
-        DispatchQueue.global().async {
-            continuation.resume(returning: semaphore.wait(timeout: .now() + 10) == .success)
-        }
-    }
-    #expect(signalled, "timed out waiting for the other side")
-}
-
-/// Awaits `task` for at most ten seconds. Records an issue and returns nil on timeout, so a hung
-/// task fails its test instead of hanging the run (the task itself is left behind).
-private func finished<T: Sendable, F: Error>(_ task: Task<T, F>) async -> Result<T, F>? {
-    let box = OSAllocatedUnfairLock<Result<T, F>?>(initialState: nil)
-    Task { let result = await task.result; box.withLock { $0 = result } }
-    let ok = await eventually { box.withLock { $0 != nil } }
-    #expect(ok, "timed out waiting for a task to finish")
-    return box.withLock { $0 }
-}
-
 /// Expects `task` to finish by throwing `expected`.
 private func expectFailure<T: Sendable, E: Error & Equatable>(_ task: Task<T, any Error>, _ expected: E) async {
     guard let result = await finished(task) else { return }
@@ -59,16 +38,6 @@ private func expectFailure<T: Sendable, E: Error & Equatable>(_ task: Task<T, an
     case .success: Issue.record("expected \(expected), but the task succeeded")
     case .failure(let error): #expect(error as? E == expected, "got \(error)")
     }
-}
-
-/// Polls `condition` until it holds or `seconds` pass; returns whether it held.
-private func eventually(within seconds: Double = 10, _ condition: () -> Bool) async -> Bool {
-    let deadline = Date().addingTimeInterval(seconds)
-    while !condition() {
-        if Date() > deadline { return false }
-        try? await Task.sleep(for: .milliseconds(2))
-    }
-    return true
 }
 
 /// A thread-safe flag.
@@ -802,6 +771,60 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
             case .failure(let error): #expect((error as? DatabaseError)?.resultCode == .SQLITE_BUSY, "got \(error)")
             }
             #expect(!ranBody.value)
+        }
+    }
+
+    // MARK: Derivation outside the write (#69)
+
+    /// A suspension announced while `ingest` derives: no call is in progress then (the derivation
+    /// holds no database access, let alone a lock), so the announcement returns at once, and the
+    /// derivation stops at its next checkpoint without reaching the write. Fails if derivation is
+    /// moved back inside the write (the announcement would wait for it). The ingest is the blocking
+    /// form on a dispatch thread, so the hook that holds the derivation still blocks no Swift
+    /// concurrency thread; both forms run the same checkpoint.
+    @Test func aSuspensionDuringDerivationStopsItBeforeTheWrite() async throws {
+        try await withDatabaseURL { url in
+            let store = try await RingStore.open(at: url)
+            var history = try VariedHistory(store)
+            try history.addDays(0..<2)
+            let ringID = history.ringID
+            try await store.ingest(ringID: ringID, kind: .heartRate)
+            try history.addDays(2..<3)
+            let before = try TypedSnapshot(store, ringID: ringID)
+            let deriving = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
+            let paused = Flag(), reachedApply = Flag()
+            let hooks = RingStore.IngestionHooks(
+                checkpoint: { _ in
+                    guard !paused.value else { return }
+                    paused.set()
+                    deriving.signal()
+                    _ = proceed.wait(timeout: .now() + 10)
+                },
+                beforeApply: { _ in reachedApply.set() })
+            let outcome = OSAllocatedUnfairLock<Result<IngestionResult, any Error>?>(initialState: nil)
+            let finished = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                let result = Result { try blocking(store).ingest(ringID: ringID, kind: .heartRate, hooks: hooks) }
+                outcome.withLock { $0 = result }
+                finished.signal()
+            }
+            await wait(for: deriving)
+            defer { RingStore.appDidResume() }
+            #expect(SuspensionState.inFlightCount == 0)
+            let announcement = startAnnouncement()
+            #expect(await eventually { announcement.done.value }, "the announcement waited for the derivation")
+            proceed.signal()
+            await wait(for: finished)
+            switch outcome.withLock({ $0 }) {
+            case .failure(let error): #expect(error as? RingStoreError == .suspended, "got \(error)")
+            case .success: Issue.record("expected suspended, but the ingest succeeded")
+            case nil: Issue.record("the ingest did not finish")
+            }
+            #expect(!reachedApply.value)
+            RingStore.appDidResume()
+            #expect(try TypedSnapshot(store, ringID: ringID) == before)
+            // After the resume the same call goes through.
+            #expect(try await store.ingest(ringID: ringID, kind: .heartRate).inserted > 0)
         }
     }
 }
