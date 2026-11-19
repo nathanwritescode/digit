@@ -222,8 +222,10 @@ extension RingStore {
     /// - a read in progress completes normally.
     ///
     /// So the wait lasts as long as the slowest call in progress takes to reach its next statement
-    /// or finish: a long `ingest` delays it. **There is no timeout here**; the caller decides how
-    /// long it can wait, by cancelling the task that awaits it. **Cancelling it throws
+    /// or finish: the apply step of a long `ingest` delays it (its derivation does not: it runs
+    /// outside any database access, and stops at its next checkpoint once the announcement is
+    /// made). **There is no timeout here**; the caller decides how long it can wait, by
+    /// cancelling the task that awaits it. **Cancelling it throws
     /// `CancellationError`**, with the suspension still in force and a lock possibly still held; a
     /// normal return means the calls drained (no lock is held), or `appDidResume()` ended the wait
     /// (the store is no longer suspended). Calling it again while one is waiting is harmless (both

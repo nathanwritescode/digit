@@ -137,6 +137,8 @@ public enum StoreFailure: Sendable, Equatable, CustomStringConvertible {
     case suspended
     /// The database was written by a newer build.
     case schemaTooNew
+    /// Ingestion gave up because other writes kept changing the stored history under it.
+    case ingestionInputsKeptChanging
 
     init(_ error: RingStoreError) {
         switch error {
@@ -147,6 +149,7 @@ public enum StoreFailure: Sendable, Equatable, CustomStringConvertible {
         case .notIngestible(let kind): self = .notIngestible(kind)
         case .suspended: self = .suspended
         case .schemaTooNew: self = .schemaTooNew
+        case .ingestionInputsKeptChanging: self = .ingestionInputsKeptChanging
         }
     }
 
@@ -159,6 +162,7 @@ public enum StoreFailure: Sendable, Equatable, CustomStringConvertible {
         case .notIngestible(let kind): "\(kind.name) history cannot be ingested"
         case .suspended: "the store was suspended with the app"
         case .schemaTooNew: "the database was written by a newer version of the app"
+        case .ingestionInputsKeptChanging: "the stored history kept changing during ingestion"
         }
     }
 }
