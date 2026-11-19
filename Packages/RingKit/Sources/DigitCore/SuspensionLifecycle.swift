@@ -30,13 +30,19 @@ public struct BackgroundTaskToken: Hashable, Sendable {
 ///   about to expire (its expiration handler);
 /// - on the normal path a task is ended only after the announcement has returned (or straight
 ///   away when the app is in the foreground and nothing needs announcing);
-/// - an expiration handler starts the announcement and then ends its own task at once, because
-///   iOS kills an app that has not ended a task by the time it expires. Ending it before the
-///   store has drained is best effort: since #69 ingestion's write is a short apply step, so the
-///   drain is normally brief, but nothing guarantees it finishes before iOS suspends the app;
-/// - becoming active resumes the store, before any store call; an announcement that returns
-///   after a later activation resumes the store again, so a late announcement cannot leave it
-///   suspended while the app is active.
+/// - every announcement first tells the store synchronously (`announce`,
+///   `RingStore.announceSuspension()`: new calls are refused and GRDB interrupts its writers), then
+///   starts the drain (`suspend`, `RingStore.appWillSuspend()`, which announces again idempotently
+///   and waits for calls in progress);
+/// - an expiration handler announces synchronously, starts the drain and then ends its own task at
+///   once, because iOS kills an app that has not ended a task by the time it expires. The store
+///   has been told before the task ends, but a write between two statements may still hold its
+///   lock until its next statement, so ending the task before the drain finishes is best effort:
+///   since #69 ingestion's write is a short apply step, so the drain is normally brief;
+/// - becoming active resumes the store, before any store call. The drain's own announcement runs
+///   after a hop off the main actor, so it can land after a later activation; it then refuses
+///   foreground calls briefly until its continuation resumes the store again (unless a later
+///   background period has announced). Rare, and it recovers by itself.
 ///
 /// Every token is ended exactly once, whichever path gets there first. The announcement is never
 /// cancelled (`appWillSuspend()` throws only then). A sync still running at expiration is aborted
@@ -50,6 +56,7 @@ public struct BackgroundTaskToken: Hashable, Sendable {
 public final class SuspensionLifecycle: RingWorkLifecycle {
     private let isRingInUse: @MainActor () -> Bool
     private let tasks: any BackgroundTaskRunner
+    private let announceNow: @MainActor () -> Void
     private let suspend: @Sendable () async -> Void
     private let resume: @MainActor () -> Void
 
@@ -69,18 +76,21 @@ public final class SuspensionLifecycle: RingWorkLifecycle {
 
     /// - Parameters:
     ///   - isRingInUse: whether a sync, pairing or forgetting is in progress now.
-    ///   - suspend: announces the suspension and returns when the store is quiet
+    ///   - announce: tells the store synchronously (`RingStore.announceSuspension()` in the app).
+    ///   - suspend: the drain: announces (idempotently) and returns when the store is quiet
     ///     (`RingStore.appWillSuspend()` in the app; its `CancellationError` cannot happen, since
-    ///     the announcement is never cancelled).
+    ///     it is never cancelled).
     ///   - resume: `RingStore.appDidResume()` in the app. Safe to call more than once.
     public init(
         isRingInUse: @escaping @MainActor () -> Bool,
         backgroundTasks: any BackgroundTaskRunner,
+        announce: @escaping @MainActor () -> Void,
         suspend: @escaping @Sendable () async -> Void,
         resume: @escaping @MainActor () -> Void
     ) {
         self.isRingInUse = isRingInUse
         self.tasks = backgroundTasks
+        self.announceNow = announce
         self.suspend = suspend
         self.resume = resume
     }
@@ -136,7 +146,8 @@ public final class SuspensionLifecycle: RingWorkLifecycle {
 
     // MARK: Tasks
 
-    /// Begins a task whose expiration starts the announcement and ends the task at once.
+    /// Begins a task whose expiration announces synchronously, starts the drain and ends the task
+    /// at once.
     private func beginTask() -> Int? {
         lastTaskID += 1
         let id = lastTaskID
@@ -150,9 +161,10 @@ public final class SuspensionLifecycle: RingWorkLifecycle {
     private func taskWillExpire(_ id: Int) {
         guard liveTasks[id] != nil else { return }
         if workTask == id { workTask = nil }
-        // Aborts ring work still running; a sync then ends as "interrupted".
+        // Aborts ring work still running; a sync then ends as "interrupted". The store is told
+        // synchronously inside `announce` before this returns.
         if isInBackground, !hasAnnounced { announce(thenEnd: nil) }
-        // Synchronously, as iOS requires; the announcement may still be draining (best effort).
+        // Synchronously, as iOS requires; the drain may still be running (best effort).
         end(id)
     }
 
@@ -163,18 +175,19 @@ public final class SuspensionLifecycle: RingWorkLifecycle {
 
     // MARK: Announcing
 
-    /// Announces, and ends task `id` once the announcement has returned (unless its expiration
-    /// ended it first). A second announcement while one waits is harmless (both return when the
+    /// Tells the store now, then drains, and ends task `id` once the drain has returned (unless its
+    /// expiration ended it first). A second drain while one waits is harmless (both return when the
     /// calls drain), and a resume ends every wait.
     private func announce(thenEnd id: Int?) {
         hasAnnounced = true
+        announceNow()
         let suspend = self.suspend
         let activationAtStart = activation
         Task { [weak self] in
             await suspend()
             guard let self else { return }
-            // The announcement may have reached the store after a resume the app made in the
-            // meantime (it hops to another thread before announcing). Resume again unless a later
+            // The drain's own announcement may have reached the store after a resume the app made
+            // in the meantime (it hops to another thread first). Resume again unless a later
             // background period has announced on its own: the store must not stay suspended while
             // the app is active, or while ring work it never meant to abort runs in the background.
             let overtaken = self.activation != activationAtStart

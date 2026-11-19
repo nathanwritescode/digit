@@ -559,6 +559,59 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
         }
     }
 
+    /// `announceSuspension()` refuses new calls before it returns, without waiting for a write in
+    /// progress (#53: an expiration handler calls it, then ends its task); `appWillSuspend()`
+    /// afterwards announces nothing more and waits for that write as usual.
+    @Test func synchronousAnnouncementRefusesAtOnceAndTheDrainStillWaits() async throws {
+        try await withDatabaseURL { url in
+            let store = try await RingStore.open(at: url)
+            let started = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
+            let write = Task {
+                try await store.write { db in
+                    try insertRing(db, UUID())
+                    started.signal()
+                    _ = proceed.wait(timeout: .now() + 10)
+                    try insertRing(db, UUID())
+                }
+            }
+            await wait(for: started)
+            defer { proceed.signal() }
+            RingStore.announceSuspension()
+            defer { RingStore.appDidResume() }
+            // Synchronous: suspended on return, with the write still in progress.
+            #expect(SuspensionState.isSuspended)
+            #expect(SuspensionState.inFlightCount == 1)
+            await #expect(throws: RingStoreError.suspended) { try await store.rings() }
+
+            let drain = startAnnouncement()
+            #expect(await !eventually(within: stillWaitingWindow) { drain.done.value })
+            proceed.signal()
+            _ = await finished(drain.task)
+            await expectFailure(write, RingStoreError.suspended)
+            RingStore.appDidResume()
+            #expect(try await store.rings().isEmpty)
+        }
+    }
+
+    /// Announcing while already suspended posts nothing more to GRDB; a resume undoes it once.
+    @Test func announcingAgainWhileSuspendedDoesNothing() async throws {
+        try await withDatabaseURL { url in
+            let store = try await RingStore.open(at: url)
+            let posted = OSAllocatedUnfairLock(initialState: 0)
+            let observer = NotificationCenter.default.addObserver(
+                forName: Database.suspendNotification, object: nil, queue: nil
+            ) { _ in posted.withLock { $0 += 1 } }
+            defer { NotificationCenter.default.removeObserver(observer) }
+            RingStore.announceSuspension()
+            RingStore.announceSuspension()
+            try await RingStore.appWillSuspend()
+            #expect(posted.withLock { $0 } == 1)
+            await #expect(throws: RingStoreError.suspended) { try await store.rings() }
+            RingStore.appDidResume()
+            #expect(try await store.rings().isEmpty)
+        }
+    }
+
     // MARK: Two stores
 
     /// Two stores on one file: while one holds the write lock, the other's write waits (the busy

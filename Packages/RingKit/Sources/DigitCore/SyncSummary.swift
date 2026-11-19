@@ -123,7 +123,11 @@ public struct SyncSummary: Sendable, Equatable {
     /// Plain words for every monitoring-interval outcome, naming the interval that outcome carries.
     public static func text(for outcome: MonitoringIntervalOutcome) -> String {
         func describe(_ interval: MonitoringInterval) -> String {
-            interval.minutes.map { "every \($0) minutes" } ?? "off"
+            switch interval.minutes {
+            case nil: "off"
+            case 1: "every minute"
+            case let minutes?: "every \(minutes) minutes"
+            }
         }
         switch outcome {
         case .accepted(let interval):

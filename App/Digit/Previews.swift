@@ -33,7 +33,7 @@ private func previewModel(paired: Bool) async -> DigitModel {
     }
     let model = DigitModel(
         services: DigitServices(ringAccess: PreviewRingAccess(), store: store),
-        backgroundTasks: PreviewBackgroundTasks(), suspend: {}, resume: {})
+        backgroundTasks: PreviewBackgroundTasks(), announce: {}, suspend: {}, resume: {})
     await model.load()
     return model
 }

@@ -68,22 +68,26 @@ enum SuspensionState {
     /// which is not worth it for a rule that is easy to follow.
     private static let announcementLock = NSLock()
 
-    /// The synchronous half of `appWillSuspend()`: refuse new calls, end every sleep observation
-    /// and have GRDB interrupt and suspend its writers.
+    /// The synchronous half of `appWillSuspend()` (`RingStore.announceSuspension()`): refuse new
+    /// calls, end every sleep observation and have GRDB interrupt and suspend its writers.
+    /// Idempotent: while already suspended it does nothing (the flag, GRDB's state and the ended
+    /// observations are already as an announcement leaves them).
     static func announce() {
-        let enders = announcementLock.withLock {
+        let enders: [@Sendable () -> Void]? = announcementLock.withLock {
             // Flag first, so new calls are refused before GRDB interrupts the running one.
-            let enders = state.withLock { state in
+            let enders: [@Sendable () -> Void]? = state.withLock { state in
+                if state.suspended { return nil }
                 state.suspended = true
                 state.epoch &+= 1
                 let enders = Array(state.observationEnders.values)
                 state.observationEnders = [:]
                 return enders
             }
+            guard let enders else { return nil }
             NotificationCenter.default.post(name: Database.suspendNotification, object: nil)
             return enders
         }
-        for end in enders { end() }
+        for end in enders ?? [] { end() }
     }
 
     /// Waits until no guarded call is in progress, or until the app resumes. Throws
@@ -196,8 +200,26 @@ enum SuspensionState {
 extension RingStore {
     // MARK: App lifecycle
 
+    /// The synchronous half of `appWillSuspend()`, for a background task's expiration handler.
+    ///
+    /// iOS requires an expiration handler to end its task before it returns, so it cannot await
+    /// the drain. Calling this first means the store has been told before the task ends: from its
+    /// return every call (reads included) and every open throws `RingStoreError.suspended`, every
+    /// sleep observation ends with `suspended`, and GRDB has interrupted its writers, so a write in
+    /// progress is rolled back at its next statement. It does not wait for that: a write between
+    /// two statements can still hold its lock when this returns, so the app should still start
+    /// `appWillSuspend()` to drain, and ending the task straight after is best effort.
+    ///
+    /// Synchronous, nonisolated and safe from any thread. Idempotent: while already suspended it
+    /// does nothing. Process-wide, like `appWillSuspend()`; undone by `appDidResume()`. Never call it
+    /// from an observer of GRDB's suspend and resume notifications. Added for #53 (planner decision).
+    public static func announceSuspension() {
+        SuspensionState.announce()
+    }
+
     /// Call when the app is about to be suspended, and **await it before ending the background
-    /// task**: it returns only when no store in this process holds a database lock.
+    /// task**: it returns only when no store in this process holds a database lock. It announces
+    /// first, as `announceSuspension()` does (nothing more if that already ran), then drains.
     ///
     /// Suspension is process-wide, so announce at the end of the background task that was keeping
     /// the app alive, or in its expiration handler, and not merely when the scene moves to the

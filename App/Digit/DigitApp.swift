@@ -58,13 +58,15 @@ final class AppRoot {
         let model = DigitModel(
             services: DigitServices(ringAccess: BluetoothRingAccess(), store: store),
             backgroundTasks: backgroundTasks,
+            announce: { RingStore.announceSuspension() },
             // `appWillSuspend()` throws only if its task is cancelled, and this one never is.
             suspend: { try? await RingStore.appWillSuspend() },
             resume: { RingStore.appDidResume() })
         state = .ready(model)
-        // Catch up with the scene, which may have changed while the store was opening.
-        if let scenePhase { apply(scenePhase, to: model) }
+        // Read the paired ring before catching up with the scene: had the scene gone to the
+        // background meanwhile, applying that first would announce the suspension and refuse it.
         await model.load()
+        if let scenePhase { apply(scenePhase, to: model) }
     }
 
     func scenePhaseChanged(_ phase: ScenePhase) {
@@ -74,8 +76,9 @@ final class AppRoot {
 
     private func apply(_ phase: ScenePhase, to model: DigitModel) {
         switch phase {
-        case .active: model.lifecycle.sceneDidBecomeActive()
-        case .background: model.lifecycle.sceneDidEnterBackground()
+        // Resumes the store at once, then retries a failed load.
+        case .active: model.sceneDidBecomeActive()
+        case .background: model.sceneDidEnterBackground()
         case .inactive: break
         @unknown default: break
         }

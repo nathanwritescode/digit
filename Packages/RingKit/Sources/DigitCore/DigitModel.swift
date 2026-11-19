@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import RingStore
+import RingSync
 
 /// The app's root model: the paired ring, the pairing and sync models, and the store's
 /// suspension around background tasks, wired together.
@@ -23,6 +24,7 @@ public final class DigitModel {
     public init(
         services: DigitServices,
         backgroundTasks: any BackgroundTaskRunner,
+        announce: @escaping @MainActor () -> Void,
         suspend: @escaping @Sendable () async -> Void,
         resume: @escaping @MainActor () -> Void
     ) {
@@ -30,20 +32,40 @@ public final class DigitModel {
         let pairedRing = PairedRing()
         let lifecycle = SuspensionLifecycle(
             isRingInUse: { [weak pairedRing] in pairedRing?.activity != nil },
-            backgroundTasks: backgroundTasks, suspend: suspend, resume: resume)
+            backgroundTasks: backgroundTasks, announce: announce, suspend: suspend, resume: resume)
         self.pairedRing = pairedRing
         self.lifecycle = lifecycle
         self.pairing = PairingModel(pairedRing: pairedRing, services: services, lifecycle: lifecycle)
         self.sync = SyncModel(pairedRing: pairedRing, services: services, lifecycle: lifecycle)
     }
 
-    /// Reads the paired ring from the store. Call once the store is open, and again to retry.
+    /// Reads the paired ring from the store. Call once the store is open, before telling the
+    /// lifecycle the scene is in the background (an announcement would refuse it); a failed load
+    /// is retried when the scene becomes active.
     public func load() async {
         do {
             try await pairedRing.load(from: services.registry)
             loadFailure = nil
         } catch {
-            loadFailure = PairingFailure(storeError: error).message
+            loadFailure = Self.loadFailureMessage(error)
         }
+    }
+
+    /// The scene became active: resume the store at once, then retry a load that failed (in a task
+    /// of its own, so the resume is never delayed behind it).
+    public func sceneDidBecomeActive() {
+        lifecycle.sceneDidBecomeActive()
+        if loadFailure != nil { Task { await load() } }
+    }
+
+    public func sceneDidEnterBackground() {
+        lifecycle.sceneDidEnterBackground()
+    }
+
+    static func loadFailureMessage(_ error: any Error) -> String {
+        if (error as? RingStoreError) == .suspended {
+            return "Digit was interrupted while reading its data. It tries again when you return to the app."
+        }
+        return "Digit couldn't read its data on this iPhone (\(SyncError(error).description)). It tries again when you return to the app."
     }
 }

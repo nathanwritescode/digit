@@ -33,9 +33,9 @@ public final class PairingModel {
     @ObservationIgnored private let pairedRing: PairedRing
     @ObservationIgnored private let services: DigitServices
     /// Told when pairing or forgetting starts and ends, so they run inside a background task.
-    @ObservationIgnored private let lifecycle: (any RingWorkLifecycle)?
+    @ObservationIgnored private let lifecycle: any RingWorkLifecycle
 
-    public init(pairedRing: PairedRing, services: DigitServices, lifecycle: (any RingWorkLifecycle)? = nil) {
+    public init(pairedRing: PairedRing, services: DigitServices, lifecycle: any RingWorkLifecycle) {
         self.pairedRing = pairedRing
         self.services = services
         self.lifecycle = lifecycle

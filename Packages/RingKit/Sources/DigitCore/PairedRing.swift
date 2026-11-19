@@ -55,12 +55,12 @@ public final class PairedRing {
     /// Runs `body` with the ring claimed for `activity`, inside the lifecycle's background task.
     /// Does nothing if the claim is refused. The claim is released before the lifecycle hears the
     /// work ended, so the lifecycle sees no ring work running when it decides to announce.
-    func using(_ activity: Activity, lifecycle: (any RingWorkLifecycle)?, _ body: () async -> Void) async {
+    func using(_ activity: Activity, lifecycle: any RingWorkLifecycle, _ body: () async -> Void) async {
         guard claim(activity) else { return }
-        lifecycle?.ringWorkWillStart()
+        lifecycle.ringWorkWillStart()
         await body()
         release()
-        lifecycle?.ringWorkDidEnd()
+        lifecycle.ringWorkDidEnd()
     }
 
     /// Reads the paired ring from the store: the oldest ring, since v1 has one.

@@ -250,6 +250,7 @@ struct SyncModelTests {
     @Test func everyIntervalOutcomeHasItsOwnText() {
         let error = SyncError.ring(.timeout("synthetic"))
         #expect(SyncSummary.text(for: .accepted(.fiveMinutes)) == "The ring will take readings every 5 minutes.")
+        #expect(SyncSummary.text(for: .accepted(.oneMinute)) == "The ring will take readings every minute.")
         #expect(SyncSummary.text(for: .accepted(.off)) == "The ring's scheduled readings are off.")
         let refused = SyncSummary.text(for: .refused(.thirtyMinutes, .unsupported))
         #expect(refused.contains("rejected"))

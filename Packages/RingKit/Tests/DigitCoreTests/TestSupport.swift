@@ -220,6 +220,13 @@ struct LoggingPhases: SyncPhases {
 
 // MARK: Fixture
 
+/// A lifecycle that ignores ring work, for tests that are not about background tasks.
+@MainActor
+final class NoOpLifecycle: RingWorkLifecycle {
+    func ringWorkWillStart() {}
+    func ringWorkDidEnd() {}
+}
+
 /// Everything one test needs: an in-memory store, the fakes and the models.
 @MainActor
 final class Fixture {
@@ -251,8 +258,9 @@ final class Fixture {
             now: { t0.addingTimeInterval(120) })
         pairedRing = PairedRing()
         lifecycle = makeLifecycle?(pairedRing)
-        pairing = PairingModel(pairedRing: pairedRing, services: services, lifecycle: lifecycle)
-        sync = SyncModel(pairedRing: pairedRing, services: services, lifecycle: lifecycle)
+        let reported: any RingWorkLifecycle = lifecycle ?? NoOpLifecycle()
+        pairing = PairingModel(pairedRing: pairedRing, services: services, lifecycle: reported)
+        sync = SyncModel(pairedRing: pairedRing, services: services, lifecycle: reported)
     }
 
     func load() async throws {
