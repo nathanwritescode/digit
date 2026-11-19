@@ -90,8 +90,9 @@ public actor RingSession {
     // follow system changes; not verified on a device.
     private nonisolated let clock: @Sendable () -> Date
     private nonisolated let timeZone: @Sendable () -> TimeZone
-    // Monotonic, and injected so tests can move time without waiting.
-    private nonisolated let now: @Sendable () -> ContinuousClock.Instant
+    // Monotonic: the conversation deadline, every wait slice, the acknowledgement waits and the
+    // write backstop. Injected so tests can move time by hand instead of waiting for it.
+    private nonisolated let monotonicClock: SessionClock
     /// The longest single wait the reader makes. A conversation waits for the reader's current
     /// wait to end before it starts, so this bounds that delay; it is well inside `replyTimeout`
     /// so the drain fits in one reply slice.
@@ -169,15 +170,17 @@ public actor RingSession {
         timeZone: @escaping @Sendable () -> TimeZone = { TimeZone.autoupdatingCurrent }
     ) {
         self.init(link: link, replyTimeout: replyTimeout, conversationTimeout: conversationTimeout,
-                  monotonicNow: { ContinuousClock.now }, clock: clock, timeZone: timeZone)
+                  monotonicClock: .continuous, clock: clock, timeZone: timeZone)
     }
 
-    /// Test hook: also injects the monotonic clock that the conversation deadline is measured on.
+    /// Test hook: also injects the monotonic clock that every deadline and timer of the session
+    /// runs on. The link's own write deadline must run on the same clock, or the backstop (which
+    /// must fire after it) and the link's deadline are not ordered by the injected time.
     init(
         link: any RingLink,
         replyTimeout: TimeInterval,
         conversationTimeout: TimeInterval,
-        monotonicNow: @escaping @Sendable () -> ContinuousClock.Instant,
+        monotonicClock: SessionClock,
         clock: @escaping @Sendable () -> Date = { Date() },
         timeZone: @escaping @Sendable () -> TimeZone = { TimeZone.autoupdatingCurrent }
     ) {
@@ -185,10 +188,12 @@ public actor RingSession {
         self.replyTimeout = replyTimeout
         self.conversationTimeout = conversationTimeout
         self.pollInterval = min(replyTimeout / 4, 0.1)
-        self.now = monotonicNow
+        self.monotonicClock = monotonicClock
         self.clock = clock
         self.timeZone = timeZone
     }
+
+    private nonisolated func now() -> ContinuousClock.Instant { monotonicClock.now() }
 
     deinit {
         for subscriber in subscribers.values { subscriber.finish() }
@@ -362,11 +367,15 @@ public actor RingSession {
         guard readerState == .running else { throw RingError.stopped }
         lastWaiterID += 1
         let id = lastWaiterID
+        // Fixed here rather than when the timer task first runs, so a late-starting task cannot
+        // extend the wait.
+        let wakeAt = now() + .seconds(timeout)
+        let sleep = monotonicClock.sleep
         return try await withCheckedThrowingContinuation { continuation in
             // One conversation at a time, and it waits for one thing at a time.
             precondition(waiter == nil, "a conversation is already waiting")
             let timer = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(timeout))
+                try? await sleep(wakeAt)
                 guard !Task.isCancelled else { return }
                 await self?.timeOut(waiter: id)
             }
@@ -640,9 +649,11 @@ public actor RingSession {
         try await withWriteTurn {
             guard acknowledgement || readerState == .running else { throw RingError.stopped }
             // Backstop only, for a link that breaks the `RingLink.send` contract. A compliant link
-            // throws by `writeTimeout` and clears its own in-flight state first; this deadline is
-            // always `replyTimeout` later than that, so it fires first only if the link is
-            // non-compliant. It is derived from the link's bound so the two cannot drift apart.
+            // throws by `writeTimeout` and clears its own in-flight state first. This deadline is
+            // fixed here, before `link.send` starts the link's own timer, so its margin over that
+            // timer is `replyTimeout` minus the delay before `send` starts (and minus any lateness
+            // of the link's timer); with a short `replyTimeout` that margin can vanish (#39). It is
+            // derived from the link's bound so the two cannot drift apart.
             //
             // Overrun past the conversation deadline, with B this backstop: a command is never
             // written after the deadline (`converse`), and the wait above ends by it, but a write
@@ -652,7 +663,9 @@ public actor RingSession {
             // end up to 4B after the later of the deadline and the end of `persist` (one more B
             // waiting for acknowledgements when the deadline has passed).
             let link = self.link
-            try await withDeadline(writeBackstop, "write confirmation") { try await link.send(frame) }
+            try await withDeadline(writeBackstop, "write confirmation", clock: monotonicClock) {
+                try await link.send(frame)
+            }
         }
     }
 
@@ -702,9 +715,11 @@ public actor RingSession {
         guard acksFinished < target else { return true }
         lastFlushID += 1
         let id = lastFlushID
+        let wakeAt = now() + .seconds(limit)
+        let sleep = monotonicClock.sleep
         return await withCheckedContinuation { continuation in
             let timer = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(limit))
+                try? await sleep(wakeAt)
                 guard !Task.isCancelled else { return }
                 await self?.expireFlush(id)
             }

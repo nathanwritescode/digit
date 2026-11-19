@@ -13,8 +13,9 @@
 # LIBDISPATCH_COOPERATIVE_POOL_STRICT) pass through to the test processes. Every target is run
 # even after one fails, and the script fails if any target failed or ran no tests.
 #
-# Keep this script even once CI's toolchain separates targets by default: it states the isolation
-# the transport tests' 50 ms reply timeout depends on, rather than relying on a toolchain default.
+# Keep this script even once CI's toolchain separates targets by default: every toolchain then
+# behaves the same. The transport tests no longer depend on it (#75: they run on a test clock),
+# but the sync tests still time conversations on real time.
 # Needs `jq` (in /usr/bin from macOS 15).
 set -uo pipefail
 
