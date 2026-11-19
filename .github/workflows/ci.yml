@@ -37,8 +37,9 @@ jobs:
           xcodebuild -version
           swift --version
 
-      # --only-use-versions-from-resolved-file makes a missing Package.resolved or a missing pin
-      # fail the build instead of being resolved silently; it does not check that the revision matches the app's (see the app job).
+      # --only-use-versions-from-resolved-file makes a stale Package.resolved (missing, lacking a
+      # pin, or out of date against Package.swift) fail the build instead of being resolved
+      # silently. It does not check that the revisions match the app's (see the app job).
       - name: Build
         run: swift build --only-use-versions-from-resolved-file
 
