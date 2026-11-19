@@ -126,11 +126,32 @@ private func holdsRawBytes(_ value: Any) -> Bool {
         monitoringInterval: .tenMinutes, budget: .seconds(60), clock: { t0 }, timeZone: { london }
     ).run()
 
-    guard case .skipped(.clockSetNotLogged(.database)) = result.clockSet else {
+    guard case .notLogged(.database) = result.clockSet else {
         Issue.record("clock-set not reported as not logged")
         return
     }
     let text = dumped(result, without: id)
     for marker in rawErrorMarkers { #expect(!text.contains(marker), "dump contains \(marker)") }
     #expect(!holdsRawBytes(result), "the result holds a byte buffer")
+}
+
+/// A clock-set the ring rejected is reported with the sanitised error: the rejecting frame's
+/// payload (recognisable here) must not be reachable from the result.
+@Test(.timeLimit(.minutes(1))) func resultOfARejectedClockSetHoldsNoFrame() async throws {
+    let (store, id) = try await makeStore()
+    let frame = Frame(group: 0x01, key: 0x00, payload: [0xE7, 0x9B, 0x51])
+    let result = await RingSyncer(
+        ring: FakeRing(store: store, ringID: id, clock: .fail(RingError.rejected(frame))), store: store, ringID: id,
+        monitoringInterval: .tenMinutes, budget: .seconds(60), clock: { t0 }, timeZone: { london }
+    ).run()
+
+    guard case .notAppliedButLogged(_, .ring(.rejected)) = result.clockSet else {
+        Issue.record("clock-set not reported as not applied but logged")
+        return
+    }
+    let text = dumped(result, without: id)
+    for marker in rawErrorMarkers + ["E79B51", "e79b51", "231", "155"] {
+        #expect(!text.contains(marker), "dump contains \(marker)")
+    }
+    #expect(!holdsRawBytes(result), "the result holds a frame or byte buffer")
 }

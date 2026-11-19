@@ -240,6 +240,7 @@ final class SuspendingStore: SyncStore, @unchecked Sendable {
     private let insertFails: Set<HistoryKind>
     private let clockSetFails: Bool
     private let ingestFails: Set<HistoryKind>
+    private let onClockSet: @Sendable () -> Void
     private let lock = NSLock()
     private var calls: [String] = []
 
@@ -249,8 +250,9 @@ final class SuspendingStore: SyncStore, @unchecked Sendable {
 
     init(
         _ base: RingStore, insertFails: Set<HistoryKind> = [], clockSetFails: Bool = false,
-        ingestFails: Set<HistoryKind> = []
+        ingestFails: Set<HistoryKind> = [], onClockSet: @escaping @Sendable () -> Void = {}
     ) {
+        self.onClockSet = onClockSet
         self.base = base
         self.insertFails = insertFails
         self.clockSetFails = clockSetFails
@@ -267,6 +269,7 @@ final class SuspendingStore: SyncStore, @unchecked Sendable {
 
     func recordClockSet(_ event: ClockSetEvent) async throws {
         note("clockSet")
+        onClockSet()
         if clockSetFails { throw RingStoreError.suspended }
         try await base.recordClockSet(event)
     }

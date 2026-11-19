@@ -27,8 +27,8 @@ import RingTransport
 /// any store step of the ring phase ends it: the failing kind is `failed`, the remaining kinds are
 /// `notAttempted(.storeSuspended)`, and the clock-set and the interval are skipped with
 /// `.storeSuspended`. `run()` then does not start the derive phase, and its kinds are
-/// `notAttempted(.storeSuspended)` too. In `ingestAll()` the first suspension makes every remaining
-/// kind `notAttempted(.storeSuspended)`. It is detected on the raw error where it is caught, not on
+/// `IngestionOutcome.storeSuspended` too. In `ingestAll()` the first suspension makes every remaining
+/// kind `IngestionOutcome.storeSuspended`. It is detected on the raw error where it is caught, not on
 /// the sanitised `SyncError`. Nothing is retried after the app resumes: that is the caller's
 /// scheduling.
 ///
@@ -47,12 +47,20 @@ import RingTransport
 ///
 /// **Phantom clock-sets.** The clock-set is logged before it is sent, because a clock-set that was
 /// applied but is missing from the log can make time resolution call later records `resolved`
-/// under the wrong offset (silent wrong data), while a logged clock-set that never happened is the
-/// safer error. There is no way to delete a log entry (an append-only log the resolver trusts), so
-/// an entry for a clock-set the ring did not apply stays: after an error reply or a refusal before
-/// writing (`ClockSetOutcome.notAppliedButLogged`, `rejected`, `refusedDestructive`,
-/// `refusedUploadGroup`, `busy`) and after any error that leaves the outcome unknown. Time
-/// resolution may therefore see a phantom clock-set; that is the accepted error.
+/// under the wrong offset (silent wrong data). A logged clock-set that never happened is the safer
+/// error only while its offset equals the ring's real one; a phantom with a different offset
+/// misleads the resolver just as a missing entry does. There is no way to delete a log entry (an
+/// append-only log the resolver trusts), so an entry for a clock-set the ring did not apply stays:
+/// after an error reply or a refusal before writing (`ClockSetOutcome.notAppliedButLogged`:
+/// `RingError.rejected`, `refusedDestructive`, `refusedUploadGroup`, `busy`), after any error that
+/// leaves the outcome unknown, and when logging was too slow to send safely
+/// (`ClockSetOutcome.notSentLogTooSlow`). Time resolution may therefore see a phantom clock-set;
+/// that is the accepted error for now. Recording outcomes so the resolver can ignore unapplied
+/// entries is #72.
+///
+/// **Stale time.** The time sent is read before the log write, and the entry must stay the event
+/// sent, so it is not re-read. If the log write took longer than `maximumClockLogDelay` (a write
+/// queued behind a long ingest, a busy timeout), the time is stale and the command is not sent.
 ///
 /// **Unknown clock-set outcomes.** Every `RingError` except an error reply and the refusals made
 /// before writing is taken to mean the command may have reached the ring. Some of those errors
@@ -94,6 +102,12 @@ public struct RingSyncer: Sendable {
     private let clock: @Sendable () -> Date
     private let timeZone: @Sendable () -> TimeZone
     private let monotonicNow: @Sendable () -> ContinuousClock.Instant
+    private let maximumLogDelay: Duration
+
+    /// The longest the clock-set's log write may take before the command is not sent: the time to
+    /// send was read before the write, so it must not be old. A second or two of error in a ring
+    /// whose records are minutes apart is tolerable; more is not.
+    public static let maximumClockLogDelay: Duration = .seconds(2)
 
     /// - Parameters:
     ///   - ring: the connected ring, normally a started `RingSession`.
@@ -130,8 +144,10 @@ public struct RingSyncer: Sendable {
         budget: Duration,
         clock: @escaping @Sendable () -> Date,
         timeZone: @escaping @Sendable () -> TimeZone,
-        monotonicNow: @escaping @Sendable () -> ContinuousClock.Instant
+        monotonicNow: @escaping @Sendable () -> ContinuousClock.Instant,
+        maximumLogDelay: Duration = RingSyncer.maximumClockLogDelay
     ) {
+        self.maximumLogDelay = maximumLogDelay
         self.ring = ring
         self.store = store
         self.ringID = ringID
@@ -148,7 +164,7 @@ public struct RingSyncer: Sendable {
         let ringPhase = await syncRing()
         // A suspended store would refuse every ingestion at once; do not start.
         if ringPhase.endedBecauseStoreSuspended {
-            return SyncResult(ringPhase: ringPhase, ingestions: await PerKind { _ in .notAttempted(.storeSuspended) })
+            return SyncResult(ringPhase: ringPhase, ingestions: await PerKind { _ in .storeSuspended })
         }
         return SyncResult(ringPhase: ringPhase, ingestions: await ingestAll())
     }
@@ -163,10 +179,14 @@ public struct RingSyncer: Sendable {
     public func syncRing() async -> RingPhaseResult {
         let deadline = monotonicNow() + budget
         let budgetLeft = { monotonicNow() < deadline }
-        let (fetches, suspended) = await fetchAll(budgetLeft: budgetLeft)
-        let clockSet = await setClock(after: fetches, storeSuspended: suspended, budgetLeft: budgetLeft)
+        let fetched = await fetchAll(budgetLeft: budgetLeft)
+        let clockSet = await setClock(after: fetched.outcomes, storeSuspended: fetched.storeSuspended, budgetLeft: budgetLeft)
         let interval = await sendInterval(after: clockSet, budgetLeft: budgetLeft)
-        return RingPhaseResult(fetches: fetches, clockSet: clockSet, monitoringInterval: interval)
+        // A suspension while logging the clock-set ends the phase too.
+        let suspended = fetched.storeSuspended || clockSet == .skipped(.storeSuspended)
+        return RingPhaseResult(
+            fetches: fetched.outcomes, clockSet: clockSet, monitoringInterval: interval,
+            endedBecauseStoreSuspended: suspended)
     }
 
     /// The derive phase: ingest every kind, each on its own, so one failure does not stop the
@@ -174,14 +194,15 @@ public struct RingSyncer: Sendable {
     public func ingestAll() async -> PerKind<IngestionOutcome> {
         let store = self.store
         let ringID = self.ringID
-        // `PerKind` builds its values in order, so the flag below is set before later kinds run.
-        let suspended = SuspensionFlag()
+        // `PerKind` builds its values one after another, in order, so the flag is set before the
+        // next kind runs.
+        var suspended = false
         return await PerKind { kind in
-            if await suspended.isSet { return .notAttempted(.storeSuspended) }
+            if suspended { return .storeSuspended }
             do {
                 return .ingested(try await store.ingest(ringID: ringID, kind: kind))
             } catch {
-                if Self.isSuspension(error) { await suspended.set() }
+                if Self.isSuspension(error) { suspended = true }
                 return .failed(SyncError(error))
             }
         }
@@ -190,7 +211,7 @@ public struct RingSyncer: Sendable {
     // MARK: Steps
 
     /// The outcomes, and whether the store was suspended (which ends the fetching).
-    private func fetchAll(budgetLeft: () -> Bool) async -> (PerKind<FetchOutcome>, storeSuspended: Bool) {
+    private func fetchAll(budgetLeft: () -> Bool) async -> (outcomes: PerKind<FetchOutcome>, storeSuspended: Bool) {
         var stopReason: SyncSkipReason?
         var outcomes: [HistoryKind: FetchOutcome] = [:]
         for kind in Self.fetchOrder {
@@ -208,7 +229,7 @@ public struct RingSyncer: Sendable {
             }
         }
         let suspended = stopReason == .storeSuspended
-        return (await PerKind { outcomes[$0]! }, suspended)
+        return (outcomes: await PerKind { outcomes[$0]! }, storeSuspended: suspended)
     }
 
     private struct FetchStep {
@@ -229,7 +250,7 @@ public struct RingSyncer: Sendable {
                 do {
                     await persisted.succeeded(try await store.insert(transfer, ringID: ringID))
                 } catch {
-                    await persisted.failed(suspended: Self.isSuspension(error))
+                    await persisted.failed()
                     throw error
                 }
             }
@@ -239,10 +260,10 @@ public struct RingSyncer: Sendable {
             case .failed: .store
             case .stored: .acknowledgement
             }
-            // Either the raw error or the record `persist` kept (in case a ring wraps the error).
-            let sawSuspension = await persisted.sawSuspension
-            let suspended = Self.isSuspension(error) || sawSuspension
-            return FetchStep(outcome: .failed(stage: stage, error: SyncError(error)), raw: error, storeSuspended: suspended)
+            // `SyncableRing` requires `fetchHistory` to rethrow `persist`'s error unchanged.
+            return FetchStep(
+                outcome: .failed(stage: stage, error: SyncError(error)), raw: error,
+                storeSuspended: Self.isSuspension(error))
         }
         if case .stored(let outcome) = await persisted.state {
             return FetchStep(outcome: transfer.data.isEmpty ? .empty : .stored(outcome, byteCount: transfer.data.count))
@@ -271,6 +292,7 @@ public struct RingSyncer: Sendable {
         // zone changing in between, could log a different offset from the one sent at a
         // daylight-saving boundary.
         let date = clock()
+        let readAt = monotonicNow()
         let given = timeZone()
         let zone = TimeZone(identifier: given.identifier) ?? given
         let event = ClockSetEvent(
@@ -285,8 +307,12 @@ public struct RingSyncer: Sendable {
             try await store.recordClockSet(event)
         } catch {
             if Self.isSuspension(error) { return .skipped(.storeSuspended) }
-            return .skipped(.clockSetNotLogged(SyncError(error)))
+            return .notLogged(SyncError(error))
         }
+        // The time was read before the write; the entry must stay the event sent, so it is not
+        // re-read. If the write was slow the time is stale: leave the entry as a phantom.
+        let elapsed = monotonicNow() - readAt
+        if elapsed > maximumLogDelay { return .notSentLogTooSlow(event, elapsed: elapsed) }
         do {
             try await ring.setTime(date, timeZone: zone)
         } catch {
@@ -300,6 +326,10 @@ public struct RingSyncer: Sendable {
         guard let interval = monitoringInterval else { return .notRequested }
         if case .skipped(let reason) = clockSet, reason == .budgetExhausted || reason == .storeSuspended {
             return .skipped(interval, reason)
+        }
+        switch clockSet {
+        case .notLogged, .notSentLogTooSlow: return .skipped(interval, .clockNotSent)
+        case .acknowledgedAndLogged, .unknownAndLogged, .notAppliedButLogged, .skipped: break
         }
         guard clockSet.wasAcknowledged else { return .skipped(interval, .clockNotAcknowledged) }
         guard budgetLeft() else { return .skipped(interval, .budgetExhausted) }
@@ -356,15 +386,6 @@ public struct RingSyncer: Sendable {
 private actor PersistRecord {
     enum State { case notCalled, stored(InsertOutcome), failed }
     private(set) var state = State.notCalled
-    private(set) var sawSuspension = false
     func succeeded(_ outcome: InsertOutcome) { state = .stored(outcome) }
-    func failed(suspended: Bool) {
-        state = .failed
-        sawSuspension = suspended
-    }
-}
-
-private actor SuspensionFlag {
-    private(set) var isSet = false
-    func set() { isSet = true }
+    func failed() { state = .failed }
 }

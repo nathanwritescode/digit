@@ -35,9 +35,9 @@ public enum SyncSkipReason: Sendable, Equatable {
     /// The store refused with `RingStoreError.suspended` (the app is suspending), so the sync
     /// stopped: the step was not run. Retrying after resume is the caller's business.
     case storeSuspended
-    /// Clock only: the clock-set could not be logged, so it was not sent (it is logged before it is
-    /// sent). Carries the store's sanitised error.
-    case clockSetNotLogged(SyncError)
+    /// Monitoring interval only: the clock-set was not sent (it could not be logged, or logging
+    /// took too long), so there is no acknowledged clock to follow.
+    case clockNotSent
 }
 
 /// Where a history fetch failed.
@@ -82,7 +82,10 @@ public enum FetchOutcome: Sendable, Equatable {
 ///
 /// The clock-set is logged before it is sent, and time resolution treats every logged clock-set as
 /// one that happened. A logged clock-set the ring did not apply therefore stays in the log, by
-/// design: a phantom entry is the safer error than a missing one.
+/// design (there is no delete). That is the safer error than a missing entry only while the
+/// phantom's offset equals the ring's real one: a phantom with a different offset makes later
+/// records resolve wrongly, just as a missing entry does. Recording outcomes so the resolver can
+/// ignore unapplied entries is #72.
 public enum ClockSetOutcome: Sendable, Equatable {
     /// Logged, sent, and the ring acknowledged it.
     case acknowledgedAndLogged(ClockSetEvent)
@@ -94,8 +97,15 @@ public enum ClockSetOutcome: Sendable, Equatable {
     /// session or the link refused the command before writing it (`RingError.refusedDestructive`,
     /// `refusedUploadGroup`, `busy`). The entry stays in the log (a phantom clock-set).
     case notAppliedButLogged(ClockSetEvent, error: SyncError)
-    /// Not sent. See `SyncSkipReason`, including `clockSetNotLogged` (logging failed, so nothing
-    /// was sent) and `storeSuspended`.
+    /// Logging failed, so nothing was sent (a store suspension is `skipped(.storeSuspended)`
+    /// instead). Nothing was logged or sent.
+    case notLogged(SyncError)
+    /// Logged, but not sent: writing the entry took longer than `RingSyncer.maximumClockLogDelay`,
+    /// so the time read before logging (the one in the entry) was stale and sending it would have
+    /// set the ring's clock wrong. The entry stays in the log (a phantom clock-set). `elapsed` is
+    /// how long logging took.
+    case notSentLogTooSlow(ClockSetEvent, elapsed: Duration)
+    /// Not sent, and not logged. See `SyncSkipReason`.
     case skipped(SyncSkipReason)
 
     /// Whether the ring acknowledged the clock-set.
@@ -120,8 +130,8 @@ public enum MonitoringIntervalOutcome: Sendable, Equatable {
 public enum IngestionOutcome: Sendable, Equatable {
     case ingested(IngestionResult)
     case failed(SyncError)
-    /// Not started: the store was suspended (`SyncSkipReason.storeSuspended`).
-    case notAttempted(SyncSkipReason)
+    /// Not started: the store was suspended by an earlier step.
+    case storeSuspended
 
     public var succeeded: Bool {
         if case .ingested = self { true } else { false }
@@ -160,8 +170,9 @@ public struct RingPhaseResult: Sendable, Equatable {
     public let clockSet: ClockSetOutcome
     public let monitoringInterval: MonitoringIntervalOutcome
 
-    /// Whether the phase ended because the store was suspended, so the derive phase should not run.
-    public var endedBecauseStoreSuspended: Bool { clockSet == .skipped(.storeSuspended) }
+    /// Whether the phase ended because the store was suspended (set by `syncRing()`), so the derive
+    /// phase should not run.
+    public let endedBecauseStoreSuspended: Bool
 }
 
 /// The result of one sync: the ring phase and the ingestion phase together.
