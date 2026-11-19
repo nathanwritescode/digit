@@ -334,7 +334,7 @@ struct VitalsIngestionTests {
                 #expect(tables.isEmpty)
             }
         }
-        let store = try RingStore(url: url)
+        let store = try RingStore(url: url, observesSuspension: false)
         // Data written at v3 survives the migration.
         #expect(try store.ring(id: ringID) != nil)
         #expect(try store.transfers(ringID: ringID).transfers.map(\.transfer.data) == [data])

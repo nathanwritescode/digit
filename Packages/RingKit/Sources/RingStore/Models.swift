@@ -129,4 +129,14 @@ public enum RingStoreError: Error, Equatable, Sendable {
     /// `ingest` does not handle this kind. Reserved for a future kind that has no typed table yet;
     /// every kind is ingestible today, so it cannot be thrown now.
     case notIngestible(HistoryKind)
+    /// The app announced it is about to be suspended (`RingStore.appWillSuspend()`). The call was
+    /// refused before touching the database; or a write in progress was rolled back as a whole at
+    /// its next statement, or as soon as it got the lock (nothing it did is kept); or a sleep
+    /// observation was ended. This keeps the app from holding a lock on the shared file while
+    /// suspended (`0xdead10cc`). Retry after `RingStore.appDidResume()`. Also thrown when opening a
+    /// store while suspended.
+    case suspended
+    /// The database was written by a newer build of the app: it has migrations this build does
+    /// not know. Opening refuses it so an older build never writes into a newer schema.
+    case schemaTooNew
 }

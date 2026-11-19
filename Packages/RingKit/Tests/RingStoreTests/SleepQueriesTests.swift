@@ -81,7 +81,7 @@ private func allNights(_ f: Fixture) async throws -> [SleepNightSummary] {
     try await f.store.sleepNights(ringID: f.ring.id, from: SleepDay(year: 2000, month: 1, day: 1), through: SleepDay(year: 2100, month: 1, day: 1))
 }
 
-struct SleepQueriesTests {
+@Suite(.timeLimit(.minutes(1))) struct SleepQueriesTests {
     @Test func nightCrossingMidnightBelongsToTheDayItEnds() async throws {
         let f = try fixture(RingStore())
         try ingest(f, [Session(22 * hour, 30 * hour)])  // 22:00 day 0 to 06:00 day 1

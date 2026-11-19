@@ -7,7 +7,7 @@ import RingProtocol
 // Pruning of superseded transfers. All data is synthetic. Helpers (`transfer`, `t0`,
 // `onEachStore`) live in RingStoreTests.swift.
 
-struct PruningTests {
+@Suite(.timeLimit(.minutes(1))) struct PruningTests {
     private func rows(_ store: RingStore, _ ring: UUID, _ kind: HistoryKind = .heartRate) throws -> [[UInt8]] {
         try store.transfers(ringID: ring, kind: kind).transfers.map(\.transfer.data)
     }
@@ -258,7 +258,7 @@ struct PruningTests {
                 }
             }
         }
-        let store = try RingStore(url: url)
+        let store = try RingStore(url: url, observesSuspension: false)
         let backfilled = try store.observations(ringID: ringID).observations
         #expect(backfilled.map(\.dataLength) == [1, 2, 3])
         #expect(backfilled.map(\.fetchedAt) == [1, 2, 3].map { Date(timeIntervalSince1970: Double($0)) })
@@ -276,7 +276,7 @@ struct PruningTests {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = try RingStore(url: dir.appendingPathComponent("ring.sqlite"))
+        let store = try RingStore(url: dir.appendingPathComponent("ring.sqlite"), observesSuspension: false)
         let ringID = try blocking(store).registerRing(protocolFamily: "ycbt").id
         try await withThrowingTaskGroup(of: Void.self) { group in
             for n in 1...40 {

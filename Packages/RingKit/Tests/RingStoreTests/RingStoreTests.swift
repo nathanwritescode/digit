@@ -17,15 +17,19 @@ func transfer(
 
 /// Runs `body` against an in-memory database and against a `DatabasePool` on a temporary file in
 /// its own directory (what production uses).
+///
+/// File-backed stores in tests are opened with `observesSuspension: false`, the one difference from
+/// production: suspension is process-wide, so only `SuspensionTests` (a serialised suite) opens
+/// stores that observe it, and a suspension there cannot fail a test running in parallel.
 func onEachStore(_ body: (RingStore) throws -> Void) throws {
     try body(RingStore())
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: dir) }
-    try body(RingStore(url: dir.appendingPathComponent("ring.sqlite")))
+    try body(RingStore(url: dir.appendingPathComponent("ring.sqlite"), observesSuspension: false))
 }
 
-struct RingStoreTests {
+@Suite(.timeLimit(.minutes(1))) struct RingStoreTests {
     @Test func migratesFromEmptyAndStartsEmpty() throws {
         try onEachStore { store in
             let rings = try store.rings()
@@ -259,7 +263,7 @@ struct RingStoreTests {
         let ringID: UUID
         let firstID: Int64
         do {
-            let store = try RingStore(url: url)
+            let store = try RingStore(url: url, observesSuspension: false)
             ringID = try store.registerRing(protocolFamily: "ycbt").id
             guard case .inserted(let id, _) = try store.insert(transfer(), ringID: ringID) else {
                 Issue.record("expected insert"); return
@@ -267,7 +271,7 @@ struct RingStoreTests {
             firstID = id
             try store.recordClockSet(ClockSetEvent(ringID: ringID, instant: t0, timeZoneIdentifier: "UTC", utcOffsetSeconds: 0))
         }
-        let reopened = try RingStore(url: url)
+        let reopened = try RingStore(url: url, observesSuspension: false)
         #expect(try reopened.transfers(ringID: ringID).transfers.count == 1)
         #expect(try reopened.clockSets(ringID: ringID).count == 1)
         #expect(try reopened.insert(transfer(), ringID: ringID) == .duplicate(existingID: firstID))
@@ -279,7 +283,7 @@ struct RingStoreTests {
         defer { try? FileManager.default.removeItem(at: dir) }
         let url = dir.appendingPathComponent("ring.sqlite")
         #expect(FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o644]))
-        _ = try RingStore(url: url)
+        _ = try RingStore(url: url, observesSuspension: false)
         func mode(_ path: String) throws -> Int? { try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? Int }
         #expect(try mode(url.path) == 0o600)
     }
@@ -287,7 +291,7 @@ struct RingStoreTests {
     @Test func failureToOpenReportsPathAndErrno() throws {
         let url = URL(fileURLWithPath: "/nonexistent-directory-for-test/ring.sqlite")
         do {
-            _ = try RingStore(url: url)
+            _ = try RingStore(url: url, observesSuspension: false)
             Issue.record("expected failure")
         } catch let RingStoreError.fileAccess(path, code) {
             #expect(path == url.path)
@@ -299,7 +303,7 @@ struct RingStoreTests {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = try RingStore(url: dir.appendingPathComponent("ring.sqlite"))
+        let store = try RingStore(url: dir.appendingPathComponent("ring.sqlite"), observesSuspension: false)
         let ring = try blocking(store).registerRing(protocolFamily: "ycbt")
         let ringID = ring.id
         let outcomes = try await withThrowingTaskGroup(of: InsertOutcome.self) { group in

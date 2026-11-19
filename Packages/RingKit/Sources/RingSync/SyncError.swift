@@ -133,6 +133,10 @@ public enum StoreFailure: Sendable, Equatable, CustomStringConvertible {
     /// The store names what could not be read with a constant (a column or a field), never a value.
     case corruptRow(String)
     case notIngestible(HistoryKind)
+    /// The app announced a suspension; the call was refused or rolled back as a whole.
+    case suspended
+    /// The database was written by a newer build.
+    case schemaTooNew
 
     init(_ error: RingStoreError) {
         switch error {
@@ -141,6 +145,8 @@ public enum StoreFailure: Sendable, Equatable, CustomStringConvertible {
         case .fileAccess(_, let code): self = .fileAccess(errno: code)
         case .corruptRow(let what): self = .corruptRow(what)
         case .notIngestible(let kind): self = .notIngestible(kind)
+        case .suspended: self = .suspended
+        case .schemaTooNew: self = .schemaTooNew
         }
     }
 
@@ -151,6 +157,8 @@ public enum StoreFailure: Sendable, Equatable, CustomStringConvertible {
         case .fileAccess(let code): "the database file could not be accessed (errno \(code))"
         case .corruptRow(let what): "a stored value could not be read (\(what))"
         case .notIngestible(let kind): "\(kind.name) history cannot be ingested"
+        case .suspended: "the store was suspended with the app"
+        case .schemaTooNew: "the database was written by a newer version of the app"
         }
     }
 }

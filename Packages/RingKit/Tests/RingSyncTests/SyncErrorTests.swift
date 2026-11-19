@@ -91,7 +91,8 @@ private func holdsRawBytes(_ value: Any) -> Bool {
 
 @Test func noSyncErrorHoldsAFrameOrPayload() {
     let errors: [SyncError] = everyRingError.map(SyncError.init)
-        + [SyncError(RingStoreError.fileAccess(path: "/synthetic/path", errno: 13)), SyncError(MonitoringSettingError.rejected(0xFD))]
+        + [SyncError(RingStoreError.fileAccess(path: "/synthetic/path", errno: 13)),
+           SyncError(RingStoreError.suspended), SyncError(RingStoreError.schemaTooNew), SyncError(MonitoringSettingError.rejected(0xFD))]
     for error in errors {
         #expect(!holdsRawBytes(error), "\(error)")
         let text = dumped(error) + error.description
