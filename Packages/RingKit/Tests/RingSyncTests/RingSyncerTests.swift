@@ -1,8 +1,8 @@
 import Foundation
 import Testing
 import RingProtocol
-import RingStore
-import RingSync
+@testable import RingStore
+@testable import RingSync
 import RingTransport
 
 // The sync against a scripted ring (`FakeRing`) and an in-memory store. All ring data is synthetic.
@@ -65,7 +65,6 @@ private let syntheticTimeout = RingError.timeout("synthetic")
     #expect(result.monitoringInterval == .accepted(.tenMinutes))
     #expect(try await store.clockSets(ringID: id).count == 2)
     #expect(result.isComplete)
-    #expect(!result.clockSetLogIncomplete)
 }
 
 @Test(.timeLimit(.minutes(1))) func fetchOrderCoversEveryKindOnce() {
@@ -295,52 +294,213 @@ func clockWithUnknownOutcomeIsLoggedAndSkipsTheInterval(_ error: RingError) asyn
     #expect(!result.isComplete)
 }
 
-/// Only an error reply and refusals made before anything is written count as "not applied".
+/// Only an error reply and refusals made before anything is written count as "not applied". The
+/// entry was logged before the command was sent, and it stays.
 @Test(.timeLimit(.minutes(1)), arguments: [
     RingError.rejected(Frame(group: 0x01, key: 0x00, payload: [0xFC])),
     RingError.refusedDestructive(Frame(group: 0x05, key: 0x40)),
     RingError.refusedUploadGroup(Frame(group: 0x04, key: 0x00)),
     RingError.busy("synthetic"),
 ])
-func clockDefinitelyNotAppliedIsNotLoggedAndSkipsTheInterval(_ error: RingError) async throws {
+func clockDefinitelyNotAppliedStaysLoggedAndSkipsTheInterval(_ error: RingError) async throws {
     let (store, id) = try await makeStore()
     let ring = FakeRing(store: store, ringID: id, clock: .fail(error))
     let result = await syncer(ring, store, id).run()
 
-    #expect(result.clockSet == .notApplied(error: SyncError(error)))
-    #expect(try await store.clockSets(ringID: id).count == 1)
+    guard case .notAppliedButLogged(let event, let reported) = result.clockSet else {
+        Issue.record("clock-set not reported as not applied but logged")
+        return
+    }
+    #expect(reported == SyncError(error))
+    #expect(try await store.clockSets(ringID: id).last == event)
+    #expect(try await store.clockSets(ringID: id).count == 2)
     #expect(result.monitoringInterval == .skipped(.tenMinutes, .clockNotAcknowledged))
     #expect(!(await ring.log).contains { $0.hasPrefix("interval") })
     #expect(!result.isComplete)
 }
 
-@Test(.timeLimit(.minutes(1))) func acknowledgedClockThatCannotBeLoggedIsReportedAndNotRetried() async throws {
+/// The entry is in the log at the moment the command is sent, and is the event that was sent.
+@Test(.timeLimit(.minutes(1))) func clockSetIsLoggedBeforeItIsSent() async throws {
+    let (store, id) = try await makeStore()
+    let ring = FakeRing(store: store, ringID: id)
+    let result = await syncer(ring, store, id).run()
+    guard case .acknowledgedAndLogged(let event) = result.clockSet else {
+        Issue.record("clock-set not acknowledged and logged")
+        return
+    }
+    let seen = await ring.clockSetsWhenSent
+    #expect(seen.count == 2)
+    #expect(seen.last == event)
+}
+
+/// If the entry cannot be written, nothing is sent: not the clock, and not the interval.
+@Test(.timeLimit(.minutes(1))) func clockSetThatCannotBeLoggedIsNotSent() async throws {
     let (store, id) = try await makeStore()
     try failInserts(into: "clock_set", store)
     let ring = FakeRing(store: store, ringID: id)
     let result = await syncer(ring, store, id).run()
 
-    guard case .acknowledgedButNotLogged = result.clockSet else {
-        Issue.record("clock-set not reported as acknowledged but not logged")
+    guard case .notLogged(.database) = result.clockSet else {
+        Issue.record("clock-set not reported as skipped because it could not be logged")
         return
     }
-    #expect(result.clockSetLogIncomplete)
+    #expect(await ring.log == completeLog.filter { $0 != "setTime" && $0 != "interval 10" })
+    #expect(try await store.clockSets(ringID: id).count == 1)
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .clockNotSent))
+    #expect(allIngested(result))
     #expect(!result.isComplete)
-    // Sent once, and the interval still follows an acknowledged clock-set.
-    #expect(await ring.log.filter { $0 == "setTime" }.count == 1)
-    #expect(result.monitoringInterval == .accepted(.tenMinutes))
 }
 
-@Test(.timeLimit(.minutes(1))) func unknownClockThatCannotBeLoggedIsReported() async throws {
-    let (store, id) = try await makeStore()
-    try failInserts(into: "clock_set", store)
-    let ring = FakeRing(store: store, ringID: id, clock: .fail(syntheticTimeout))
-    let result = await syncer(ring, store, id).run()
-    guard case .unknownAndNotLogged = result.clockSet else {
-        Issue.record("clock-set not reported as unknown and not logged")
+// MARK: Slow log write
+
+/// The time was read before the log write, so a slow write makes it stale: the command is not
+/// sent, the entry stays, and the interval is skipped.
+@Test(.timeLimit(.minutes(1))) func clockSetWhoseLogWriteWasTooSlowIsNotSent() async throws {
+    let (base, id) = try await makeStore()
+    let monotonic = FakeMonotonic()
+    let store = SuspendingStore(base, onClockSet: { monotonic.advance(by: .milliseconds(300)) })
+    let ring = FakeRing(store: base, ringID: id)
+    let result = await suspendingSyncer(ring, store, id, monotonic: monotonic, maximumLogDelay: .milliseconds(200)).run()
+
+    guard case .notSentLogTooSlow(let event, let elapsed) = result.clockSet else {
+        Issue.record("clock-set not reported as too slow to send")
         return
     }
-    #expect(result.clockSetLogIncomplete)
+    #expect(elapsed == .milliseconds(300))
+    #expect(try await base.clockSets(ringID: id).last == event)
+    #expect(!(await ring.log).contains("setTime"))
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .clockNotSent))
+    #expect(allIngested(result))
+    #expect(!result.isComplete)
+}
+
+/// A log write within the bound is sent, with the time that was logged.
+@Test(.timeLimit(.minutes(1))) func clockSetWhoseLogWriteWasWithinTheBoundIsSent() async throws {
+    let (base, id) = try await makeStore()
+    let monotonic = FakeMonotonic()
+    let store = SuspendingStore(base, onClockSet: { monotonic.advance(by: .milliseconds(100)) })
+    let ring = FakeRing(store: base, ringID: id)
+    let result = await suspendingSyncer(ring, store, id, monotonic: monotonic, maximumLogDelay: .milliseconds(200)).run()
+    guard case .acknowledgedAndLogged(let event) = result.clockSet else {
+        Issue.record("clock-set not acknowledged and logged")
+        return
+    }
+    #expect(try await ring.clockSent?.date == t0.addingTimeInterval(60))
+    #expect(event.instant == t0.addingTimeInterval(60))
+}
+
+// MARK: Store suspension
+
+/// The empty-transfer path inserts outside `persist`; a suspension there ends the sync too.
+@Test(.timeLimit(.minutes(1))) func suspensionLoggingAnEmptyTransferStopsTheSync() async throws {
+    let (base, id) = try await makeStore()
+    var fetches = syntheticHistory.mapValues { FakeRing.Fetch.data($0) }
+    fetches[.activity] = .empty
+    let store = SuspendingStore(base, insertFails: [.activity])
+    let ring = FakeRing(store: base, ringID: id, fetches: fetches)
+    let result = await suspendingSyncer(ring, store, id).run()
+
+    #expect(await ring.log == ["fetch activity"])
+    #expect(result.fetches[.activity] == .failed(stage: .store, error: .store(.suspended)))
+    for kind in [HistoryKind.sleep, .heartRate, .combined] {
+        #expect(result.fetches[kind] == .notAttempted(.storeSuspended), "\(kind.name)")
+    }
+    #expect(result.clockSet == .skipped(.storeSuspended))
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .storeSuspended))
+    for kind in HistoryKind.allCases { #expect(result.ingestions[kind] == .storeSuspended) }
+}
+
+private func suspendingSyncer(
+    _ ring: FakeRing, _ store: SuspendingStore, _ ringID: UUID,
+    monotonic: FakeMonotonic = FakeMonotonic(), maximumLogDelay: Duration = RingSyncer.maximumClockLogDelay
+) -> RingSyncer {
+    RingSyncer(
+        ring: ring, syncStore: store, ringID: ringID, monitoringInterval: .tenMinutes, budget: .seconds(60),
+        clock: { t0.addingTimeInterval(60) }, timeZone: { london }, monotonicNow: { monotonic.now() },
+        maximumLogDelay: maximumLogDelay)
+}
+
+@Test(.timeLimit(.minutes(1))) func suspensionInPersistOfTheFirstKindStopsTheSync() async throws {
+    let (base, id) = try await makeStore()
+    let store = SuspendingStore(base, insertFails: [.activity])
+    let ring = FakeRing(store: base, ringID: id)
+    let result = await suspendingSyncer(ring, store, id).run()
+
+    // Only the first kind was fetched; it was never acknowledged.
+    #expect(await ring.log == ["fetch activity", "not acknowledged activity"])
+    #expect(result.fetches[.activity] == .failed(stage: .store, error: .store(.suspended)))
+    for kind in [HistoryKind.sleep, .heartRate, .combined] {
+        #expect(result.fetches[kind] == .notAttempted(.storeSuspended), "\(kind.name)")
+    }
+    #expect(result.clockSet == .skipped(.storeSuspended))
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .storeSuspended))
+    // No ingestion was started, and the store saw nothing after the refused insert.
+    for kind in HistoryKind.allCases { #expect(result.ingestions[kind] == .storeSuspended) }
+    #expect(store.log == ["insert activity"])
+    #expect(!result.isComplete)
+}
+
+/// Suspension in the last kind: nothing is left to mark not attempted, but the clock-set must still
+/// be skipped with the reason, and no clock-set entry is written.
+@Test(.timeLimit(.minutes(1))) func suspensionInPersistOfTheLastKindSkipsTheClockSet() async throws {
+    let (base, id) = try await makeStore()
+    let store = SuspendingStore(base, insertFails: [.combined])
+    let ring = FakeRing(store: base, ringID: id)
+    let result = await suspendingSyncer(ring, store, id).run()
+
+    #expect(result.fetches[.combined] == .failed(stage: .store, error: .store(.suspended)))
+    #expect(result.clockSet == .skipped(.storeSuspended))
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .storeSuspended))
+    #expect(!(await ring.log).contains("setTime"))
+    #expect(!store.log.contains("clockSet") && !store.log.contains { $0.hasPrefix("ingest") })
+    for kind in HistoryKind.allCases { #expect(result.ingestions[kind] == .storeSuspended) }
+}
+
+/// The raw error is recognised even when it comes out of the ring's own fetch, without `persist`
+/// having run.
+@Test(.timeLimit(.minutes(1))) func suspensionThrownByTheFetchEndsTheSync() async throws {
+    let (base, id) = try await makeStore()
+    var fetches = syntheticHistory.mapValues { FakeRing.Fetch.data($0) }
+    fetches[.activity] = .fail(RingStoreError.suspended)
+    let ring = FakeRing(store: base, ringID: id, fetches: fetches)
+    let result = await suspendingSyncer(ring, SuspendingStore(base), id).run()
+
+    #expect(await ring.log == ["fetch activity"])
+    #expect(result.fetches[.activity] == .failed(stage: .transfer, error: .store(.suspended)))
+    #expect(result.fetches[.sleep] == .notAttempted(.storeSuspended))
+    #expect(result.clockSet == .skipped(.storeSuspended))
+}
+
+/// A suspension while logging the clock-set: nothing is sent, and it is the suspension that is
+/// reported, not a generic logging failure.
+@Test(.timeLimit(.minutes(1))) func suspensionWhileLoggingTheClockSetSendsNothing() async throws {
+    let (base, id) = try await makeStore()
+    let store = SuspendingStore(base, clockSetFails: true)
+    let ring = FakeRing(store: base, ringID: id)
+    let result = await suspendingSyncer(ring, store, id).run()
+
+    #expect(await ring.log == completeLog.filter { $0 != "setTime" && $0 != "interval 10" })
+    #expect(result.clockSet == .skipped(.storeSuspended))
+    #expect(result.monitoringInterval == .skipped(.tenMinutes, .storeSuspended))
+    #expect(!store.log.contains { $0.hasPrefix("ingest") })
+    for kind in HistoryKind.allCases { #expect(result.ingestions[kind] == .storeSuspended) }
+}
+
+@Test(.timeLimit(.minutes(1))) func suspensionDuringIngestionLeavesTheRestNotAttempted() async throws {
+    let (base, id) = try await makeStore()
+    let store = SuspendingStore(base, ingestFails: [.sleep])
+    let ring = FakeRing(store: base, ringID: id)
+    let result = await suspendingSyncer(ring, store, id).run()
+
+    // The ring phase completed.
+    #expect(await ring.log == completeLog)
+    #expect(result.clockSet.wasAcknowledged)
+    #expect(result.ingestions[.activity].succeeded)
+    #expect(result.ingestions[.sleep] == .failed(.store(.suspended)))
+    #expect(result.ingestions[.heartRate] == .storeSuspended)
+    #expect(result.ingestions[.combined] == .storeSuspended)
+    #expect(store.log.filter { $0.hasPrefix("ingest") } == ["ingest activity", "ingest sleep"])
+    #expect(!result.isComplete)
 }
 
 /// Dates finer than a millisecond, in zones with non-zero offsets, inside and outside daylight saving.
