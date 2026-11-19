@@ -217,6 +217,18 @@ extension RingStore {
         SuspensionState.announce()
     }
 
+    /// The waiting half of `appWillSuspend()`, without announcing: returns once no guarded call is
+    /// in progress, or at once when the store is not suspended (nothing announced, or
+    /// `appDidResume()` already called), or when `appDidResume()` ends the wait. Throws
+    /// `CancellationError` if its task is cancelled first, with the suspension still in force.
+    ///
+    /// For an app that announces with `announceSuspension()` and drains separately: because this
+    /// never announces, a drain that runs late (after the app has resumed) cannot suspend the store
+    /// again. Process-wide. Added for #53 (planner decision).
+    public static func drainSuspension() async throws {
+        try await SuspensionState.drain()
+    }
+
     /// Call when the app is about to be suspended, and **await it before ending the background
     /// task**: it returns only when no store in this process holds a database lock. It announces
     /// first, as `announceSuspension()` does (nothing more if that already ran), then drains.

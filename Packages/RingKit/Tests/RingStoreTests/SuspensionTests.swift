@@ -10,7 +10,8 @@ import RingProtocol
 //
 // Suspension is process-wide (GRDB's notifications are, and `swift test` runs every target in one
 // process), so every test that suspends, or opens a store that observes suspension, lives in this
-// one serialised suite, and no test anywhere else may call `appWillSuspend()` or `appDidResume()`.
+// one serialised suite, and no test anywhere else may call `appWillSuspend()`, `announceSuspension()`,
+// `drainSuspension()` or `appDidResume()`.
 // Every other file-backed test opens its store with `observesSuspension: false`. Each test that
 // suspends resumes in a `defer`, so a failure cannot leave the process suspended.
 //
@@ -608,6 +609,25 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
             #expect(posted.withLock { $0 } == 1)
             await #expect(throws: RingStoreError.suspended) { try await store.rings() }
             RingStore.appDidResume()
+            #expect(try await store.rings().isEmpty)
+        }
+    }
+
+    /// A drain after a resume finds nothing to wait for and does not suspend again (#53: the app's
+    /// drain can run after it has resumed).
+    @Test func drainAfterResumeReturnsAtOnceAndLeavesTheStoreResumed() async throws {
+        try await withDatabaseURL { url in
+            let store = try await RingStore.open(at: url)
+            RingStore.announceSuspension()
+            RingStore.appDidResume()
+            let drained = Flag()
+            let drain = Task {
+                try await RingStore.drainSuspension()
+                drained.set()
+            }
+            #expect(await eventually(within: 5) { drained.value })
+            _ = await finished(drain)
+            #expect(!SuspensionState.isSuspended)
             #expect(try await store.rings().isEmpty)
         }
     }

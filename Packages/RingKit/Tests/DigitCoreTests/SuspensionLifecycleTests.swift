@@ -206,16 +206,20 @@ struct SuspensionLifecycleTests {
         #expect(h.suspension.count("announce") == 0)
     }
 
-    /// The drain (which announces again, idempotently) hops off the main actor first, so it can
-    /// land after a resume; the lifecycle resumes again once it returns.
-    @Test func aDrainOvertakenByAResumeResumesAgain() async {
+    /// The drain hops off the main actor first, so it can run after a resume. It only waits, so
+    /// the announcement (made on the main actor) always precedes the resume, and nothing after the
+    /// resume suspends again or needs a second resume.
+    @Test func aDrainAfterAResumeChangesNothing() async {
         let h = Harness()
         h.suspension.gate.open()
         h.lifecycle.sceneDidEnterBackground()
         // Back before the drain has started.
         h.lifecycle.sceneDidBecomeActive()
-        #expect(await eventually { h.suspension.events == ["announce", "resume", "drain", "drained", "resume"] })
+        #expect(await eventually { h.suspension.events == ["announce", "resume", "drain", "drained"] })
         #expect(await eventually { h.tasks.events == ["begin 1", "end 1"] })
+        await h.settle()
+        #expect(h.suspension.count("resume") == 1)
+        #expect(h.suspension.count("announce") == 1)
     }
 
     @Test func aLateDrainDoesNotResumeOverALaterAnnouncement() async {
