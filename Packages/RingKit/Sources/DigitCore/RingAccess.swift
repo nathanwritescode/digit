@@ -128,7 +128,7 @@ public enum RingAccessProblem: Error, Sendable, Equatable {
         case .bluetoothOff:
             "Bluetooth is off. Turn it on in Control Center or Settings, then try again."
         case .bluetoothNotPermitted:
-            "Digit isn't allowed to use Bluetooth. Allow it in Settings, under Privacy & Security, Bluetooth, then try again."
+            "Digit isn't allowed to use Bluetooth. Allow Bluetooth for Digit in Settings, then try again."
         case .bluetoothUnsupported:
             "Bluetooth isn't available on this device."
         case .bluetoothNotReady:

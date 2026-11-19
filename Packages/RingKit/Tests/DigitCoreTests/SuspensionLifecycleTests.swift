@@ -9,29 +9,30 @@ import Testing
 @MainActor
 final class FakeBackgroundTasks: BackgroundTaskRunner {
     private(set) var events: [String] = []
-    private(set) var handlers: [BackgroundTaskToken: @MainActor () -> Void] = [:]
+    private var handlers: [Int: @MainActor () -> Void] = [:]
     private var next = 0
 
     func begin(expirationHandler: @escaping @MainActor () -> Void) -> BackgroundTaskToken? {
         next += 1
-        let token = BackgroundTaskToken(rawValue: next)
-        handlers[token] = expirationHandler
+        handlers[next] = expirationHandler
         events.append("begin \(next)")
-        return token
+        return BackgroundTaskToken(rawValue: next)
     }
 
     func end(_ token: BackgroundTaskToken) {
         events.append("end \(token.rawValue)")
     }
 
+    /// Runs task `rawValue`'s expiration handler, as iOS does shortly before its time runs out.
     func expire(_ rawValue: Int) {
-        handlers[BackgroundTaskToken(rawValue: rawValue)]?()
+        handlers[rawValue]?()
     }
 }
 
-/// The announcement and the resume, recorded; the announcement returns only once released, as
-/// `appWillSuspend()` returns only when the store's calls have drained.
-/// `@unchecked Sendable`: guarded by `lock`.
+/// The announcement and the resume, recorded in one sequence. The announcement first gives up its
+/// thread (as the real one hops off the main actor before announcing), then records `announce`,
+/// and returns (`announced`) only once released, as `appWillSuspend()` returns only when the
+/// store's calls have drained. `@unchecked Sendable`: guarded by `lock`.
 final class FakeSuspension: @unchecked Sendable {
     private let lock = NSLock()
     private var log: [String] = []
@@ -39,8 +40,10 @@ final class FakeSuspension: @unchecked Sendable {
 
     var events: [String] { lock.withLock { log } }
     func record(_ event: String) { lock.withLock { log.append(event) } }
+    func count(_ event: String) -> Int { events.filter { $0 == event }.count }
 
     func suspend() async {
+        await Task.yield()
         record("announce")
         await gate.wait()
         record("announced")
@@ -51,29 +54,33 @@ final class FakeSuspension: @unchecked Sendable {
 private final class Harness {
     let tasks = FakeBackgroundTasks()
     let suspension = FakeSuspension()
-    var syncRunning = false
-    var resumes = 0
+    var ringInUse = false
     lazy var lifecycle = SuspensionLifecycle(
-        isSyncRunning: { [unowned self] in self.syncRunning },
+        isRingInUse: { [unowned self] in self.ringInUse },
         backgroundTasks: tasks,
         suspend: { [suspension] in await suspension.suspend() },
-        resume: { [unowned self] in self.resumes += 1 })
+        resume: { [suspension] in suspension.record("resume") })
 
-    func startSync() {
-        syncRunning = true
-        lifecycle.syncWillStart()
+    func startWork() {
+        ringInUse = true
+        lifecycle.ringWorkWillStart()
     }
 
-    func endSync() {
-        syncRunning = false
-        lifecycle.syncDidEnd()
+    func endWork() {
+        ringInUse = false
+        lifecycle.ringWorkDidEnd()
+    }
+
+    /// Gives queued work a chance to run, for checks that something did not happen.
+    func settle() async {
+        try? await Task.sleep(for: .milliseconds(20))
     }
 }
 
 @MainActor
 @Suite(.timeLimit(.minutes(1)))
 struct SuspensionLifecycleTests {
-    @Test func backgroundWithNoSyncAnnouncesAtOnceAndEndsTheTaskAfterwards() async {
+    @Test func backgroundWithNoWorkAnnouncesAtOnceAndEndsTheTaskAfterwards() async {
         let h = Harness()
         h.lifecycle.sceneDidEnterBackground()
         #expect(await eventually { h.suspension.events == ["announce"] })
@@ -84,68 +91,128 @@ struct SuspensionLifecycleTests {
         #expect(h.suspension.events == ["announce", "announced"])
     }
 
-    @Test func backgroundDuringASyncWaitsForTheSyncToEnd() async {
+    @Test func backgroundDuringWorkWaitsForTheWorkToEnd() async {
         let h = Harness()
-        h.startSync()
+        h.startWork()
         h.lifecycle.sceneDidEnterBackground()
-        try? await Task.sleep(for: .milliseconds(20))
+        await h.settle()
         #expect(h.suspension.events.isEmpty)
         #expect(h.tasks.events == ["begin 1"])
 
-        h.endSync()
+        h.endWork()
         #expect(await eventually { h.suspension.events == ["announce"] })
         #expect(h.tasks.events == ["begin 1"])
         h.suspension.gate.open()
         #expect(await eventually { h.tasks.events == ["begin 1", "end 1"] })
     }
 
-    @Test func expirationDuringASyncAnnouncesFirst() async {
+    @Test func expiryStartsTheAnnouncementAndEndsItsTaskAtOnce() async {
         let h = Harness()
-        h.startSync()
+        h.startWork()
         h.lifecycle.sceneDidEnterBackground()
         h.tasks.expire(1)
+        // Ended synchronously in the handler, before the announcement has even started.
+        #expect(h.tasks.events == ["begin 1", "end 1"])
         #expect(await eventually { h.suspension.events == ["announce"] })
-        #expect(h.tasks.events == ["begin 1"])
         h.suspension.gate.open()
-        #expect(await eventually { h.tasks.events == ["begin 1", "end 1"] })
+        #expect(await eventually { h.suspension.events == ["announce", "announced"] })
+        await h.settle()
 
-        // The aborted sync ends later: no second announcement, and the task is not ended again.
-        h.endSync()
-        try? await Task.sleep(for: .milliseconds(20))
-        #expect(h.suspension.events == ["announce", "announced"])
+        // The aborted work ends later: no second announcement, and the task is not ended again.
+        h.endWork()
+        await h.settle()
+        #expect(h.suspension.count("announce") == 1)
         #expect(h.tasks.events == ["begin 1", "end 1"])
     }
 
-    @Test func aSyncEndingInTheForegroundEndsItsTaskWithoutAnnouncing() async {
+    @Test func expiryOfTheAnnouncementsOwnTaskEndsItOnce() async {
+        let h = Harness()
+        h.lifecycle.sceneDidEnterBackground()
+        #expect(await eventually { h.suspension.events == ["announce"] })
+        h.tasks.expire(1)
+        #expect(h.tasks.events == ["begin 1", "end 1"])
+        h.suspension.gate.open()
+        #expect(await eventually { h.suspension.events == ["announce", "announced"] })
+        await h.settle()
+        #expect(h.tasks.events == ["begin 1", "end 1"])
+        #expect(h.suspension.count("announce") == 1)
+    }
+
+    /// The sequence from review: the first task expires mid-sync, the owner returns while the sync
+    /// carries on, then leaves again. The sync must hold a new task, and its end must announce
+    /// under it.
+    @Test func workStillRunningAfterAnExpiryGetsANewTask() async {
+        let h = Harness()
+        h.suspension.gate.open()
+        h.startWork()
+        h.lifecycle.sceneDidEnterBackground()
+        h.tasks.expire(1)
+        #expect(await eventually { h.suspension.events == ["announce", "announced"] })
+
+        h.lifecycle.sceneDidBecomeActive()
+        #expect(h.tasks.events == ["begin 1", "end 1", "begin 2"])
+        h.lifecycle.sceneDidEnterBackground()
+        await h.settle()
+        // Still running: no announcement, and task 2 is held.
+        #expect(h.suspension.count("announce") == 1)
+        #expect(h.tasks.events == ["begin 1", "end 1", "begin 2"])
+
+        h.endWork()
+        #expect(await eventually { h.tasks.events == ["begin 1", "end 1", "begin 2", "end 2"] })
+        #expect(h.suspension.events.suffix(2) == ["announce", "announced"])
+        #expect(h.suspension.count("announce") == 2)
+    }
+
+    @Test func workEndingInTheForegroundEndsItsTaskWithoutAnnouncing() async {
         let h = Harness()
         h.lifecycle.sceneDidBecomeActive()
-        h.startSync()
-        h.endSync()
+        h.startWork()
+        h.endWork()
         #expect(h.tasks.events == ["begin 1", "end 1"])
-        try? await Task.sleep(for: .milliseconds(20))
-        #expect(h.suspension.events.isEmpty)
+        await h.settle()
+        #expect(h.suspension.count("announce") == 0)
     }
 
     @Test func becomingActiveResumes() {
         let h = Harness()
         h.lifecycle.sceneDidBecomeActive()
-        #expect(h.resumes == 1)
-        h.lifecycle.sceneDidEnterBackground()
-        h.suspension.gate.open()
-        h.lifecycle.sceneDidBecomeActive()
-        #expect(h.resumes == 2)
+        #expect(h.suspension.events == ["resume"])
         #expect(!h.lifecycle.isInBackground)
     }
 
-    @Test func returningBeforeTheSyncEndsDoesNotAnnounce() async {
+    @Test func returningBeforeTheWorkEndsDoesNotAnnounce() async {
         let h = Harness()
-        h.startSync()
+        h.startWork()
         h.lifecycle.sceneDidEnterBackground()
         h.lifecycle.sceneDidBecomeActive()
-        h.endSync()
+        h.endWork()
         #expect(h.tasks.events == ["begin 1", "end 1"])
-        try? await Task.sleep(for: .milliseconds(20))
-        #expect(h.suspension.events.isEmpty)
+        await h.settle()
+        #expect(h.suspension.count("announce") == 0)
+    }
+
+    @Test func anAnnouncementOvertakenByAResumeResumesAgain() async {
+        let h = Harness()
+        h.suspension.gate.open()
+        h.lifecycle.sceneDidEnterBackground()
+        // Back before the announcement has reached the store.
+        h.lifecycle.sceneDidBecomeActive()
+        #expect(await eventually { h.suspension.events == ["resume", "announce", "announced", "resume"] })
+        #expect(await eventually { h.tasks.events == ["begin 1", "end 1"] })
+    }
+
+    @Test func aLateAnnouncementDoesNotResumeOverALaterOne() async {
+        let h = Harness()
+        h.lifecycle.sceneDidEnterBackground()
+        h.lifecycle.sceneDidBecomeActive()
+        h.lifecycle.sceneDidEnterBackground()
+        #expect(await eventually { h.suspension.count("announce") == 2 })
+        h.suspension.gate.open()
+        #expect(await eventually { h.suspension.count("announced") == 2 })
+        await h.settle()
+        // The only resume is the activation's: the store stays suspended in the background.
+        #expect(h.suspension.count("resume") == 1)
+        #expect(h.suspension.events.last == "announced")
     }
 }
 
@@ -153,28 +220,69 @@ struct SuspensionLifecycleTests {
 
 @MainActor
 @Suite(.timeLimit(.minutes(1)))
-struct SyncInsideABackgroundTaskTests {
+struct RingWorkInsideABackgroundTaskTests {
+    private func fixture(_ tasks: FakeBackgroundTasks, _ suspension: FakeSuspension) throws -> Fixture {
+        try Fixture { pairedRing in
+            SuspensionLifecycle(
+                isRingInUse: { pairedRing.activity != nil }, backgroundTasks: tasks,
+                suspend: { await suspension.suspend() }, resume: {})
+        }
+    }
+
     @Test func aSyncRunsInsideABackgroundTaskAndAnnouncesWhenItEndsInTheBackground() async throws {
-        let f = try Fixture()
-        try await f.storePairedRing()
         let tasks = FakeBackgroundTasks()
         let suspension = FakeSuspension()
         suspension.gate.open()
-        let sync = f.sync
-        let lifecycle = SuspensionLifecycle(
-            isSyncRunning: { sync.isRunning }, backgroundTasks: tasks,
-            suspend: { await suspension.suspend() }, resume: {})
-        f.sync.lifecycle = lifecycle
+        let f = try fixture(tasks, suspension)
+        try await f.storePairedRing()
         let gate = Gate()
         f.access.connectGate = gate
 
         let done = Flag()
+        let sync = f.sync
         Task { await sync.sync(); done.value = true }
         #expect(await eventually { f.log.count("connect") == 1 })
         #expect(tasks.events == ["begin 1"])
-        lifecycle.sceneDidEnterBackground()
+        f.lifecycle?.sceneDidEnterBackground()
         #expect(suspension.events.isEmpty)
 
+        gate.open()
+        #expect(await eventually { done.value })
+        #expect(await eventually { tasks.events == ["begin 1", "end 1"] })
+        #expect(suspension.events == ["announce", "announced"])
+    }
+
+    @Test func pairingAndForgettingRunInsideABackgroundTask() async throws {
+        let tasks = FakeBackgroundTasks()
+        let suspension = FakeSuspension()
+        let f = try fixture(tasks, suspension)
+        try await f.load()
+        f.lifecycle?.sceneDidBecomeActive()
+        await f.pairing.findRings()
+        #expect(tasks.events == ["begin 1", "end 1"])
+        await f.pairing.pair(RingCandidate(identifier: syntheticIdentifier, name: syntheticName, signal: .strong))
+        #expect(tasks.events == ["begin 1", "end 1", "begin 2", "end 2"])
+        await f.pairing.forget()
+        #expect(tasks.events == ["begin 1", "end 1", "begin 2", "end 2", "begin 3", "end 3"])
+        #expect(suspension.events.isEmpty)
+    }
+
+    @Test func pairingInTheBackgroundDefersTheAnnouncement() async throws {
+        let tasks = FakeBackgroundTasks()
+        let suspension = FakeSuspension()
+        suspension.gate.open()
+        let f = try fixture(tasks, suspension)
+        try await f.load()
+        let gate = Gate()
+        f.access.connectGate = gate
+        let done = Flag()
+        let pairing = f.pairing
+        let pick = RingCandidate(identifier: syntheticIdentifier, name: syntheticName, signal: .strong)
+        Task { await pairing.pair(pick); done.value = true }
+        #expect(await eventually { f.log.count("connect") == 1 })
+        f.lifecycle?.sceneDidEnterBackground()
+        try? await Task.sleep(for: .milliseconds(20))
+        #expect(suspension.events.isEmpty)
         gate.open()
         #expect(await eventually { done.value })
         #expect(await eventually { tasks.events == ["begin 1", "end 1"] })

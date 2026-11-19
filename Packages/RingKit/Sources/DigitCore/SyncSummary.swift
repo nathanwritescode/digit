@@ -68,12 +68,7 @@ public struct SyncSummary: Sendable, Equatable {
         if case .accepted = interval { true } else { false }
     }
 
-    public var intervalText: String {
-        let minutes = SyncSettings.monitoringInterval.minutes.map { "\($0) minutes" } ?? "off"
-        return intervalSent
-            ? "Measurement interval sent to the ring (\(minutes))."
-            : "Measurement interval not sent; the next sync sends it."
-    }
+    public var intervalText: String { Self.text(for: interval) }
 
     init(result: SyncResult, finishedAt: Date, firmwareNotSaved: Bool) {
         kinds = result.fetches.entries.map { entry in
@@ -122,6 +117,27 @@ public struct SyncSummary: Sendable, Equatable {
             .counts(inserted: result.inserted, updated: result.updated, rejected: result.rejectedImplausible + result.rejectedFuture)
         case .failed(let error): .failed(error.description)
         case .storeSuspended: .notRun
+        }
+    }
+
+    /// Plain words for every monitoring-interval outcome, naming the interval that outcome carries.
+    public static func text(for outcome: MonitoringIntervalOutcome) -> String {
+        func describe(_ interval: MonitoringInterval) -> String {
+            interval.minutes.map { "every \($0) minutes" } ?? "off"
+        }
+        switch outcome {
+        case .accepted(let interval):
+            return interval == .off
+                ? "The ring's scheduled readings are off."
+                : "The ring will take readings \(describe(interval))."
+        case .refused(let interval, _):
+            return "The ring rejected the reading interval (\(describe(interval))). The next sync sends it again."
+        case .unknown(let interval, _):
+            return "Digit couldn't confirm the reading interval (\(describe(interval))); the ring may have applied it. The next sync sends it again."
+        case .skipped(let interval, _):
+            return "The reading interval (\(describe(interval))) wasn't sent. The next sync sends it."
+        case .notRequested:
+            return "No reading interval was sent."
         }
     }
 

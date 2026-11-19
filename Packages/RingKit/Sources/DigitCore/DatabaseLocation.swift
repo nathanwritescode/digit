@@ -26,7 +26,9 @@ public enum DatabaseLocation {
         return try await RingStore.open(at: url)
     }
 
-    // Nonisolated and async, so it runs on the global executor, not the caller's actor.
+    // Nonisolated and async, so it runs on the global executor, not the caller's actor. That holds
+    // only while the package does not enable NonisolatedNonsendingByDefault (under which it would
+    // run on the caller's actor); mark it `@concurrent` once the package's tools version is 6.2.
     private static func createDirectory(_ directory: URL) async throws {
         try FileManager.default.createDirectory(
             at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])

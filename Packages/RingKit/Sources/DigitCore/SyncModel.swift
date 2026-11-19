@@ -3,14 +3,6 @@ import Observation
 import RingStore
 import RingSync
 
-/// What the sync model tells the app's lifecycle, so a sync runs inside a background task and the
-/// store's suspension is announced only once it has ended (`SuspensionLifecycle`).
-@MainActor
-public protocol SyncLifecycle: AnyObject {
-    func syncWillStart()
-    func syncDidEnd()
-}
-
 /// "Sync now": connect to the paired ring, run the ring phase of a sync, disconnect, then run the
 /// derive phase, and show what happened in counts.
 ///
@@ -32,15 +24,16 @@ public final class SyncModel {
     }
 
     public private(set) var state = State.idle
-    /// Told when a sync starts and ends. Set by the app's root before any sync.
-    public weak var lifecycle: (any SyncLifecycle)?
 
-    private let pairedRing: PairedRing
-    private let services: DigitServices
+    @ObservationIgnored private let pairedRing: PairedRing
+    @ObservationIgnored private let services: DigitServices
+    /// Told when a sync starts and ends.
+    @ObservationIgnored private let lifecycle: (any RingWorkLifecycle)?
 
-    public init(pairedRing: PairedRing, services: DigitServices) {
+    public init(pairedRing: PairedRing, services: DigitServices, lifecycle: (any RingWorkLifecycle)? = nil) {
         self.pairedRing = pairedRing
         self.services = services
+        self.lifecycle = lifecycle
     }
 
     /// Whether a sync is in progress.
@@ -68,13 +61,11 @@ public final class SyncModel {
 
     /// Runs one sync. A tap while a sync (or pairing) runs does nothing.
     public func sync() async {
-        guard let ring = pairedRing.ring, let identifier = ring.peripheralIdentifier,
-              pairedRing.claim(.syncing) else { return }
-        state = .connecting
-        lifecycle?.syncWillStart()
-        state = await run(ring: ring, identifier: identifier)
-        pairedRing.release()
-        lifecycle?.syncDidEnd()
+        guard let ring = pairedRing.ring, let identifier = ring.peripheralIdentifier else { return }
+        await pairedRing.using(.syncing, lifecycle: lifecycle) {
+            state = .connecting
+            state = await run(ring: ring, identifier: identifier)
+        }
     }
 
     private func run(ring: StoredRing, identifier: UUID) async -> State {

@@ -36,6 +36,7 @@ struct SyncModelTests {
         #expect(summary.kinds.first { $0.kind == .heartRate }?.ingestion == .counts(inserted: 2, updated: 0, rejected: 0))
         #expect(summary.clockText == "The ring's clock was set.")
         #expect(summary.intervalSent)
+        #expect(summary.intervalText == "The ring will take readings every 10 minutes.")
         #expect(summary.finishedAt == t0.addingTimeInterval(120))
         #expect(f.sync.statusText == "Sync complete.")
         #expect(f.pairedRing.activity == nil)
@@ -244,6 +245,20 @@ struct SyncModelTests {
             #expect(text.contains("Nothing to do"))
             #expect(text.contains("the next sync sets it again"))
         }
+    }
+
+    @Test func everyIntervalOutcomeHasItsOwnText() {
+        let error = SyncError.ring(.timeout("synthetic"))
+        #expect(SyncSummary.text(for: .accepted(.fiveMinutes)) == "The ring will take readings every 5 minutes.")
+        #expect(SyncSummary.text(for: .accepted(.off)) == "The ring's scheduled readings are off.")
+        let refused = SyncSummary.text(for: .refused(.thirtyMinutes, .unsupported))
+        #expect(refused.contains("rejected"))
+        #expect(refused.contains("every 30 minutes"))
+        let unknown = SyncSummary.text(for: .unknown(.tenMinutes, error: error))
+        #expect(unknown.contains("may have applied"))
+        #expect(unknown.contains("every 10 minutes"))
+        #expect(SyncSummary.text(for: .skipped(.tenMinutes, .clockNotAcknowledged)).contains("wasn't sent"))
+        #expect(!SyncSummary.text(for: .notRequested).isEmpty)
     }
 
     @Test func noTextCarriesANameOrIdentifier() async throws {

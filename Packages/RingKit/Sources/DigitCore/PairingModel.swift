@@ -30,12 +30,15 @@ public final class PairingModel {
     /// Why the last "Forget this ring" failed, if it did; cleared by the next attempt.
     public private(set) var forgetFailure: PairingFailure?
 
-    private let pairedRing: PairedRing
-    private let services: DigitServices
+    @ObservationIgnored private let pairedRing: PairedRing
+    @ObservationIgnored private let services: DigitServices
+    /// Told when pairing or forgetting starts and ends, so they run inside a background task.
+    @ObservationIgnored private let lifecycle: (any RingWorkLifecycle)?
 
-    public init(pairedRing: PairedRing, services: DigitServices) {
+    public init(pairedRing: PairedRing, services: DigitServices, lifecycle: (any RingWorkLifecycle)? = nil) {
         self.pairedRing = pairedRing
         self.services = services
+        self.lifecycle = lifecycle
     }
 
     /// Whether a scan or a pick can start now (no sync or other flow is using the ring).
@@ -67,8 +70,10 @@ public final class PairingModel {
 
     /// Scans for rings. Does nothing while another flow uses the ring.
     public func findRings() async {
-        guard pairedRing.claim(.pairing) else { return }
-        defer { pairedRing.release() }
+        await pairedRing.using(.pairing, lifecycle: lifecycle) { await scan() }
+    }
+
+    private func scan() async {
         state = .scanning
         do {
             let heard = try await services.ringAccess.discoverRings(for: SyncSettings.discoveryDuration)
@@ -86,8 +91,10 @@ public final class PairingModel {
     /// Connects to `candidate`, reads its firmware, saves it, then disconnects. Does nothing while
     /// another flow uses the ring. Nothing is saved unless the device information was read.
     public func pair(_ candidate: RingCandidate) async {
-        guard pairedRing.claim(.pairing) else { return }
-        defer { pairedRing.release() }
+        await pairedRing.using(.pairing, lifecycle: lifecycle) { await connectAndSave(candidate) }
+    }
+
+    private func connectAndSave(_ candidate: RingCandidate) async {
         state = .connecting
         let connected: any ConnectedRing
         do {
@@ -118,8 +125,11 @@ public final class PairingModel {
     /// Clears the saved identifier, so Digit stops connecting to the ring. Deletes nothing from
     /// the store and sends nothing to the ring. Does nothing while another flow uses the ring.
     public func forget() async {
-        guard let ring = pairedRing.ring, pairedRing.claim(.forgetting) else { return }
-        defer { pairedRing.release() }
+        guard let ring = pairedRing.ring else { return }
+        await pairedRing.using(.forgetting, lifecycle: lifecycle) { await clearIdentifier(of: ring) }
+    }
+
+    private func clearIdentifier(of ring: StoredRing) async {
         forgetFailure = nil
         do {
             try await services.registry.setPeripheralIdentifier(nil, forRing: ring.id)

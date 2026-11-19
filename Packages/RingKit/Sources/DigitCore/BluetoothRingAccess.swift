@@ -11,15 +11,19 @@ import RingTransport
 /// the Bluetooth permission prompt appears with the first scan rather than at launch. One
 /// connection object serves the whole process; it carries one link at a time.
 ///
+/// **One connection object, many sessions.** The same `RingConnection` carries every pairing and
+/// sync, each with a new session that is stopped before the link is disconnected. `RingSession.stop()`
+/// warns that a write already in progress and leftover event acknowledgements can still reach the
+/// link after it returns, so they can overlap the next session's first writes on a reused link.
+/// Accepted for foreground use, where connections are seconds apart and each starts with a
+/// reconnect that clears the inbox; revisit with background sync (#54).
+///
 /// Foreground only: connecting by identifier falls back to an unfiltered scan, which finds nothing
 /// in the background on iOS (see "Known gaps in RingTransport" in AGENTS.md). Never run against a
 /// ring by its tests; covered by the hardware check on #53.
 ///
 /// `@unchecked Sendable`: the lazily created connection is guarded by `lock`.
 public final class BluetoothRingAccess: RingAccess, @unchecked Sendable {
-    /// How long a connect may take, scan through subscribe (the transport's default).
-    public static let connectTimeout: TimeInterval = 20
-
     private let lock = NSLock()
     private var connection: RingConnection?
 
@@ -35,7 +39,7 @@ public final class BluetoothRingAccess: RingAccess, @unchecked Sendable {
     }
 
     public func discoverRings(for duration: Duration) async throws(RingAccessProblem) -> [RingCandidate] {
-        let seconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+        let seconds = duration / .seconds(1)
         let devices: [DiscoveredDevice]
         do {
             devices = try await sharedConnection().discoverRings(for: seconds, namePrefixes: YCBT.knownNamePrefixes)
@@ -51,7 +55,7 @@ public final class BluetoothRingAccess: RingAccess, @unchecked Sendable {
     public func connect(identifier: UUID) async throws(RingAccessProblem) -> any ConnectedRing {
         let connection = sharedConnection()
         do {
-            try await connection.connect(identifier: identifier, timeout: Self.connectTimeout)
+            try await connection.connect(identifier: identifier)
         } catch {
             // A failed attempt may leave nothing to cancel; disconnecting is harmless either way.
             connection.disconnect()

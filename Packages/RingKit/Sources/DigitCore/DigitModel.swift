@@ -28,14 +28,13 @@ public final class DigitModel {
     ) {
         self.services = services
         let pairedRing = PairedRing()
-        let sync = SyncModel(pairedRing: pairedRing, services: services)
-        self.pairedRing = pairedRing
-        self.pairing = PairingModel(pairedRing: pairedRing, services: services)
-        self.sync = sync
-        self.lifecycle = SuspensionLifecycle(
-            isSyncRunning: { [weak sync] in sync?.isRunning ?? false },
+        let lifecycle = SuspensionLifecycle(
+            isRingInUse: { [weak pairedRing] in pairedRing?.activity != nil },
             backgroundTasks: backgroundTasks, suspend: suspend, resume: resume)
-        sync.lifecycle = lifecycle
+        self.pairedRing = pairedRing
+        self.lifecycle = lifecycle
+        self.pairing = PairingModel(pairedRing: pairedRing, services: services, lifecycle: lifecycle)
+        self.sync = SyncModel(pairedRing: pairedRing, services: services, lifecycle: lifecycle)
     }
 
     /// Reads the paired ring from the store. Call once the store is open, and again to retry.

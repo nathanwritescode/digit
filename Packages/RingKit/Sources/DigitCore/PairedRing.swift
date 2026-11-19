@@ -2,6 +2,14 @@ import Foundation
 import Observation
 import RingStore
 
+/// What ring work tells the app's lifecycle, so it runs inside a background task and the store's
+/// suspension is announced only once it has ended (`SuspensionLifecycle`).
+@MainActor
+public protocol RingWorkLifecycle: AnyObject {
+    func ringWorkWillStart()
+    func ringWorkDidEnd()
+}
+
 /// What both models share: the ring Digit is paired with, and which flow is using the ring.
 ///
 /// **One ring in v1.** The store's oldest ring is the paired ring. Pairing again attaches the new
@@ -42,6 +50,17 @@ public final class PairedRing {
 
     func release() {
         activity = nil
+    }
+
+    /// Runs `body` with the ring claimed for `activity`, inside the lifecycle's background task.
+    /// Does nothing if the claim is refused. The claim is released before the lifecycle hears the
+    /// work ended, so the lifecycle sees no ring work running when it decides to announce.
+    func using(_ activity: Activity, lifecycle: (any RingWorkLifecycle)?, _ body: () async -> Void) async {
+        guard claim(activity) else { return }
+        lifecycle?.ringWorkWillStart()
+        await body()
+        release()
+        lifecycle?.ringWorkDidEnd()
     }
 
     /// Reads the paired ring from the store: the oldest ring, since v1 has one.

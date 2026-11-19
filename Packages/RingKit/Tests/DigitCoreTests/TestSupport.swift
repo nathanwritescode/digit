@@ -108,23 +108,40 @@ final class ScriptedRing: SyncableRing, @unchecked Sendable {
 }
 
 /// The ring-side protocol, scripted. Logs `discover`, `connect`, `deviceDetails`, `disconnect`.
-/// `@unchecked Sendable`: configured before use, then only read.
+/// `@unchecked Sendable`: every mutable field is guarded by `lock`.
 final class FakeRingAccess: RingAccess, @unchecked Sendable {
+    private struct Script {
+        var candidates: [RingCandidate] = []
+        var discoveryProblem: RingAccessProblem?
+        var connectProblem: RingAccessProblem?
+        var detailsProblem: RingAccessProblem?
+        var firmware = "2.32"
+        var ring: ScriptedRing
+        var connectGate: Gate?
+        var connectedIdentifier: UUID?
+    }
+
     let log: EventLog
-    var candidates: [RingCandidate] = []
-    var discoveryProblem: RingAccessProblem?
-    var connectProblem: RingAccessProblem?
-    var detailsProblem: RingAccessProblem?
-    var firmware = "2.32"
-    var ring: ScriptedRing
+    private let lock = NSLock()
+    private var script: Script
+
+    private func get<T>(_ path: KeyPath<Script, T>) -> T { lock.withLock { script[keyPath: path] } }
+    private func set<T>(_ path: WritableKeyPath<Script, T>, _ value: T) { lock.withLock { script[keyPath: path] = value } }
+
+    var candidates: [RingCandidate] { get { get(\.candidates) } set { set(\.candidates, newValue) } }
+    var discoveryProblem: RingAccessProblem? { get { get(\.discoveryProblem) } set { set(\.discoveryProblem, newValue) } }
+    var connectProblem: RingAccessProblem? { get { get(\.connectProblem) } set { set(\.connectProblem, newValue) } }
+    var detailsProblem: RingAccessProblem? { get { get(\.detailsProblem) } set { set(\.detailsProblem, newValue) } }
+    var firmware: String { get { get(\.firmware) } set { set(\.firmware, newValue) } }
+    var ring: ScriptedRing { get { get(\.ring) } set { set(\.ring, newValue) } }
     /// If set, `connect` waits for it before answering.
-    var connectGate: Gate?
+    var connectGate: Gate? { get { get(\.connectGate) } set { set(\.connectGate, newValue) } }
     /// The identifier `connect` was last given.
-    private(set) var connectedIdentifier: UUID?
+    private(set) var connectedIdentifier: UUID? { get { get(\.connectedIdentifier) } set { set(\.connectedIdentifier, newValue) } }
 
     init(log: EventLog) {
         self.log = log
-        ring = ScriptedRing(log: log)
+        script = Script(ring: ScriptedRing(log: log))
     }
 
     func discoverRings(for duration: Duration) async throws(RingAccessProblem) -> [RingCandidate] {
@@ -213,8 +230,10 @@ final class Fixture {
     let pairedRing: PairedRing
     let pairing: PairingModel
     let sync: SyncModel
+    let lifecycle: SuspensionLifecycle?
 
-    init() throws {
+    /// `makeLifecycle`, if given, builds the lifecycle the models report to, from the shared ring.
+    init(makeLifecycle: ((PairedRing) -> SuspensionLifecycle)? = nil) throws {
         store = try RingStore()
         registry = SuspendingRegistry(store, log: log)
         access = FakeRingAccess(log: log)
@@ -231,8 +250,9 @@ final class Fixture {
             },
             now: { t0.addingTimeInterval(120) })
         pairedRing = PairedRing()
-        pairing = PairingModel(pairedRing: pairedRing, services: services)
-        sync = SyncModel(pairedRing: pairedRing, services: services)
+        lifecycle = makeLifecycle?(pairedRing)
+        pairing = PairingModel(pairedRing: pairedRing, services: services, lifecycle: lifecycle)
+        sync = SyncModel(pairedRing: pairedRing, services: services, lifecycle: lifecycle)
     }
 
     func load() async throws {
