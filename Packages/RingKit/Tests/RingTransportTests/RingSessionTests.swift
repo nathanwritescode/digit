@@ -36,7 +36,7 @@ private final class FakeLink: RingLink, @unchecked Sendable {
         stale: [Frame] = [], guardWrites: Bool = false, writeTimeout: TimeInterval = 0.02, clock: TestClock = TestClock(),
         onSend: @escaping @Sendable (Frame) -> [Frame] = { _ in [] }
     ) {
-        if ThreadLoad.enabledForWholeRun { ThreadLoad.wholeRun }
+        ThreadLoad.startForWholeRunIfEnabled()
         self.clock = clock
         inbox = stale
         self.guardWrites = guardWrites
@@ -60,7 +60,11 @@ private final class FakeLink: RingLink, @unchecked Sendable {
     // With `guardWrites`, a send while an earlier one is still in flight throws `busy` (and is
     // logged), as the real connection does. `trickle` is returned by `nextFrame` whenever nothing
     // else is queued; `setTrickleOnNextSend` turns it on once the next frame has been written.
-    private enum SendFault { case park, ownTimeout }
+    private enum SendFault { case park, ownTimeout(until: ContinuousClock.Instant) }
+    // Sends held by their own write deadline. Ended early by `close()` and `releaseAll()`.
+    private var ownTimeouts: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var lastOwnTimeoutID = 0
+    private var ownTimeoutsReleased = false
     let writeTimeout: TimeInterval
     private var faults: [SendFault] = []
     private var parkedGroup: UInt8?
@@ -95,8 +99,24 @@ private final class FakeLink: RingLink, @unchecked Sendable {
             parkEverything = false
         }
         releaseParked()
+        releaseOwnTimeouts()
     }
-    func timeOutNextSend() { mutate { faults.append(.ownTimeout) } }
+
+    /// Ends every send waiting for its own write deadline, now and from now on.
+    private func releaseOwnTimeouts() {
+        let all = mutate { () -> [CheckedContinuation<Void, Never>] in
+            ownTimeoutsReleased = true
+            defer { ownTimeouts = [:] }
+            return Array(ownTimeouts.values)
+        }
+        for continuation in all { continuation.resume() }
+    }
+
+    private func endOwnTimeout(_ id: Int) {
+        mutate { ownTimeouts.removeValue(forKey: id) }?.resume()
+    }
+    /// The deadline is read from `clock` when the send is attempted (see `send`).
+    func timeOutNextSend() { mutate { faults.append(.ownTimeout(until: clock.start)) } }
     func setTrickle(_ frame: Frame?) { mutate { trickleFrame = frame } }
     func setTrickleOnNextSend(_ frame: Frame) { mutate { trickleAfterSend = frame } }
     func setAlwaysReady(_ frame: Frame?) { mutate { alwaysReady = frame } }
@@ -148,6 +168,7 @@ private final class FakeLink: RingLink, @unchecked Sendable {
             return woken
         }
         releaseParked()
+        releaseOwnTimeouts()
         for continuation in reading { continuation.resume(returning: nil) }
     }
 
@@ -162,11 +183,31 @@ private final class FakeLink: RingLink, @unchecked Sendable {
             inFlight = true
             if parkEverything { return .park }
             if let group = parkedGroup, frame.group == group { return .park }
-            return faults.isEmpty ? nil : faults.removeFirst()
+            guard !faults.isEmpty else { return nil }
+            // Read under the same lock as the attempt is logged, so a test that moves the clock
+            // once it sees the attempt always moves it past this deadline.
+            if case .ownTimeout = faults[0] {
+                faults.removeFirst()
+                return .ownTimeout(until: clock.now() + .seconds(writeTimeout))
+            }
+            return faults.removeFirst()
         }
         switch fault {
-        case .ownTimeout:
-            await clock.sleepIgnoringCancellation(until: clock.now() + .seconds(writeTimeout))
+        case .ownTimeout(let deadline):
+            // Ignores the caller's cancellation, as the real connection's write deadline does.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let id = mutate { () -> Int? in
+                    guard !ownTimeoutsReleased else { return nil }
+                    lastOwnTimeoutID += 1
+                    ownTimeouts[lastOwnTimeoutID] = continuation
+                    return lastOwnTimeoutID
+                }
+                guard let id else { return continuation.resume() }
+                Task {
+                    try? await self.clock.sleep(until: deadline)
+                    self.endOwnTimeout(id)
+                }
+            }
             // The link clears its own in-flight state before reporting, so the next send is accepted.
             mutate { inFlight = false }
             throw RingError.timeout("write confirmation")
@@ -361,7 +402,8 @@ private func backstop(_ link: FakeLink, _ s: RingSession) -> Double { link.write
 /// threw, so no reader outlives its test. Closing first makes any write still held fail at once,
 /// so `stop()` does not wait for a write backstop on a clock nobody is moving any more. If `body`
 /// threw or the test is cancelled (its time limit), the fake's holds are released first, so
-/// `stop()` cannot wait on a reader the fake is holding. The cancellation handler covers `stop()` too.
+/// `stop()` cannot wait on a reader the fake is holding. The cancellation handler covers `stop()`
+/// too.
 @discardableResult
 private func using<T: Sendable>(
     _ s: RingSession,
@@ -1666,7 +1708,7 @@ private func expectStopped<T>(_ result: Result<T, Error>?, sourceLocation: Sourc
 
 @Test(.timeLimit(.minutes(1))) func deadlineHelperReturnsTheOperationsResultWhenItWins() async throws {
     // The long deadline must not keep the call waiting: the timer is cancelled when the operation wins.
-    let value = try await withDeadline(3600, "never") { 42 }
+    let value = try await withDeadline(3600, "never", clock: .continuous) { 42 }
     #expect(value == 42)
 }
 
@@ -1690,7 +1732,7 @@ private func expectStopped<T>(_ result: Result<T, Error>?, sourceLocation: Sourc
 
 @Test(.timeLimit(.minutes(1))) func deadlineHelperPropagatesTheOperationsError() async throws {
     do {
-        try await withDeadline(3600, "never") { throw PersistFailure() }
+        try await withDeadline(3600, "never", clock: .continuous) { throw PersistFailure() }
         Issue.record("expected an error")
     } catch is PersistFailure {
     }
@@ -1871,11 +1913,12 @@ func monitoringIntervalOtherErrorCodesMapToRejected(code: UInt8) async throws {
 // each hop of a scripted reply was delayed past a 50 ms reply timeout running on real time (#68).
 // On the test clock no timer fires until the test moves it, so these conversations, which expect
 // replies and never move the clock, get them however long the hand-over takes. Each pool thread
-// that the load uses is held for 150 ms at a time throughout, which is beyond the delays seen in #68. Set
-// RINGKIT_THREAD_LOAD=1 to run the same load beside every test of this target instead.
+// that the load uses is held for 150 ms at a time throughout, which is beyond the delays seen in
+// #68. Set RINGKIT_THREAD_LOAD=1 to run the same load beside every test of this target instead.
 @Test(.timeLimit(.minutes(1))) func threadHoldingLoadDoesNotChangeOutcomes() async throws {
     // With RINGKIT_THREAD_LOAD=1 the same load already runs; a second would hold every thread.
-    let load = ThreadLoad.enabledForWholeRun ? nil : await ThreadLoad.start(tasks: ThreadLoad.defaultTasks, blockMilliseconds: 150)
+    let load = ThreadLoad.enabledForWholeRun
+        ? nil : await ThreadLoad.start(tasks: ThreadLoad.defaultTasks, blockMilliseconds: 150)
     defer { load?.cancel() }
     let live = Frame(group: 0x06, key: 0x01, payload: [60])
     try await withThrowingTaskGroup(of: Void.self) { group in

@@ -31,9 +31,6 @@ final class TestClock: @unchecked Sendable {
     /// How far the clock has moved since it was made.
     var elapsed: Duration { lock.withLock { offset } }
 
-    /// Sleepers not yet woken or cancelled.
-    var pendingSleepers: Int { lock.withLock { sleepers.count } }
-
     func now() -> ContinuousClock.Instant {
         let (instant, due) = lock.withLock { () -> (ContinuousClock.Instant, [CheckedContinuation<Void, Error>]) in
             if let step = stepPerRead { offset += step }
@@ -110,12 +107,6 @@ final class TestClock: @unchecked Sendable {
         }
     }
 
-    /// Like `sleep(until:)`, but ignores cancellation, as a link's own write deadline does.
-    func sleepIgnoringCancellation(until instant: ContinuousClock.Instant) async {
-        // An unstructured task is not cancelled when the task awaiting it is.
-        await Task { try? await self.sleep(until: instant) }.value
-    }
-
     /// Removes and returns the sleepers that are due, earliest first. Call with the lock held.
     private func takeDue() -> [CheckedContinuation<Void, Error>] {
         let now = start + offset
@@ -135,8 +126,15 @@ final class TestClock: @unchecked Sendable {
 enum ThreadLoad {
     static let enabledForWholeRun = ProcessInfo.processInfo.environment["RINGKIT_THREAD_LOAD"] == "1"
 
-    /// Started at most once per process, and runs until the process ends.
-    static let wholeRun: Void = {
+    /// With `RINGKIT_THREAD_LOAD=1`, starts the load the first time it is called; it then runs
+    /// until the process ends. Does nothing otherwise, and on later calls.
+    static func startForWholeRunIfEnabled() {
+        guard enabledForWholeRun else { return }
+        _ = startedForWholeRun
+    }
+
+    /// A static's initialiser runs once per process, however many threads call this at once.
+    private static let startedForWholeRun: Void = {
         Task { _ = await start(tasks: defaultTasks, blockMilliseconds: 150) }
     }()
 

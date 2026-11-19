@@ -3,7 +3,9 @@ import Foundation
 /// The monotonic time that `RingSession`'s deadlines and timers run on, and that `withDeadline`
 /// sleeps on. Production always uses `.continuous`, real time. Tests inject a clock that moves
 /// only when the test moves it, so whether a wait times out cannot depend on how promptly threads
-/// are scheduled (#75).
+/// are scheduled (#75). Not a `Clock` conformance: the session's deadlines are
+/// `ContinuousClock.Instant`s, and a generic or existential clock would change every signature
+/// that carries one, for no gain over these two functions.
 struct SessionClock: Sendable {
     let now: @Sendable () -> ContinuousClock.Instant
     /// Returns once the clock reaches the instant, or throws when the calling task is cancelled.
@@ -24,7 +26,7 @@ struct SessionClock: Sendable {
 func withDeadline<T: Sendable>(
     _ seconds: TimeInterval,
     _ what: String,
-    clock: SessionClock = .continuous,
+    clock: SessionClock,
     _ operation: @escaping @Sendable () async throws -> T
 ) async throws -> T {
     let deadline = clock.now() + .seconds(seconds)
