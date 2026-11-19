@@ -20,8 +20,8 @@ import RingProtocol
     }
 }
 
-@Test func onlyValuesSentToTheR99AreMarkedVerified() {
-    #expect(MonitoringInterval.allCases.filter(\.isVerifiedOnHardware).map(\.rawValue) == [0, 1, 5, 10])
+@Test func onlyValuesWhoseSpacingWasSeenOnTheR99AreMarkedObserved() {
+    #expect(MonitoringInterval.allCases.filter(\.isSpacingObservedOnHardware).map(\.rawValue) == [0, 1, 5, 10])
 }
 
 @Test func summaryNamesTheInterval() {

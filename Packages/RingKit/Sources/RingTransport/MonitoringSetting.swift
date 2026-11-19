@@ -26,7 +26,8 @@ extension RingSession {
     /// So a caller catches `MonitoringSettingError` for "the ring refused the setting" and only
     /// `RingError` (timeout, not connected, ...) for transport failures. On a timeout the ring may
     /// still have applied the setting. The ring cannot report this setting back, so the caller must
-    /// remember it. Tested only against a scripted link; not yet sent to a ring through this method.
+    /// remember it. Sent to an R99 through this method for 10, 15, 20, 30 and 60 minutes, each
+    /// acknowledged; `off` has not been sent through it, and the refusal paths are tested only against a scripted link.
     public func setMonitoringInterval(_ interval: MonitoringInterval) async throws {
         let reply: Frame
         do {
