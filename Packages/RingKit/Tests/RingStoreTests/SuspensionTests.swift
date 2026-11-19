@@ -794,7 +794,7 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
             RingStore.appDidResume()
             _ = await finished(announcement.task)
             guard let outcome = await finished(write) else { return }
-            let took = ended.withLock { $0 }.map { $0 - started } ?? .zero
+            let took = try #require(ended.withLock { $0 }) - started
             switch outcome {
             case .success: Issue.record("expected SQLITE_BUSY")
             case .failure(let error as RingStoreError) where error == .suspended && took < .seconds(busyTimeout):

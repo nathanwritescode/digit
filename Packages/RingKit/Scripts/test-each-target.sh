@@ -3,8 +3,8 @@
 #
 # With Swift 6.3 (CI's toolchain in November 2026) `swift test` runs every test target in one
 # process; Swift 6.4 already gives each target a process of its own. In the shared process, tests
-# that hold threads (ringprobe's tests wait synchronously for `git`; the store derivation tests
-# added for #69) delayed the transport tests' scripted replies by 80 to 180 ms per scheduling hop,
+# that hold threads (ringprobe's tests wait synchronously for `git`; heavy store
+# tests) delayed the transport tests' scripted replies by 80 to 180 ms per scheduling hop,
 # past their 50 ms reply timeout, so requests timed out with the reply already queued. With one
 # target per process no target's tests can starve another's, and every toolchain behaves the same.
 #
@@ -12,7 +12,16 @@
 # target in Package.swift; otherwise only the targets named. Environment variables (such as
 # LIBDISPATCH_COOPERATIVE_POOL_STRICT) pass through to the test processes. Every target is run
 # even after one fails, and the script fails if any target failed or ran no tests.
+#
+# Keep this script even once CI's toolchain separates targets by default: it states the isolation
+# the transport tests' 50 ms reply timeout depends on, rather than relying on a toolchain default.
+# Needs `jq` (in /usr/bin from macOS 15).
 set -uo pipefail
+
+if ! command -v jq >/dev/null; then
+    echo "error: this script needs jq (in /usr/bin from macOS 15)" >&2
+    exit 1
+fi
 
 if [ $# -eq 0 ]; then
     targets=$(swift package dump-package | jq -r '.targets[] | select(.type == "test") | .name') || exit 1
