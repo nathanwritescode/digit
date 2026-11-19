@@ -20,7 +20,8 @@ import RingProtocol
 // task. Fixed delays that remain: `stillWaitingWindow`, which only bounds how long a test looks for
 // something that must not happen (an announcement returning early); and one in
 // `busyTimeoutAfterResumeIsNotReportedAsSuspended`, which cannot observe that a write has entered
-// SQLite's busy wait and so waits a fixed 300 ms for it (documented there).
+// SQLite's busy wait and so waits a fixed 300 ms to make it likely, then repeats an attempt in
+// which the write was refused instead (documented there).
 
 /// A fresh directory dedicated to one database, removed afterwards.
 private func withDatabaseURL(_ body: (URL) async throws -> Void) async throws {
@@ -409,9 +410,31 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
         }
     }
 
+    /// How many times a test may set up a write waiting for the lock before it gives up on getting
+    /// the write into SQLite's busy wait ahead of the announcement (see the two tests that use it).
+    private static let busyWaitAttempts = 5
+
     /// A write waiting in the busy timeout when suspension is announced is not woken (measured in
     /// review): it gets the lock later. It must then do no work, and the announcement waits for it.
+    ///
+    /// Whether the write has reached SQLite's busy wait cannot be observed. If the announcement
+    /// lands first, GRDB refuses the write's BEGIN, the write fails with `suspended` at once and the
+    /// announcement returns at once: right, but not this scenario. That case is told apart from a
+    /// real failure afterwards (the write has already left while the lock is still held, which a
+    /// write in the busy wait cannot do before its 5 s busy timeout) and the attempt is repeated.
+    /// It used to count as a failure: 1 run in 30 of the store tests beside busy processes (#68).
     @Test func writeWaitingForTheLockDoesNoWorkAndIsWaitedFor() async throws {
+        var exercised = false
+        for _ in 0..<Self.busyWaitAttempts where !exercised {
+            exercised = try await writeWaitingForTheLockAttempt()
+        }
+        #expect(exercised, "the write never reached the busy wait before the announcement")
+    }
+
+    /// One attempt of `writeWaitingForTheLockDoesNoWorkAndIsWaitedFor`. Returns false if GRDB
+    /// refused the write before it waited for the lock.
+    private func writeWaitingForTheLockAttempt() async throws -> Bool {
+        var exercised = true
         try await withDatabaseURL { url in
             let store = try await RingStore.open(at: url)
             // Another connection holds the write lock.
@@ -437,22 +460,25 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
                     try insertRing(db, UUID())
                 }
             }
-            // Whether the write has reached SQLite's busy wait cannot be observed. If the
-            // announcement lands first, GRDB refuses its BEGIN instead and the test still passes,
-            // without exercising the store's in-transaction check; the check is covered by
-            // `writeQueuedAcrossSuspendAndResumeSucceeds` failing when it is wrong.
             #expect(await eventually { SuspensionState.inFlightCount == 1 })
             let announcement = startAnnouncement()
             defer { RingStore.appDidResume() }
             #expect(await eventually { SuspensionState.isSuspended })
-            #expect(await !eventually(within: stillWaitingWindow) { announcement.done.value },
-                    "returned while a write was still waiting for the lock")
+            if await eventually(within: stillWaitingWindow, { announcement.done.value }) {
+                // The announcement returns only once no call is in flight, unless it is broken.
+                if SuspensionState.inFlightCount == 0 {
+                    exercised = false  // the write left with the lock still held: it was refused
+                } else {
+                    Issue.record("returned while a write was still waiting for the lock")
+                }
+            }
             release.signal()
             _ = await finished(announcement.task)
             await expectFailure(write, RingStoreError.suspended)
             #expect(!ranBody.value, "the write ran its body after the announcement")
             #expect(try plainConnectionCanTakeWriteLock(url))
         }
+        return exercised
     }
 
     /// A read in progress when suspension is announced is waited for and completes normally.
@@ -722,31 +748,57 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
 
     /// The reviewed sequence: another connection holds the write lock, a store write waits in the
     /// busy timeout, the app suspends and resumes within the timeout, and the timeout then runs
-    /// out. Contention was the only cause, so the raw SQLITE_BUSY must pass through. Timing: the
-    /// write must be in SQLite's busy wait before the announcement, or GRDB refuses it (ABORT, a
-    /// real `suspended`) and the test fails; that cannot be observed, so it waits a fixed 300 ms
-    /// inside a 1.5 s timeout. Under a stall longer than that the test fails spuriously rather than
-    /// passing wrongly. With the mapping made epoch-based again it fails.
+    /// out. Contention was the only cause, so the raw SQLITE_BUSY must pass through. With the
+    /// mapping made epoch-based again it fails.
+    ///
+    /// Timing: the write must be in SQLite's busy wait before the announcement, or GRDB refuses it
+    /// (ABORT, a real `suspended`). That cannot be observed, so the attempt waits a fixed 300 ms
+    /// first, which only makes the first attempt likely to get there. A refused write is told apart
+    /// afterwards by its duration: one that went through the busy wait cannot fail before the 1.5 s
+    /// busy timeout (the lock is held throughout), and one refused fails at once. A refused attempt
+    /// is repeated. Before #68 a refusal failed the test: a stall of over 300 ms before the write's
+    /// BEGIN failed it if the BEGIN then fell between the announcement and the resume (a window of
+    /// milliseconds; never seen failing). Now a spurious failure needs a refused write taking 1.5 s.
     @Test func busyTimeoutAfterResumeIsNotReportedAsSuspended() async throws {
+        var exercised = false
+        for _ in 0..<Self.busyWaitAttempts where !exercised {
+            exercised = true
+            try await busyTimeoutAfterResumeAttempt(exercised: &exercised)
+        }
+        #expect(exercised, "the write never reached the busy wait before the announcement")
+    }
+
+    /// One attempt of `busyTimeoutAfterResumeIsNotReportedAsSuspended`. Sets `exercised` to false
+    /// if GRDB refused the write before it waited for the lock.
+    private func busyTimeoutAfterResumeAttempt(exercised: inout Bool) async throws {
         try await withDatabaseURL { url in
+            let busyTimeout = 1.5
             var hooks = RingStore.OpenHooks()
-            hooks.busyTimeout = 1.5
+            hooks.busyTimeout = busyTimeout
             let store = try RingStore(url: url, observesSuspension: true, hooks: hooks)
             let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
             holdWriteLock(url, held: held, release: release)
             await wait(for: held)
             defer { release.signal() }
             let ranBody = Flag()
-            let write = Task { try await store.write { db in ranBody.set(); try insertRing(db, UUID()) } }
+            let started = ContinuousClock.now
+            let ended = OSAllocatedUnfairLock<ContinuousClock.Instant?>(initialState: nil)
+            let write = Task {
+                defer { ended.withLock { $0 = ContinuousClock.now } }
+                try await store.write { db in ranBody.set(); try insertRing(db, UUID()) }
+            }
             #expect(await eventually { SuspensionState.inFlightCount == 1 })
-            try await Task.sleep(for: .milliseconds(300))  // fixed delay: let it reach SQLite's busy wait
+            try await Task.sleep(for: .milliseconds(300))  // makes reaching SQLite's busy wait likely
             let announcement = startAnnouncement()
             #expect(await eventually { SuspensionState.isSuspended })
             RingStore.appDidResume()
             _ = await finished(announcement.task)
             guard let outcome = await finished(write) else { return }
+            let took = ended.withLock { $0 }.map { $0 - started } ?? .zero
             switch outcome {
             case .success: Issue.record("expected SQLITE_BUSY")
+            case .failure(let error as RingStoreError) where error == .suspended && took < .seconds(busyTimeout):
+                exercised = false  // refused before it waited for the lock
             case .failure(let error): #expect((error as? DatabaseError)?.resultCode == .SQLITE_BUSY, "got \(error)")
             }
             #expect(!ranBody.value)
