@@ -266,6 +266,15 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
                     try await store.dailySummaries(ringID: ringID, from: days.first, through: days.last)
                 }
                 await #expect(throws: RingStoreError.suspended) {
+                    try await store.sleepNightDetails(ringID: ringID, from: days.first, through: days.last)
+                }
+                await #expect(throws: RingStoreError.suspended) {
+                    try await store.heartRateSummary(
+                        ringID: ringID, within: [DateInterval(start: Date(timeIntervalSince1970: 0), duration: 60)])
+                }
+                // Even with nothing to read, the call is refused before touching SQLite.
+                await #expect(throws: RingStoreError.suspended) { try await store.heartRateSummary(ringID: ringID, within: []) }
+                await #expect(throws: RingStoreError.suspended) {
                     try await store.registerRing(protocolFamily: "ycbt")
                 }
                 await #expect(throws: RingStoreError.suspended) {

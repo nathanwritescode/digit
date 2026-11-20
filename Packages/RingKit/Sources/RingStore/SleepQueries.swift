@@ -118,6 +118,17 @@ extension RingStore {
         }
     }
 
+    /// Every night whose day is in `first...last` (inclusive), each with its stages, ordered by
+    /// start: the nights `sleepNights(ringID:from:through:)` returns, with the stages
+    /// `sleepNightDetail(ringID:startingAt:)` would give each. One read, and one stage query for
+    /// all of them (in chunks of whole nights, about `stageQueryChunk` sessions each), so a screen that needs a month of
+    /// nights' stages does not make a read per night.
+    public func sleepNightDetails(ringID: UUID, from first: SleepDay, through last: SleepDay) async throws
+        -> [SleepNightDetail]
+    {
+        try await read { db in try Self.sleepNightDetails(db, ringID: ringID, from: first, through: last) }
+    }
+
     /// Yields `latestSleepNight` now and again when it changes. An unchanged value is normally not
     /// repeated (a change to another ring's sessions yields nothing), but a repeat is possible:
     /// de-duplication compares with the last value fetched, not the last delivered, so if the
@@ -215,6 +226,52 @@ extension RingStore {
                 durationSeconds: try column(row, "duration_seconds"))
         }
         return SleepNightDetail(summary: night.summary, stages: stages)
+    }
+
+    /// About how many session ids go in one stage query, well under SQLite's limit on bound
+    /// parameters. A night is never split between two queries, so each night's stages come from
+    /// one ordered query, as in `detail`.
+    static let stageQueryChunk = 500
+
+    static func sleepNightDetails(
+        _ db: Database, ringID: UUID, from first: SleepDay, through last: SleepDay, chunk: Int = stageQueryChunk
+    ) throws -> [SleepNightDetail] {
+        let nights = try sleepNightGroups(db, ringID: ringID).filter { first <= $0.summary.day && $0.summary.day <= last }
+        var nightOfSession: [Int64: Int] = [:]
+        for (index, night) in nights.enumerated() { for id in night.sessionIDs { nightOfSession[id] = index } }
+        var stages = Array(repeating: [SleepStageEntry](), count: nights.count)
+
+        // Whole nights per query.
+        var chunks: [[Int64]] = []
+        for night in nights {
+            if let last = chunks.last, last.count + night.sessionIDs.count <= chunk {
+                chunks[chunks.count - 1] += night.sessionIDs
+            } else {
+                chunks.append(night.sessionIDs)
+            }
+        }
+        for ids in chunks {
+            let marks = ids.map { _ in "?" }.joined(separator: ",")
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT session_id, kind, start, duration_seconds FROM sleep_stage
+                    WHERE session_id IN (\(marks)) ORDER BY start, session_id, ordinal
+                    """,
+                arguments: StatementArguments(ids))
+            for row in rows {
+                guard let kind = StageCode.kind(forCode: try column(row, "kind")) else {
+                    throw RingStoreError.corruptRow("sleep stage kind")
+                }
+                let session: Int64 = try column(row, "session_id")
+                guard let index = nightOfSession[session] else { continue }
+                stages[index].append(
+                    SleepStageEntry(
+                        kind: kind, start: HistoryTransfer.date(millisecondsSince1970: try column(row, "start")),
+                        durationSeconds: try column(row, "duration_seconds")))
+            }
+        }
+        return nights.enumerated().map { index, night in SleepNightDetail(summary: night.summary, stages: stages[index]) }
     }
 
     /// Rules 1 to 5, over all of the ring's sessions, ordered by night start.

@@ -309,6 +309,45 @@ private func allNights(_ f: Fixture) async throws -> [SleepNightSummary] {
         #expect(try await f.store.sleepNightDetail(ringID: f.ring.id, startingAt: at(-5)) == nil)
     }
 
+    @Test func detailsForARangeMatchEachNightsOwnDetailInOneRead() async throws {
+        let f = try fixture(RingStore())
+        let other = try fixture(f.store)
+        // Day 1: two overlapping sessions (stages interleave in time) and an afternoon nap; days 2
+        // and 3 one night each.
+        try ingest(f, [
+            Session(22 * hour, 30 * hour, stages: [(241, 22 * hour, 3600), (242, 25 * hour, 3600)]),
+            Session(23 * hour, 26 * hour, stages: [(243, 23 * hour, 1800), (242, 24 * hour, 1800)]),
+            Session(86400 + 14 * hour, 86400 + 15 * hour),
+            Session(86400 + 22 * hour, 86400 + 30 * hour),
+            Session(2 * 86400 + 22 * hour, 2 * 86400 + 30 * hour),
+        ])
+        try ingest(other, [Session(22 * hour, 30 * hour)])
+        let nights = try await allNights(f)
+        #expect(nights.count == 4)
+        var expected: [SleepNightDetail] = []
+        for night in nights {
+            expected.append(try #require(try await f.store.sleepNightDetail(ringID: f.ring.id, startingAt: night.start)))
+        }
+        let all = try await f.store.sleepNightDetails(ringID: f.ring.id, from: day(0), through: day(9))
+        #expect(all == expected)
+        #expect(all[0].stages.map(\.kind) == [.deep, .rem, .light, .light])
+        // The range is by day, inclusive, as for `sleepNights`, and naps are included.
+        let first = try await f.store.sleepNightDetails(ringID: f.ring.id, from: day(1), through: day(1))
+        #expect(first.map(\.summary) == nights.filter { $0.day == day(1) })
+        #expect(first.map(\.summary.isMainSleep) == [true, false])
+        #expect(try await f.store.sleepNightDetails(ringID: f.ring.id, from: day(5), through: day(9)).isEmpty)
+        #expect(try await f.store.sleepNightDetails(ringID: f.ring.id, from: day(3), through: day(1)).isEmpty)
+
+        // Split into several stage queries (whole nights each), the result is the same.
+        for chunk in [1, 2, 3] {
+            let ringID = f.ring.id
+            let chunked = try await f.store.writer.read { db in
+                try RingStore.sleepNightDetails(db, ringID: ringID, from: day(0), through: day(9), chunk: chunk)
+            }
+            #expect(chunked == expected, "chunk \(chunk)")
+        }
+    }
+
     @Test func emptyRingAndRingsAreIndependent() async throws {
         let store = try RingStore()
         let f = try fixture(store)

@@ -144,8 +144,29 @@ public struct SleepNightPage: Sendable, Equatable {
     public let timeZone: TimeZone
     public let uncertainty: String?
     public let uncertaintyExplanation: String?
+    /// The stages as lanes, with bedtime, midpoint and wake time.
+    public let timeline: LaneTimeline
+    /// Digit's score, for a main sleep with time asleep; `nil` for a nap or an empty night.
+    public let score: ScoreBreakdown?
+    /// Why there is no score, when there is none.
+    public let noScoreText: String?
+    /// Time to deep sleep, deep, REM, efficiency and interruptions against the usual range; empty
+    /// for a nap (ranges compare main sleeps).
+    public let quality: [RangeBar]
+    public let qualityLegend = PersonalRange.legend
+    /// "58 bpm", the mean of heart-rate readings inside the night's sessions (heart-rate records
+    /// only), or "No heart-rate readings".
+    public let sleepingHeartRateText: String
+    public let sleepingHeartRateAccessibilityLabel: String
 
-    init(_ detail: SleepNightDetail, formatter: HealthFormatter) {
+    /// - Parameters:
+    ///   - earlier: nights of the ring days before this one (`SleepHistoryWindow` picks the main
+    ///     sleeps to compare with, never this night).
+    ///   - heartRate: the summary over `NightMetrics.sessionCover`.
+    init(
+        _ detail: SleepNightDetail, earlier: [SleepNightDetail] = [], heartRate: HeartRateSummary? = nil,
+        formatter: HealthFormatter
+    ) {
         let summary = detail.summary
         let offset = summary.utcOffsetSeconds
         self.summary = summary
@@ -180,6 +201,31 @@ public struct SleepNightPage: Sendable, Equatable {
         timeZone = HealthFormatter.zone(utcOffsetSeconds: offset)
         uncertainty = HealthFormatter.uncertaintyMarker(for: summary.timeSource)
         uncertaintyExplanation = HealthFormatter.uncertaintyExplanation(for: summary.timeSource)
+        timeline = LaneTimeline(detail, formatter: formatter)
+
+        let metrics = NightMetrics(detail)
+        if summary.isMainSleep {
+            let compared = SleepHistoryWindow.earlierMainSleeps(before: summary, in: earlier)
+            let result = SleepScore.score(
+                metrics, earlierBedtimes: compared.map { NightMetrics($0).bedtimeSecondsOfDay })
+            score = result.map { ScoreBreakdown($0, formatter: formatter) }
+            noScoreText = result == nil ? "No score: this night has no time asleep." : nil
+            quality = [SleepMetric.timeToDeepSleep, .deep, .rem, .efficiency, .interruptions].map {
+                RangeBar(metric: $0, night: metrics, earlier: compared, formatter: formatter)
+            }
+        } else {
+            score = nil
+            noScoreText = "Digit scores main sleeps only, and compares them with your other main sleeps."
+            quality = []
+        }
+        if let heartRate {
+            sleepingHeartRateText = formatter.bpm(heartRate.meanBPM)
+            sleepingHeartRateAccessibilityLabel =
+                "Sleeping heart rate, average \(formatter.number(heartRate.meanBPM)) beats per minute"
+        } else {
+            sleepingHeartRateText = "No heart-rate readings"
+            sleepingHeartRateAccessibilityLabel = "Sleeping heart rate, no heart-rate readings"
+        }
     }
 
     /// Instants in `start...end` that fall on a whole hour of the clock `utcOffsetSeconds` ahead of
@@ -212,6 +258,13 @@ private extension Int64 {
 /// One night, found by its start. When ingestion has moved the night's start since the list was
 /// read, the store returns `nil`: the model then says so (`moved`) and asks for the list to be
 /// reloaded, and the screen returns to it.
+///
+/// Previous and next move between main sleeps (naps are skipped) among `mainSleepStarts`, the
+/// main sleeps of the list the screen was opened from, and stop at its ends.
+///
+/// Each load makes three reads: the night (`sleepNightDetail`, which says whether it moved), the
+/// nights of the previous 30 ring days in one read (`sleepNightDetails`, for the score's
+/// consistency and the usual ranges; a nap skips it) and the sleeping heart rate.
 @MainActor
 @Observable
 public final class NightDetailModel {
@@ -224,24 +277,48 @@ public final class NightDetailModel {
     }
 
     public private(set) var state = State.loading
-    /// The start the night was opened with.
-    public let start: Date
+    /// The night on display: the one it was opened with, until previous or next moves it.
+    public private(set) var start: Date
 
     @ObservationIgnored private let ringID: UUID
     @ObservationIgnored private let history: any RingHistoryReader
     @ObservationIgnored private let formatter: HealthFormatter
     @ObservationIgnored private let onMoved: @MainActor () -> Void
+    @ObservationIgnored private let mainSleepStarts: [Date]
     @ObservationIgnored private var generation = 0
 
     public init(
         ringID: UUID, start: Date, history: any RingHistoryReader, formatter: HealthFormatter = HealthFormatter(),
-        onMoved: @escaping @MainActor () -> Void
+        mainSleepStarts: [Date] = [], onMoved: @escaping @MainActor () -> Void
     ) {
         self.ringID = ringID
         self.start = start
         self.history = history
         self.formatter = formatter
+        self.mainSleepStarts = mainSleepStarts.sorted()
         self.onMoved = onMoved
+    }
+
+    /// The main sleep before the one shown, if any.
+    public var previousStart: Date? { mainSleepStarts.last { $0 < start } }
+    /// The main sleep after the one shown, if any.
+    public var nextStart: Date? { mainSleepStarts.first { $0 > start } }
+
+    public func showPrevious() async {
+        guard let previous = previousStart else { return }
+        await show(previous)
+    }
+
+    public func showNext() async {
+        guard let next = nextStart else { return }
+        await show(next)
+    }
+
+    private func show(_ other: Date) async {
+        guard state != .moved else { return }
+        start = other
+        state = .loading
+        await reload()
     }
 
     public func reload() async {
@@ -249,15 +326,24 @@ public final class NightDetailModel {
         guard state != .moved else { return }
         generation += 1
         let mine = generation
+        let start = self.start
         do {
             let detail = try await history.sleepNightDetail(ringID: ringID, startingAt: start)
             guard mine == generation, state != .moved else { return }
-            if let detail {
-                state = .loaded(SleepNightPage(detail, formatter: formatter))
-            } else {
+            guard let detail else {
                 state = .moved
                 onMoved()
+                return
             }
+            let summary = detail.summary
+            let earlier = summary.isMainSleep
+                ? try await history.sleepNightDetails(
+                    ringID: ringID, from: summary.day.adding(days: -SleepHistoryWindow.lookbackDays), through: summary.day)
+                : []
+            let cover = NightMetrics.sessionCover(summary)
+            let heartRate = try await history.heartRateSummary(ringID: ringID, within: cover)
+            guard mine == generation, state != .moved else { return }
+            state = .loaded(SleepNightPage(detail, earlier: earlier, heartRate: heartRate, formatter: formatter))
         } catch {
             guard mine == generation, state != .moved else { return }
             // A refused load keeps the night shown; it is retried when the app becomes active.

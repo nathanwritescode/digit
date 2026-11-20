@@ -7,6 +7,11 @@ import RingSync
 public protocol RingHistoryReader: Sendable {
     func sleepNights(ringID: UUID, from first: RingDay, through last: RingDay) async throws -> [SleepNightSummary]
     func sleepNightDetail(ringID: UUID, startingAt start: Date) async throws -> SleepNightDetail?
+    /// Every night of the range with its stages, in one read (the Sleep tab and the night screen
+    /// need a month of them; never one read per night).
+    func sleepNightDetails(ringID: UUID, from first: RingDay, through last: RingDay) async throws -> [SleepNightDetail]
+    /// Heart rate from heart-rate records only, over readings inside any of `intervals` (ends inclusive).
+    func heartRateSummary(ringID: UUID, within intervals: [DateInterval]) async throws -> HeartRateSummary?
     func dailySummaries(ringID: UUID, from first: RingDay, through last: RingDay) async throws -> [DailySummary]
 }
 
