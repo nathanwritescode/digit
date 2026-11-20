@@ -27,4 +27,4 @@ swift run ringprobe info
 swift run ringprobe history all --save ../../captures
 ```
 
-Run `swift run ringprobe` with no arguments for the full command list. `history --save` writes one JSON file per kind (`<kind>-<timestamp>.json`) holding the raw bytes as hex plus the header payload, fetch time and time zone needed to decode them later. Health data is only printed with `--show`. The history-delete commands are always refused, and `raw` sends only known read-only commands unless `--allow-unknown` is given.
+Run `swift run ringprobe` with no arguments for the full command list. `history --save` writes one JSON file per kind (`<kind>-<timestamp>.json`) holding the raw bytes as hex plus the header payload, fetch time and time zone needed to decode them later. Health data is only printed with `--show`. Every known delete, reset or factory command (and the groups 0x07xx, 0x0Axx, 0x0Cxx, 0x0Exx) is always refused, even with `--allow-unknown`, and `raw` sends only known read-only commands unless `--allow-unknown` is given.

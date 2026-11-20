@@ -26,8 +26,8 @@ extension Frame {
 
 /// Builders for the frames the app sends.
 ///
-/// The `Health_Delete*` commands (`0x0540`–`0x0552`) are deliberately absent, and the transport
-/// refuses them (`Frame.erasesRingData`).
+/// The `Health_Delete*` commands (`0x0540`–`0x0552`) and every other destructive or reset command are deliberately absent, and the transport
+/// refuses them (`Frame.isDestructive`).
 public enum Command {
     public static let healthGroup: UInt8 = 0x05
 

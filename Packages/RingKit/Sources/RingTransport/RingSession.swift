@@ -4,7 +4,7 @@ import RingProtocol
 /// What `RingSession` needs from a connection to a ring. `RingConnection` is the Bluetooth
 /// implementation; tests supply a scripted one.
 public protocol RingLink: Sendable {
-    /// Conformers must also refuse frames where `erasesRingData` is true, by throwing `RingError.refusedDestructive`.
+    /// Conformers must also refuse frames where `isDestructive` is true, by throwing `RingError.refusedDestructive`.
     ///
     /// Deadline contract: `send` must return or throw within `writeTimeout`, and after it throws
     /// the link must accept the next `send`. The link owns the write deadline because only it can
@@ -484,7 +484,7 @@ public actor RingSession {
     /// subscribers, so their replies could never reach the request.
     public func request(_ command: Frame) async throws -> Frame {
         // Also refused in `transmit`; checked here too so a refusal does not wait for a turn.
-        guard !command.erasesRingData else { throw RingError.refusedDestructive(command) }
+        guard !command.isDestructive else { throw RingError.refusedDestructive(command) }
         guard command.group != Self.eventGroup, command.group != Self.liveGroup else {
             throw RingError.refusedUploadGroup(command)
         }
@@ -615,12 +615,12 @@ public actor RingSession {
         return try await body()
     }
 
-    /// Every write goes through here so the delete-range refusal holds even for a link that forgets it.
+    /// Every write goes through here so the destructive-command refusal holds even for a link that forgets it.
     /// `mayFollowDeadline` is for the history acknowledgement, which comes after `persist` and so
     /// may be written after the conversation's deadline; every other conversation write fails
     /// instead once the deadline has passed while it waits for event acknowledgements.
     private func transmit(_ frame: Frame, acknowledgement: Bool = false, mayFollowDeadline: Bool = false) async throws {
-        guard !frame.erasesRingData else { throw RingError.refusedDestructive(frame) }
+        guard !frame.isDestructive else { throw RingError.refusedDestructive(frame) }
         // After `stop`, only event acknowledgements are still written; checked again at the write
         // turn, since `stop` can come while this waits.
         guard acknowledgement || readerState == .running else { throw RingError.stopped }

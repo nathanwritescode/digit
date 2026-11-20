@@ -35,9 +35,39 @@ public struct Frame: Equatable, Sendable {
     /// A one-byte payload of `0xFB…0xFF` is the ring rejecting the command.
     public var isErrorReply: Bool { payload.count == 1 && payload[0] >= 0xFB }
 
-    /// True for the `Health_Delete*` range (`0x0540`–`0x0552`), which erases stored history.
-    /// The transport refuses to send these. Other commands that reset the ring may exist and are not covered.
-    public var erasesRingData: Bool { group == 0x05 && (0x40...0x52).contains(key) }
+    /// True for every known command that deletes stored data, resets the ring or puts it into a
+    /// firmware, factory or raw-collection mode. The transport refuses to send these, and
+    /// `ringprobe raw --allow-unknown` does not override that. This is the one place the list lives.
+    ///
+    /// Names and numbers come from public YCBT references that were themselves derived from the
+    /// vendor SDK (owner decision, #83). None was sent to this ring; refusing needs no validation,
+    /// sending one would. A command missing from here is not thereby safe: unknown commands are
+    /// still limited by the read-only allowlist.
+    public var isDestructive: Bool { Self.isDestructive(type: type) }
+
+    public static func isDestructive(type: UInt16) -> Bool {
+        let group = UInt8(type >> 8)
+        switch group {
+        // Whole groups with no permitted documentation and factory, update or collection roles.
+        case 0x07: return true  // raw collection (includes deletes 0x0730, 0x0731)
+        case 0x0A: return true  // firmware update
+        case 0x0C: return true  // self-inspection
+        case 0x0E: return true  // factory test
+        default: break
+        }
+        if (0x0540...0x0552).contains(type) { return true }  // Health_Delete*
+        switch type {
+        case 0x0568: return true  // delete (health data family)
+        case 0x0575: return true  // delete (health data family)
+        case 0x0578: return true  // delete (health data family)
+        case 0x010E: return true  // restore factory settings; reported to wipe the record store (R99, fw 2.32)
+        case 0x0151: return true  // reset
+        case 0x0157: return true  // reset
+        case 0x0316: return true  // reset
+        case 0x0809: return true  // reset / factory state
+        default: return false
+        }
+    }
 
     public func encoded() -> [UInt8] {
         let length = Frame.overhead + payload.count
