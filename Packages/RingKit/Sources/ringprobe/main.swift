@@ -43,7 +43,7 @@ Options:
 
 Always refused, even with --allow-unknown: every known delete, reset or factory command
 (0x0540-0x0552, 0x0568, 0x0575, 0x0578, 0x0730, 0x0731, 0x010E, 0x0151, 0x0157, 0x0316,
-0x0809) and the whole groups 0x07xx, 0x0Axx, 0x0Cxx and 0x0Exx. `raw` sends only known
+0x0809, 0x031A, 0x031B) and the whole groups 0x07xx, 0x0Axx, 0x0Cxx and 0x0Exx. `raw` sends only known
 read-only commands, with their documented payloads, unless --allow-unknown is given.
 """
 

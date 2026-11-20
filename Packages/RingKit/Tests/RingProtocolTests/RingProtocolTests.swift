@@ -50,19 +50,25 @@ private let utc = TimeZone(identifier: "UTC")!
 }
 
 @Test func everyKnownDestructiveOrResetCommandIsFlagged() {
-    let single: [UInt16] = [0x0568, 0x0575, 0x0578, 0x0730, 0x0731, 0x010E, 0x0151, 0x0157, 0x0316, 0x0809]
-    for type in single { #expect(Frame(group: UInt8(type >> 8), key: UInt8(type & 0xFF)).isDestructive, "\(type)") }
+    let single: [UInt16] = [0x0568, 0x0575, 0x0578, 0x0730, 0x0731, 0x010E, 0x0151, 0x0157, 0x0316, 0x0809, 0x031A, 0x031B]
+    for type in single { #expect(Frame(group: UInt8(type >> 8), key: UInt8(type & 0xFF)).isDestructive, "\(String(format: "%04X", type))") }
     for group in [0x07, 0x0A, 0x0C, 0x0E] as [UInt8] {
         for key in [0x00, 0x01, 0x80, 0xFE, 0xFF] as [UInt8] { #expect(Frame(group: group, key: key).isDestructive) }
     }
     for type in single + [0x0540, 0x0552] { #expect(!Command.knownReadOnlyTypes.contains(type)) }
 }
 
+@Test func oversizedPayloadIsNotEncodable() {
+    #expect(Frame(group: 0x02, key: 0x00, payload: [UInt8](repeating: 0, count: Frame.maximumPayload)).isEncodable)
+    #expect(!Frame(group: 0x02, key: 0x00, payload: [UInt8](repeating: 0, count: Frame.maximumPayload + 1)).isEncodable)
+    #expect(!Frame(group: 0x02, key: 0x00, payload: [UInt8](repeating: 0, count: 70_000)).isEncodable)
+}
+
 @Test func neighbouringReadCommandsAreNotFlagged() {
     let reads: [UInt16] = [0x0566, 0x0573, 0x0576, 0x0502, 0x0504, 0x0506, 0x0509, 0x0100, 0x010C, 0x0200, 0x020C,
                            0x053F, 0x0553, 0x0567, 0x0569, 0x0574, 0x0579, 0x010D, 0x010F, 0x0150, 0x0152, 0x0156,
-                           0x0158, 0x0315, 0x0317, 0x0808, 0x080A, 0x0600, 0x06FF, 0x0800, 0x0B00, 0x0D00, 0x0F00]
-    for type in reads { #expect(!Frame(group: UInt8(type >> 8), key: UInt8(type & 0xFF)).isDestructive, "\(type)") }
+                           0x0158, 0x0315, 0x0317, 0x0808, 0x080A, 0x0600, 0x06FF, 0x0800, 0x0B00, 0x0D00, 0x0F00, 0x0319, 0x031C]
+    for type in reads { #expect(!Frame(group: UInt8(type >> 8), key: UInt8(type & 0xFF)).isDestructive, "\(String(format: "%04X", type))") }
     #expect(!Frame(group: 0x04, key: 0x0E).isDestructive)
 }
 
