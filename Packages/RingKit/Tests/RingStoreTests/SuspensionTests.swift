@@ -255,6 +255,16 @@ private func insertRing(_ db: Database, _ id: UUID) throws {
                 await #expect(throws: RingStoreError.suspended) { try await store.rings() }
                 await #expect(throws: RingStoreError.suspended) { try await store.transfers(ringID: ringID) }
                 await #expect(throws: RingStoreError.suspended) { try await store.latestSleepNight(ringID: ringID) }
+                let days = (first: RingDay(year: 2027, month: 1, day: 1), last: RingDay(year: 2027, month: 1, day: 30))
+                await #expect(throws: RingStoreError.suspended) {
+                    try await store.sleepNights(ringID: ringID, from: days.first, through: days.last)
+                }
+                await #expect(throws: RingStoreError.suspended) {
+                    try await store.sleepNightDetail(ringID: ringID, startingAt: Date(timeIntervalSince1970: 0))
+                }
+                await #expect(throws: RingStoreError.suspended) {
+                    try await store.dailySummaries(ringID: ringID, from: days.first, through: days.last)
+                }
                 await #expect(throws: RingStoreError.suspended) {
                     try await store.registerRing(protocolFamily: "ycbt")
                 }

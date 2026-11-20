@@ -17,25 +17,119 @@ struct ContentView: View {
     }
 }
 
+/// Once the paired ring has been read: Sleep, Days and Ring tabs.
 struct ReadyView: View {
     let model: DigitModel
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if let failure = model.loadFailure {
-                    ErrorScreen(message: failure) {
-                        Task { await model.load() }
+        if let failure = model.loadFailure {
+            NavigationStack {
+                ErrorScreen(message: failure) {
+                    Task { await model.retryLoad() }
+                }
+                .navigationTitle("Digit")
+            }
+        } else if !model.pairedRing.isLoaded {
+            ProgressView("Loading…")
+        } else {
+            AppTabs(model: model)
+        }
+    }
+}
+
+enum AppTab: Hashable {
+    case sleep, days, ring
+}
+
+struct AppTabs: View {
+    let model: DigitModel
+    /// Starts on the Ring tab when no ring is paired, so pairing is the first thing seen.
+    @State private var selection: AppTab
+
+    init(model: DigitModel) {
+        self.model = model
+        _selection = State(initialValue: model.pairedRing.canSync ? .sleep : .ring)
+    }
+
+    var body: some View {
+        TabView(selection: $selection) {
+            Tab("Sleep", systemImage: "bed.double", value: AppTab.sleep) {
+                NavigationStack { SleepListView(model: model) }
+            }
+            Tab("Days", systemImage: "figure.walk", value: AppTab.days) {
+                NavigationStack { DaysView(days: model.days) }
+            }
+            Tab("Ring", systemImage: "circle.circle", value: AppTab.ring) {
+                NavigationStack {
+                    Group {
+                        if model.pairedRing.canSync {
+                            PairedRingView(model: model)
+                        } else {
+                            PairingView(pairing: model.pairing)
+                        }
                     }
-                } else if !model.pairedRing.isLoaded {
-                    ProgressView("Loading…")
-                } else if model.pairedRing.canSync {
-                    PairedRingView(model: model)
-                } else {
-                    PairingView(pairing: model.pairing)
+                    .navigationTitle("Ring")
                 }
             }
-            .navigationTitle("Digit")
+        }
+    }
+}
+
+/// The empty, not-paired and failed states shared by the data screens.
+struct DataStateView<Value: Sendable & Equatable, Content: View>: View {
+    let state: DataState<Value>
+    /// What the screen holds, for "Sync your ring to see your …".
+    let subject: String
+    /// Reloads: "Try Again" after a failure, "Refresh" when there is no data yet.
+    let retry: () async -> Void
+    @ViewBuilder let content: (Value) -> Content
+
+    var body: some View {
+        switch state {
+        case .loading:
+            ProgressView("Loading…")
+        case .notPaired:
+            ContentUnavailableView(
+                "No Ring Paired", systemImage: "circle.dashed",
+                description: Text("Pair your ring in the Ring tab to see your \(subject)."))
+        case .noData:
+            ContentUnavailableView {
+                Label("Nothing Yet", systemImage: "arrow.triangle.2.circlepath")
+            } description: {
+                Text("Sync your ring to see your \(subject).")
+            } actions: {
+                Button("Refresh") { Task { await retry() } }
+            }
+        case .failed(let message):
+            ContentUnavailableView {
+                Label("Couldn't Load", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(message)
+            } actions: {
+                Button("Try Again") { Task { await retry() } }
+            }
+        case .loaded(let value):
+            content(value)
+        }
+    }
+}
+
+/// "Times uncertain", with its one-line explanation when asked.
+struct UncertaintyLabel: View {
+    let marker: String
+    let explanation: String?
+    var showsExplanation = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Label(marker, systemImage: "questionmark.circle")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            if showsExplanation, let explanation {
+                Text(explanation)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }
