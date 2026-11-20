@@ -27,6 +27,10 @@ public struct HeartRateDaySummary: Equatable, Sendable {
     }
 }
 
+/// Heart rate over any stretch of time, from heart-rate records only (see
+/// `RingStore.heartRateSummary(ringID:within:)`). The same fields as a day's.
+public typealias HeartRateSummary = HeartRateDaySummary
+
 /// Steps and heart rate for one day on the ring's own clock. See
 /// `RingStore.dailySummaries(ringID:from:through:)` for the rules.
 public struct DailySummary: Equatable, Sendable {
@@ -167,5 +171,48 @@ extension RingStore {
                         meanBPM: Int((Double(partial.bpmSum) / Double(partial.readings)).rounded())),
                 timeSource: sources[partial.rank])
         }
+    }
+}
+
+extension RingStore {
+    /// Heart rate over the readings whose instant lies in any of `intervals`, from
+    /// `heart_rate_reading` only, never the combined record (as for `dailySummaries`). Both ends of
+    /// each interval are inclusive, at whole milliseconds (the stored precision; an end is
+    /// truncated to its millisecond); a reading inside two overlapping intervals counts once.
+    /// Instants only: a reading's `utc_offset_seconds` plays no part. `nil` when no reading falls
+    /// inside, or `intervals` is empty (still a guarded read, so it is refused while suspended).
+    ///
+    /// Used for a night's sleeping heart rate, with one interval per stretch its sessions cover.
+    public func heartRateSummary(ringID: UUID, within intervals: [DateInterval]) async throws -> HeartRateSummary? {
+        try await read { db in try Self.heartRateSummary(db, ringID: ringID, within: intervals) }
+    }
+
+    static func heartRateSummary(_ db: Database, ringID: UUID, within intervals: [DateInterval]) throws
+        -> HeartRateSummary?
+    {
+        guard !intervals.isEmpty else { return nil }
+        var arguments: StatementArguments = [ringID.uuidString]
+        var conditions: [String] = []
+        for interval in intervals {
+            conditions.append("(time >= ? AND time <= ?)")
+            arguments += [
+                HistoryTransfer.millisecondsSince1970(interval.start), HistoryTransfer.millisecondsSince1970(interval.end),
+            ]
+        }
+        guard
+            let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT COUNT(*) AS readings, SUM(bpm) AS bpm_sum, MIN(bpm) AS minimum, MAX(bpm) AS maximum
+                    FROM heart_rate_reading WHERE ring_id = ? AND (\(conditions.joined(separator: " OR ")))
+                    """,
+                arguments: arguments)
+        else { return nil }
+        let readings: Int = try column(row, "readings")
+        guard readings > 0 else { return nil }
+        let sum: Int = try column(row, "bpm_sum")
+        return HeartRateSummary(
+            readingCount: readings, minimumBPM: try column(row, "minimum"), maximumBPM: try column(row, "maximum"),
+            meanBPM: Int((Double(sum) / Double(readings)).rounded()))
     }
 }

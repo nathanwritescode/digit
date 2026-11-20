@@ -37,6 +37,11 @@ public struct HealthFormatter: Sendable {
         Self.wholeMinutes(seconds).formatted(durationStyle(width: .wide))
     }
 
+    /// Compact, for chart labels: "1h 10m" in en_GB.
+    public func compactDuration(seconds: Int) -> String {
+        Self.wholeMinutes(seconds).formatted(durationStyle(width: .narrow))
+    }
+
     // MARK: Times and days
 
     /// The zone a row's times are shown in: a fixed offset, never the device's zone.
@@ -66,7 +71,35 @@ public struct HealthFormatter: Sendable {
                 .weekday(.wide).day().month(.wide))
     }
 
+    /// The day's weekday as one letter ("F"), for a chart's day axis. Read in GMT, since a
+    /// `RingDay` is.
+    public func weekdayLetter(_ day: RingDay) -> String {
+        day.gmtMidnight.addingTimeInterval(12 * 3600).formatted(
+            Date.FormatStyle(locale: locale, calendar: calendar(in: .gmt), timeZone: .gmt).weekday(.narrow))
+    }
+
+    /// The day's weekday in full ("Friday"), for VoiceOver beside `weekdayLetter`.
+    public func weekday(_ day: RingDay) -> String {
+        day.gmtMidnight.addingTimeInterval(12 * 3600).formatted(
+            Date.FormatStyle(locale: locale, calendar: calendar(in: .gmt), timeZone: .gmt).weekday(.wide))
+    }
+
+    /// A time of day given as seconds after midnight, with no date or zone involved ("23:10").
+    public func timeOfDay(secondsAfterMidnight seconds: Int) -> String {
+        time(Date(timeIntervalSince1970: TimeInterval(seconds.modulo(86_400))), utcOffsetSeconds: 0)
+    }
+
     // MARK: Values
+
+    /// "87%", from a fraction.
+    public func percent(_ fraction: Double) -> String {
+        fraction.formatted(.percent.precision(.fractionLength(0)).locale(locale))
+    }
+
+    /// "58 bpm".
+    public func bpm(_ value: Int) -> String {
+        "\(number(value)) bpm"
+    }
 
     public func number(_ value: Int) -> String {
         value.formatted(.number.locale(locale))

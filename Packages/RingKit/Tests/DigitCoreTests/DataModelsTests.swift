@@ -69,6 +69,8 @@ final class FakeHistory: RingHistoryReader, @unchecked Sendable {
     private var _nights: [SleepNightSummary] = []
     private var _details: [Date: SleepNightDetail] = [:]
     private var _days: [DailySummary] = []
+    private var _heartRate: HeartRateSummary?
+    private var _intervals: [[DateInterval]] = []
     private var _failure: (any Error)?
     private var _calls: [String] = []
     private var _ranges: [String] = []
@@ -76,6 +78,10 @@ final class FakeHistory: RingHistoryReader, @unchecked Sendable {
     var nights: [SleepNightSummary] { get { lock.withLock { _nights } } set { lock.withLock { _nights = newValue } } }
     var details: [Date: SleepNightDetail] { get { lock.withLock { _details } } set { lock.withLock { _details = newValue } } }
     var days: [DailySummary] { get { lock.withLock { _days } } set { lock.withLock { _days = newValue } } }
+    /// Returned by every `heartRateSummary` call.
+    var heartRate: HeartRateSummary? { get { lock.withLock { _heartRate } } set { lock.withLock { _heartRate = newValue } } }
+    /// The intervals each `heartRateSummary` call asked for.
+    var heartRateIntervals: [[DateInterval]] { lock.withLock { _intervals } }
     /// Thrown by every call while set.
     var failure: (any Error)? { get { lock.withLock { _failure } } set { lock.withLock { _failure = newValue } } }
     var calls: [String] { lock.withLock { _calls } }
@@ -99,6 +105,21 @@ final class FakeHistory: RingHistoryReader, @unchecked Sendable {
     func sleepNightDetail(ringID: UUID, startingAt start: Date) async throws -> SleepNightDetail? {
         try record("sleepNightDetail")
         return details[start]
+    }
+
+    /// Details for the nights in `details` whose day is in range, else the bare summaries in
+    /// `nights` with no stages.
+    func sleepNightDetails(ringID: UUID, from first: RingDay, through last: RingDay) async throws -> [SleepNightDetail] {
+        try record("sleepNightDetails", first, last)
+        let all = nights.map { details[$0.start] ?? SleepNightDetail(summary: $0, stages: []) }
+            + details.values.filter { detail in !nights.contains { $0.start == detail.summary.start } }
+        return all.filter { first <= $0.summary.day && $0.summary.day <= last }.sorted { $0.summary.start < $1.summary.start }
+    }
+
+    func heartRateSummary(ringID: UUID, within intervals: [DateInterval]) async throws -> HeartRateSummary? {
+        try record("heartRateSummary")
+        lock.withLock { _intervals.append(intervals) }
+        return heartRate
     }
 
     func dailySummaries(ringID: UUID, from first: RingDay, through last: RingDay) async throws -> [DailySummary] {

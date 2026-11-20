@@ -54,7 +54,7 @@ struct AppTabs: View {
     var body: some View {
         TabView(selection: $selection) {
             Tab("Sleep", systemImage: "bed.double", value: AppTab.sleep) {
-                NavigationStack { SleepListView(model: model) }
+                NavigationStack { SleepTabView(model: model) }
             }
             Tab("Days", systemImage: "figure.walk", value: AppTab.days) {
                 NavigationStack { DaysView(days: model.days) }

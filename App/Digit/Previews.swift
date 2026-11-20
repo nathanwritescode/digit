@@ -25,8 +25,9 @@ private final class PreviewBackgroundTasks: BackgroundTaskRunner {
 }
 
 /// SYNTHETIC sleep, steps and heart rate for previews, made up in code relative to now: a main
-/// sleep each night (the second-latest with uncertain times), one afternoon nap, and a day of steps
-/// and heart rate for each of the last week. Nothing comes from a ring or a capture.
+/// sleep on each of the last 40 nights (varied by a fixed pattern, one night missing, one with
+/// uncertain times, some with an interruption), one afternoon nap, and a day of steps and heart
+/// rate for each of the last week. Nothing comes from a ring or a capture.
 private struct PreviewHistory: RingHistoryReader {
     let empty: Bool
 
@@ -34,49 +35,66 @@ private struct PreviewHistory: RingHistoryReader {
     private static var today: RingDay { RingDay(instant: Date(), utcOffsetSeconds: offset) }
 
     private static func nights() -> [SleepNightDetail] {
-        (0..<7).flatMap { back -> [SleepNightDetail] in
+        (0..<40).filter { $0 != 3 }.flatMap { back -> [SleepNightDetail] in
             let day = today.adding(days: -back)
-            // 23:10 the evening before to about 06:40.
-            let start = day.gmtMidnight.addingTimeInterval(-50 * 60 + Double(back * 7 * 60))
+            let vary = (back * 7) % 11  // 0 to 10, a fixed made-up pattern
+            // About 23:00 the evening before, give or take, to about 06:30.
+            let start = day.gmtMidnight.addingTimeInterval(Double(-60 + vary * 6) * 60)
             let pattern: [(SleepStageKind, Int)] = [
-                (.light, 25), (.deep, 50), (.light, 40), (.rem, 20), (.light, 45), (.deep, 35),
-                (.light, 50), (.rem, 30), (.light, 55), (.rem, 35), (.light, 25),
+                (.light, 20 + vary), (.deep, 45 + vary * 2), (.light, 40), (.rem, 20), (.light, 45), (.deep, 30),
+                (.light, 50 - vary), (.rem, 30 + vary), (.light, 55), (.rem, 35), (.light, 25),
             ]
             var stages: [SleepStageEntry] = []
+            var interruptions: [SleepInterruption] = []
             var t = start
-            for (kind, minutes) in pattern {
+            for (index, (kind, minutes)) in pattern.enumerated() {
+                if index == 6, vary % 3 == 0 {
+                    let gap = Double(8 + vary * 2) * 60
+                    interruptions.append(SleepInterruption(start: t, end: t.addingTimeInterval(gap)))
+                    t = t.addingTimeInterval(gap)
+                }
                 stages.append(SleepStageEntry(kind: kind, start: t, durationSeconds: minutes * 60))
                 t = t.addingTimeInterval(Double(minutes * 60 + 1))
             }
-            var main = summary(day: day, stages: stages, main: true)
+            var main = summary(day: day, stages: stages, interruptions: interruptions, main: true)
             if back == 1 { main.timeSource = .ambiguous }
             guard back == 2 else { return [SleepNightDetail(summary: main, stages: stages)] }
             let napStart = day.gmtMidnight.addingTimeInterval(14 * 3600 + 20 * 60)
             let nap = [SleepStageEntry(kind: .light, start: napStart, durationSeconds: 25 * 60)]
             return [
                 SleepNightDetail(summary: main, stages: stages),
-                SleepNightDetail(summary: summary(day: day, stages: nap, main: false), stages: nap),
+                SleepNightDetail(summary: summary(day: day, stages: nap, interruptions: [], main: false), stages: nap),
             ]
         }
     }
 
-    private static func summary(day: RingDay, stages: [SleepStageEntry], main: Bool) -> SleepNightSummary {
+    private static func summary(
+        day: RingDay, stages: [SleepStageEntry], interruptions: [SleepInterruption], main: Bool
+    ) -> SleepNightSummary {
         var byKind = Dictionary(uniqueKeysWithValues: SleepStageKind.allCases.map { ($0, 0) })
         for stage in stages { byKind[stage.kind, default: 0] += stage.durationSeconds }
         let last = stages[stages.count - 1]
         return SleepNightSummary(
             day: day, utcOffsetSeconds: offset, start: stages[0].start,
             end: last.start.addingTimeInterval(Double(last.durationSeconds)), secondsByKind: byKind,
-            secondsAsleep: byKind.filter { $0.key != .awake }.values.reduce(0, +), interruptions: [],
+            secondsAsleep: byKind.filter { $0.key != .awake }.values.reduce(0, +), interruptions: interruptions,
             timeSource: .resolved, isMainSleep: main)
     }
 
     func sleepNights(ringID: UUID, from first: RingDay, through last: RingDay) async throws -> [SleepNightSummary] {
-        empty ? [] : Self.nights().map(\.summary)
+        try await sleepNightDetails(ringID: ringID, from: first, through: last).map(\.summary)
     }
 
     func sleepNightDetail(ringID: UUID, startingAt start: Date) async throws -> SleepNightDetail? {
         Self.nights().first { $0.summary.start == start }
+    }
+
+    func sleepNightDetails(ringID: UUID, from first: RingDay, through last: RingDay) async throws -> [SleepNightDetail] {
+        empty ? [] : Self.nights().filter { first <= $0.summary.day && $0.summary.day <= last }.sorted { $0.summary.start < $1.summary.start }
+    }
+
+    func heartRateSummary(ringID: UUID, within intervals: [DateInterval]) async throws -> HeartRateSummary? {
+        empty || intervals.isEmpty ? nil : HeartRateSummary(readingCount: 42, minimumBPM: 49, maximumBPM: 66, meanBPM: 55)
     }
 
     func dailySummaries(ringID: UUID, from first: RingDay, through last: RingDay) async throws -> [DailySummary] {
@@ -141,7 +159,11 @@ private struct NightPreviewHost: View {
 }
 
 #Preview("Not paired") { PreviewHost(paired: false) }
-#Preview("Paired") { PreviewHost(paired: true) }
+#Preview("Sleep") { PreviewHost(paired: true) }
+#Preview("Sleep, dark") { PreviewHost(paired: true).preferredColorScheme(.dark) }
+#Preview("Sleep, accessibility size") { PreviewHost(paired: true).environment(\.dynamicTypeSize, .accessibility3) }
 #Preview("Paired, no data yet") { PreviewHost(paired: true, withData: false) }
 #Preview("Night") { NightPreviewHost() }
+#Preview("Night, dark") { NightPreviewHost().preferredColorScheme(.dark) }
+#Preview("Night, accessibility size") { NightPreviewHost().environment(\.dynamicTypeSize, .accessibility3) }
 #endif

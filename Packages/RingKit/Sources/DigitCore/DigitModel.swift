@@ -21,6 +21,9 @@ public final class DigitModel {
     public let pairing: PairingModel
     public let sync: SyncModel
     public let lifecycle: SuspensionLifecycle
+    /// The Sleep tab's cards.
+    public let overview: SleepOverviewModel
+    /// Every night of the window, behind "See all nights".
     public let sleep: SleepListModel
     public let days: DailyModel
     /// Why the paired ring could not be read from the store, if it could not.
@@ -46,6 +49,8 @@ public final class DigitModel {
         self.lifecycle = lifecycle
         self.pairing = PairingModel(pairedRing: pairedRing, services: services, lifecycle: lifecycle)
         self.sync = SyncModel(pairedRing: pairedRing, services: services, lifecycle: lifecycle)
+        self.overview = SleepOverviewModel(
+            pairedRing: pairedRing, history: services.history, now: services.now, timeZone: services.timeZone)
         self.sleep = SleepListModel(
             pairedRing: pairedRing, history: services.history, now: services.now, timeZone: services.timeZone)
         self.days = DailyModel(
@@ -56,13 +61,20 @@ public final class DigitModel {
         }
     }
 
-    /// The model for one night's screen, opened from the sleep list. When the night has moved, the
-    /// sleep list reloads.
+    /// The model for one night's screen, opened from the Sleep tab or the list of nights. Previous
+    /// and next move between the main sleeps the list holds. When the night has moved, the Sleep
+    /// tab and the list reload.
     public func nightDetail(startingAt start: Date) -> NightDetailModel? {
         guard let ringID = pairedRing.ring?.id else { return nil }
-        let model = NightDetailModel(ringID: ringID, start: start, history: services.history) { [weak self] in
+        let mains = (sleep.state.value ?? []).flatMap(\.nights).map(\.summary).filter(\.isMainSleep).map(\.start)
+        let model = NightDetailModel(
+            ringID: ringID, start: start, history: services.history, mainSleepStarts: mains
+        ) { [weak self] in
             guard let self else { return }
-            Task { await self.sleep.reload() }
+            Task {
+                await self.overview.reload()
+                await self.sleep.reload()
+            }
         }
         nightDetail = model
         return model
@@ -71,6 +83,7 @@ public final class DigitModel {
     /// Reloads every data model. Reads are short and are refused cleanly by a suspension, so they
     /// are not ring work and take no background task.
     public func reloadData() async {
+        await overview.reload()
         await sleep.reload()
         await days.reload()
         await nightDetail?.reload()

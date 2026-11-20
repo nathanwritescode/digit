@@ -191,3 +191,66 @@ private func all(_ f: Fixture) async throws -> [DailySummary] {
         #expect(days.first?.heartRate == nil)
     }
 }
+
+/// `heartRateSummary(ringID:within:)`: a night's sleeping heart rate. SYNTHETIC rows, as above.
+@Suite(.timeLimit(.minutes(1))) struct HeartRateSummaryTests {
+    private func summary(_ f: Fixture, _ intervals: [DateInterval]) async throws -> HeartRateSummary? {
+        try await f.store.heartRateSummary(ringID: f.ring.id, within: intervals)
+    }
+
+    @Test func ingestedHeartRateOnlyNeverTheCombinedRecord() async throws {
+        try await onEachStoreAsync { store in
+            let f = try clockedFixture(store, kinds: [.heartRate, .combined])
+            func ring(_ seconds: Double) -> UInt32 { wall(t0.addingTimeInterval(seconds), offset: plus1) }
+            try f.fetch(.heartRate, hrBytes(ring(600), bpm: 52) + hrBytes(ring(1200), bpm: 57), at: t0.addingTimeInterval(7200))
+            // The combined record's own heart rate, inside the interval, must not count.
+            try f.fetch(.combined, combinedBytes(ring(900), steps: 0, hr: 150, spo2: 97), at: t0.addingTimeInterval(7200))
+            for kind in [HistoryKind.heartRate, .combined] { _ = try await store.ingest(ringID: f.ring.id, kind: kind) }
+            #expect(try await store.vitalsReadings(ringID: f.ring.id).count == 1)
+            let all = DateInterval(start: t0, end: t0.addingTimeInterval(3600))
+            #expect(try await summary(f, [all]) == HeartRateSummary(readingCount: 2, minimumBPM: 52, maximumBPM: 57, meanBPM: 55))
+        }
+    }
+
+    @Test func boundsAreInclusiveAtBothEnds() async throws {
+        let f = try Fixture(RingStore())
+        try insertHeartRate(f, at: utc(1), bpm: 50)
+        try insertHeartRate(f, at: utc(2), bpm: 60)
+        try insertHeartRate(f, at: utc(3), bpm: 70)
+        #expect(try await summary(f, [DateInterval(start: utc(1), end: utc(3))])?.readingCount == 3)
+        #expect(try await summary(f, [DateInterval(start: utc(1), end: utc(2))])?.meanBPM == 55)
+        // A millisecond short at either end leaves that reading out.
+        let inside = DateInterval(start: utc(1).addingTimeInterval(0.001), end: utc(3).addingTimeInterval(-0.001))
+        #expect(try await summary(f, [inside]) == HeartRateSummary(readingCount: 1, minimumBPM: 60, maximumBPM: 60, meanBPM: 60))
+        #expect(try await summary(f, [DateInterval(start: utc(4), end: utc(5))]) == nil)
+    }
+
+    @Test func severalIntervalsLeaveTheGapsOutAndCountAReadingOnce() async throws {
+        let f = try Fixture(RingStore())
+        for (hours, bpm) in [(1.0, 50), (2.0, 90), (3.0, 60), (4.0, 61)] { try insertHeartRate(f, at: utc(hours), bpm: bpm) }
+        // A night from 01:00 to 04:00 with an interruption around 02:00.
+        let cover = [DateInterval(start: utc(0.5), end: utc(1.5)), DateInterval(start: utc(2.5), end: utc(4))]
+        #expect(try await summary(f, cover) == HeartRateSummary(readingCount: 3, minimumBPM: 50, maximumBPM: 61, meanBPM: 57))
+        // Overlapping intervals count a reading once.
+        let overlapping = [DateInterval(start: utc(0), end: utc(3)), DateInterval(start: utc(2.5), end: utc(3.5))]
+        #expect(try await summary(f, overlapping)?.readingCount == 3)
+        #expect(try await summary(f, []) == nil)
+    }
+
+    @Test func instantsOnlyWhateverTheRowsOffsetAndOtherRingsLeftOut() async throws {
+        let f = try Fixture(RingStore())
+        let other = try await f.store.registerRing(protocolFamily: "ycbt").id
+        // The same instant at three offsets: all inside an interval of instants.
+        try insertHeartRate(f, at: utc(2), bpm: 50, offset: -5 * 3600)
+        try insertHeartRate(f, at: utc(2.1), bpm: 60, offset: 0)
+        try insertHeartRate(f, at: utc(2.2), bpm: 70, offset: 9 * 3600, source: .assumed)
+        try insertHeartRate(f, at: utc(2), bpm: 140, ring: other)
+        #expect(try await summary(f, [DateInterval(start: utc(1.9), end: utc(2.3))])
+            == HeartRateSummary(readingCount: 3, minimumBPM: 50, maximumBPM: 70, meanBPM: 60))
+        // Halves round away from zero, as for days: 60 and 61 average 60.5.
+        try insertHeartRate(f, at: utc(10), bpm: 60)
+        try insertHeartRate(f, at: utc(10.5), bpm: 61)
+        #expect(try await summary(f, [DateInterval(start: utc(10), end: utc(11))])?.meanBPM == 61)
+    }
+}
+
