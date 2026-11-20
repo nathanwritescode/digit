@@ -57,6 +57,12 @@ public struct SleepStageEntry: Equatable, Sendable {
     public var kind: SleepStageKind
     public var start: Date
     public var durationSeconds: Int
+
+    public init(kind: SleepStageKind, start: Date, durationSeconds: Int) {
+        self.kind = kind
+        self.start = start
+        self.durationSeconds = durationSeconds
+    }
 }
 
 public struct SleepSessionRecord: Equatable, Sendable {

@@ -12,7 +12,7 @@ struct DigitModelTests {
     private func model(_ registry: SuspendingRegistry, _ access: FakeRingAccess) -> DigitModel {
         DigitModel(
             services: DigitServices(
-                ringAccess: access, registry: registry,
+                ringAccess: access, registry: registry, history: registry.base,
                 makeSync: { _, _ in fatalError("no sync in these tests") }),
             backgroundTasks: FakeBackgroundTasks(), announce: {}, suspend: {}, resume: {})
     }

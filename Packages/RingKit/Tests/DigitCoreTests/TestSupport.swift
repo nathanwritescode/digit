@@ -248,7 +248,7 @@ final class Fixture {
         let store = self.store
         let log = self.log
         let services = DigitServices(
-            ringAccess: access, registry: registry,
+            ringAccess: access, registry: registry, history: store,
             makeSync: { ring, ringID in
                 LoggingPhases(
                     syncer: RingSyncer(

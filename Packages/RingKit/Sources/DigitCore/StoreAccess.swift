@@ -29,26 +29,34 @@ extension RingSyncer: SyncPhases {}
 public struct DigitServices: Sendable {
     public var ringAccess: any RingAccess
     public var registry: any RingRegistry
+    /// The reads behind the sleep and Days screens.
+    public var history: any RingHistoryReader
     /// Builds the sync for one connected ring and one stored ring.
     public var makeSync: @Sendable (_ ring: any SyncableRing, _ ringID: UUID) -> any SyncPhases
     public var now: @Sendable () -> Date
+    /// The device's zone, used only to say which days are recent (`RecentDays`), never to show a time.
+    public var timeZone: @Sendable () -> TimeZone
 
     public init(
         ringAccess: any RingAccess,
         registry: any RingRegistry,
+        history: any RingHistoryReader,
         makeSync: @escaping @Sendable (_ ring: any SyncableRing, _ ringID: UUID) -> any SyncPhases,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        timeZone: @escaping @Sendable () -> TimeZone = { TimeZone.autoupdatingCurrent }
     ) {
         self.ringAccess = ringAccess
         self.registry = registry
+        self.history = history
         self.makeSync = makeSync
         self.now = now
+        self.timeZone = timeZone
     }
 
     /// The production wiring: one store for everything, and `RingSyncer` with the default
     /// monitoring interval and the foreground budget.
     public init(ringAccess: any RingAccess, store: RingStore) {
-        self.init(ringAccess: ringAccess, registry: store, makeSync: { ring, ringID in
+        self.init(ringAccess: ringAccess, registry: store, history: store, makeSync: { ring, ringID in
             RingSyncer(
                 ring: ring, store: store, ringID: ringID,
                 monitoringInterval: SyncSettings.monitoringInterval, budget: SyncSettings.foregroundBudget)

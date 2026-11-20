@@ -11,33 +11,6 @@ import RingProtocol
 // returning one row per session and kind (the totals). The stage rows themselves are fetched only
 // for a night's detail. Windowed grouping is tracked in #44.
 
-/// A calendar day on the ring's own clock. Not a `Date`: it carries no time zone.
-public struct SleepDay: Comparable, Hashable, Sendable {
-    public var year: Int
-    public var month: Int
-    public var day: Int
-
-    public init(year: Int, month: Int, day: Int) {
-        self.year = year
-        self.month = month
-        self.day = day
-    }
-
-    public static func < (a: SleepDay, b: SleepDay) -> Bool {
-        (a.year, a.month, a.day) < (b.year, b.month, b.day)
-    }
-
-    /// The Gregorian day of `instant` on a clock `utcOffsetSeconds` ahead of UTC, read in GMT.
-    /// Never uses the device's time zone.
-    public init(instant: Date, utcOffsetSeconds: Int) {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone.gmt
-        let parts = calendar.dateComponents(
-            [.year, .month, .day], from: instant.addingTimeInterval(TimeInterval(utcOffsetSeconds)))
-        self.init(year: parts.year!, month: parts.month!, day: parts.day!)
-    }
-}
-
 /// A gap between two consecutive sessions of one night.
 public struct SleepInterruption: Equatable, Sendable {
     public var start: Date
@@ -338,7 +311,8 @@ extension RingStore {
         return nights
     }
 
-    private static func rank(_ source: TimeSource) -> Int {
+    /// Certainty order for "the least certain source" (nights here, days in `DailySummaries.swift`).
+    static func rank(_ source: TimeSource) -> Int {
         // Exhaustive on purpose: a new case must be placed in the order here.
         switch source {
         case .resolved: 0

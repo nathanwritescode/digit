@@ -31,6 +31,10 @@ public final class PairedRing {
     public internal(set) var isLoaded = false
     /// The flow using the ring, if any.
     public private(set) var activity: Activity?
+    /// Called when a flow that held the ring ends (after the lifecycle hears of it), so the data
+    /// screens can reload: a sync, even a failed one, can have added rows, and pairing can have
+    /// stored the first ring.
+    @ObservationIgnored var workDidEnd: (@MainActor (Activity) -> Void)?
 
     public init(ring: StoredRing? = nil, isLoaded: Bool = false) {
         self.ring = ring
@@ -61,6 +65,7 @@ public final class PairedRing {
         await body()
         release()
         lifecycle.ringWorkDidEnd()
+        workDidEnd?(activity)
     }
 
     /// Reads the paired ring from the store: the oldest ring, since v1 has one.
