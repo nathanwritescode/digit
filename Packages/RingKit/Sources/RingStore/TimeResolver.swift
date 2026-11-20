@@ -58,6 +58,7 @@ struct TimeResolver {
     /// recorded). The tie-break is explicit rather than relying on sort stability.
     let clockSets: [ClockSetEvent]
 
+    /// Every clock-set given is treated as one that changed the ring's clock.
     init(ringID: UUID, kind: HistoryKind, observations: [TransferObservation], clockSets: [ClockSetEvent]) {
         self.ringID = ringID
         self.kind = kind
@@ -65,6 +66,17 @@ struct TimeResolver {
         self.clockSets = clockSets.enumerated()
             .sorted { ($0.element.instant, $0.offset) < ($1.element.instant, $1.offset) }
             .map(\.element)
+    }
+
+    /// The log as the store holds it (#72): an entry whose recorded outcome says the ring's clock
+    /// certainly did not change (`notApplied`, `notSent`) is left out, so a phantom clock-set with a
+    /// different offset can neither end the real clock's period nor become a candidate. Entries with
+    /// no outcome or with `unknown` stay, exactly as before outcomes were recorded: the ring may
+    /// have applied them, and a clock-set it applied but the resolver lacks is the worse error.
+    init(ringID: UUID, kind: HistoryKind, observations: [TransferObservation], loggedClockSets: [LoggedClockSet]) {
+        self.init(
+            ringID: ringID, kind: kind, observations: observations,
+            clockSets: loggedClockSets.filter { $0.outcome?.excludesFromTimeResolution != true }.map(\.event))
     }
 
     /// One usable observation of a transfer's data.

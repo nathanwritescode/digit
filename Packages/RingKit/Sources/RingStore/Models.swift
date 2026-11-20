@@ -117,8 +117,55 @@ public struct ClockSetEvent: Equatable, Sendable {
     }
 }
 
+/// What became of a logged clock-set once the app tried to send it (#72). The sync logs a
+/// clock-set before it sends `0x0100`, so an entry can describe a clock-set the ring never
+/// applied (a phantom). Recording the outcome lets time resolution ignore entries that certainly
+/// did not reach the ring's clock. Stored as a frozen text code (`ClockSetOutcomeCode`).
+public enum LoggedClockSetOutcome: Sendable, CaseIterable {
+    /// Sent, and the ring acknowledged it.
+    case acknowledged
+    /// Sent, but the ring certainly did not apply it: an error reply, or a refusal before anything
+    /// was written. Time resolution ignores the entry.
+    case notApplied
+    /// Logged but never sent (for example because logging took too long and the time was stale).
+    /// Time resolution ignores the entry.
+    case notSent
+    /// Sent, but whether the ring applied it is not known (a timeout, a lost connection). Time
+    /// resolution keeps the entry as a candidate, exactly like an entry with no outcome.
+    case unknown
+
+    /// Whether time resolution leaves the entry out: only when the ring's clock certainly did not
+    /// change. `unknown` stays a candidate, because the ring may have applied it.
+    public var excludesFromTimeResolution: Bool {
+        switch self {
+        case .notApplied, .notSent: true
+        case .acknowledged, .unknown: false
+        }
+    }
+}
+
+/// A clock-set as the log holds it: its row id (`RingStore.recordClockSet` returns it), the event,
+/// and its recorded outcome, `nil` when none was recorded (an entry written before outcomes
+/// existed, one whose outcome write failed, or one whose code this version does not know).
+public struct LoggedClockSet: Equatable, Sendable {
+    public var id: Int64
+    public var event: ClockSetEvent
+    public var outcome: LoggedClockSetOutcome?
+
+    public init(id: Int64, event: ClockSetEvent, outcome: LoggedClockSetOutcome?) {
+        self.id = id
+        self.event = event
+        self.outcome = outcome
+    }
+}
+
 public enum RingStoreError: Error, Equatable, Sendable {
     case unknownRing(UUID)
+    /// `recordClockSetOutcome` was given a clock-set id the log does not hold.
+    case unknownClockSet(Int64)
+    /// `recordClockSetOutcome` was given an outcome for a clock-set that already has a different
+    /// one. Outcomes are append-only: the first one recorded stands.
+    case clockSetOutcomeConflict(Int64)
     /// `setPeripheralIdentifier` was given an identifier another ring holds. Carries that ring's
     /// app id, never the identifier, so the description holds no device identifier.
     case peripheralIdentifierInUse(UUID)
@@ -140,7 +187,7 @@ public enum RingStoreError: Error, Equatable, Sendable {
     /// not know. Opening refuses it so an older build never writes into a newer schema.
     case schemaTooNew
     /// `ingest` or `rebuild` found, `RingStore.maximumDerivationAttempts` times in a row, that
-    /// another write had changed its inputs (transfers, fetch log or clock-sets) between deriving
+    /// another write had changed its inputs (transfers, fetch log, clock-sets or their outcomes) between deriving
     /// the typed rows and applying them. Nothing was applied: the typed tables are as they were.
     /// The stored history is intact; call again once the other writer has finished.
     case ingestionInputsKeptChanging

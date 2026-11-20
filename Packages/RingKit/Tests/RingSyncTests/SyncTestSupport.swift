@@ -239,20 +239,23 @@ final class SuspendingStore: SyncStore, @unchecked Sendable {
     let base: RingStore
     private let insertFails: Set<HistoryKind>
     private let clockSetFails: Bool
+    private let outcomeFails: (any Error & Sendable)?
     private let ingestFails: Set<HistoryKind>
     private let onClockSet: @Sendable () -> Void
     private let lock = NSLock()
     private var calls: [String] = []
 
-    /// Every call that reached the store, in order (`insert <kind>`, `clockSet`, `ingest <kind>`),
-    /// including the ones that threw.
+    /// Every call that reached the store, in order (`insert <kind>`, `clockSet`,
+    /// `clockSetOutcome <code>`, `ingest <kind>`), including the ones that threw.
     var log: [String] { lock.withLock { calls } }
 
     init(
         _ base: RingStore, insertFails: Set<HistoryKind> = [], clockSetFails: Bool = false,
+        outcomeFails: (any Error & Sendable)? = nil,
         ingestFails: Set<HistoryKind> = [], onClockSet: @escaping @Sendable () -> Void = {}
     ) {
         self.onClockSet = onClockSet
+        self.outcomeFails = outcomeFails
         self.base = base
         self.insertFails = insertFails
         self.clockSetFails = clockSetFails
@@ -267,11 +270,19 @@ final class SuspendingStore: SyncStore, @unchecked Sendable {
         return try await base.insert(transfer, ringID: ringID)
     }
 
-    func recordClockSet(_ event: ClockSetEvent) async throws {
+    func recordClockSet(_ event: ClockSetEvent) async throws -> Int64 {
         note("clockSet")
         onClockSet()
         if clockSetFails { throw RingStoreError.suspended }
-        try await base.recordClockSet(event)
+        return try await base.recordClockSet(event)
+    }
+
+    /// Throws `outcomeFails` when set (writing nothing), standing in for a suspension or any other
+    /// failure of the outcome write.
+    func recordClockSetOutcome(id: Int64, outcome: LoggedClockSetOutcome) async throws {
+        note("clockSetOutcome \(outcome)")
+        if let outcomeFails { throw outcomeFails }
+        try await base.recordClockSetOutcome(id: id, outcome: outcome)
     }
 
     func ingest(ringID: UUID, kind: HistoryKind) async throws -> IngestionResult {
