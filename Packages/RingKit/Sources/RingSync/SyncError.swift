@@ -115,7 +115,7 @@ public enum RingFailure: Sendable, Equatable, CustomStringConvertible {
         case .rejected(let command, let code):
             String(format: "ring rejected command %04X", command) + (code.map { String(format: " (code %02X)", $0) } ?? "")
         case .checksumMismatch: "history transfer failed its checksum"
-        case .refusedDestructive(let command): String(format: "refused to send %04X: it erases history from the ring", command)
+        case .refusedDestructive(let command): String(format: "refused to send %04X: it can erase data or reset the ring", command)
         case .busy: "busy"
         case .stopped: "the session was stopped"
         case .tooManyFrames(let limit): "more than \(limit) frames arrived while the conversation was not reading"

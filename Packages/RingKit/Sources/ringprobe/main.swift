@@ -38,10 +38,12 @@ Options:
                     names and identifiers of every device heard. Off by default so that health
                     data and device identities stay out of terminal logs and agent transcripts.
   --allow-unknown   with raw: send frame types that are not on the known read-only list.
-                    Their effects are unknown and may include resetting the ring.
+                    Their effects are unknown. Never overrides the always-refused list below.
   --trace           print every raw packet (implies health data is printed)
 
-The history-delete commands (0x0540-0x0552) are always refused. `raw` sends only known
+Always refused, even with --allow-unknown: every known delete, reset or factory command
+(0x0540-0x0552, 0x0568, 0x0575, 0x0578, 0x0730, 0x0731, 0x010E, 0x0151, 0x0157, 0x0316,
+0x0809, 0x031A, 0x031B) and the whole groups 0x07xx, 0x0Axx, 0x0Cxx and 0x0Exx. `raw` sends only known
 read-only commands, with their documented payloads, unless --allow-unknown is given.
 """
 
@@ -264,15 +266,7 @@ do {
             guard let first = parts.first, let type = Hex.decode(first), type.count == 2,
                   let payload = Hex.decode(parts.count > 1 ? parts[1] : "") else { fail("bad frame '\(operand)'") }
             let frame = Frame(group: type[0], key: type[1], payload: payload)
-            if frame.erasesRingData {
-                fail("refusing to send \(first): that range deletes history from the ring")
-            }
-            if frame.isMonitoringSetting {
-                fail("refusing to send \(first): it changes the ring's monitoring interval. Use `ringprobe monitor`, which validates the value and asks for confirmation.")
-            }
-            if !Command.isKnownReadOnly(frame), !allowUnknown {
-                fail("refusing to send \(operand): not a known read-only command with its documented payload. Its effect is unknown; pass --allow-unknown to send it anyway.")
-            }
+            if let refusal = rawRefusal(frame, operand: operand, allowUnknown: allowUnknown) { fail(refusal) }
             return frame
         }
         _ = try await connect()
