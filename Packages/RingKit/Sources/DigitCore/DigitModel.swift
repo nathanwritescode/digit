@@ -26,9 +26,9 @@ public final class DigitModel {
     /// Why the paired ring could not be read from the store, if it could not.
     public private(set) var loadFailure: String?
 
-    private let services: DigitServices
+    @ObservationIgnored private let services: DigitServices
     /// The night screen on display, if any, so it reloads with the lists.
-    private weak var nightDetail: NightDetailModel?
+    @ObservationIgnored private weak var nightDetail: NightDetailModel?
 
     public init(
         services: DigitServices,
@@ -79,15 +79,24 @@ public final class DigitModel {
     /// Reads the paired ring from the store. Call once the store is open, before telling the
     /// lifecycle the scene is in the background (an announcement would refuse it); a failed load
     /// is retried when the scene becomes active.
+    ///
+    /// It does not read the data screens' data: the app applies the scene phase straight after,
+    /// and the first activation (at once, or later for a launch that stays in the background)
+    /// reloads them, so a cold launch reads them once.
     public func load() async {
         do {
             try await pairedRing.load(from: services.registry)
             loadFailure = nil
         } catch {
             loadFailure = Self.loadFailureMessage(error)
-            return
         }
-        await reloadData()
+    }
+
+    /// "Try Again" after a failed load: loads, then reloads the data screens, since no activation
+    /// follows a tap.
+    public func retryLoad() async {
+        await load()
+        if loadFailure == nil { await reloadData() }
     }
 
     /// The scene became active: resume the store at once, then retry a load that failed, or reload
@@ -96,7 +105,7 @@ public final class DigitModel {
     public func sceneDidBecomeActive() {
         lifecycle.sceneDidBecomeActive()
         if loadFailure != nil {
-            Task { await load() }
+            Task { await retryLoad() }
         } else if pairedRing.isLoaded {
             Task { await reloadData() }
         }

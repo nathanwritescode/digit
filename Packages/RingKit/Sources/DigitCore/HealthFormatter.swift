@@ -5,8 +5,8 @@ import RingStore
 /// Text for the data screens. Times of day are always shown on a row's own clock (its
 /// `utcOffsetSeconds`), never in the device's time zone; days are `RingDay`s, which carry no zone.
 ///
-/// Durations and the spoken forms are English, like the rest of the app; numbers, times and dates
-/// follow `locale`.
+/// Durations, distances, numbers, times and dates come from Foundation's format styles in
+/// `locale`. The surrounding words ("asleep", "steps", "mean") are English, like the rest of the app.
 public struct HealthFormatter: Sendable {
     public var locale: Locale
 
@@ -16,62 +16,53 @@ public struct HealthFormatter: Sendable {
 
     // MARK: Durations
 
-    /// Whole minutes, rounded to the nearest (half a minute rounds up).
-    private func hoursAndMinutes(_ seconds: Int) -> (hours: Int, minutes: Int) {
-        let minutes = Int((Double(max(seconds, 0)) / 60).rounded())
-        return (minutes / 60, minutes % 60)
+    /// Rounded to the nearest whole minute (half a minute rounds up) before formatting, so the
+    /// style never has to show or round seconds.
+    private static func wholeMinutes(_ seconds: Int) -> Duration {
+        .seconds(Int((Double(max(seconds, 0)) / 60).rounded()) * 60)
     }
 
-    /// "7 h 12 min", "45 min", "8 h", "0 min".
+    /// The style for `duration(seconds:)` and `spokenDuration(seconds:)`.
+    public func durationStyle(width: Duration.UnitsFormatStyle.UnitWidth) -> Duration.UnitsFormatStyle {
+        Duration.UnitsFormatStyle(allowedUnits: [.hours, .minutes], width: width).locale(locale)
+    }
+
+    /// Hours and minutes, abbreviated: "7 hrs, 12 min" in en_GB.
     public func duration(seconds: Int) -> String {
-        let (h, m) = hoursAndMinutes(seconds)
-        switch (h, m) {
-        case (0, _): return "\(m) min"
-        case (_, 0): return "\(h) h"
-        default: return "\(h) h \(m) min"
-        }
+        Self.wholeMinutes(seconds).formatted(durationStyle(width: .abbreviated))
     }
 
-    /// For VoiceOver: "7 hours 12 minutes", "1 hour", "1 minute", "0 minutes".
+    /// For VoiceOver, in full: "7 hours, 12 minutes" in en_GB.
     public func spokenDuration(seconds: Int) -> String {
-        let (h, m) = hoursAndMinutes(seconds)
-        let hours = h == 1 ? "1 hour" : "\(h) hours"
-        let minutes = m == 1 ? "1 minute" : "\(m) minutes"
-        switch (h, m) {
-        case (0, _): return minutes
-        case (_, 0): return hours
-        default: return "\(hours) \(minutes)"
-        }
+        Self.wholeMinutes(seconds).formatted(durationStyle(width: .wide))
     }
 
     // MARK: Times and days
 
     /// The zone a row's times are shown in: a fixed offset, never the device's zone.
-    static func zone(utcOffsetSeconds: Int) -> TimeZone {
+    public static func zone(utcOffsetSeconds: Int) -> TimeZone {
         TimeZone(secondsFromGMT: utcOffsetSeconds) ?? .gmt
     }
 
-    private var gmtCalendar: Calendar {
+    private func calendar(in zone: TimeZone) -> Calendar {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = .gmt
+        calendar.timeZone = zone
         calendar.locale = locale
         return calendar
     }
 
     /// A time of day on the clock `utcOffsetSeconds` ahead of UTC, in the locale's short style.
     public func time(_ date: Date, utcOffsetSeconds: Int) -> String {
-        var calendar = gmtCalendar
         let zone = Self.zone(utcOffsetSeconds: utcOffsetSeconds)
-        calendar.timeZone = zone
         return date.formatted(
-            Date.FormatStyle(date: .omitted, time: .shortened, locale: locale, calendar: calendar, timeZone: zone))
+            Date.FormatStyle(date: .omitted, time: .shortened, locale: locale, calendar: calendar(in: zone), timeZone: zone))
     }
 
     /// "Saturday 16 January" (in the locale's order). Read in GMT, since a `RingDay` is.
     public func day(_ day: RingDay) -> String {
         // Noon, so no rounding can move it to a neighbouring day.
-        day.midnight.addingTimeInterval(12 * 3600).formatted(
-            Date.FormatStyle(locale: locale, calendar: gmtCalendar, timeZone: .gmt)
+        day.gmtMidnight.addingTimeInterval(12 * 3600).formatted(
+            Date.FormatStyle(locale: locale, calendar: calendar(in: .gmt), timeZone: .gmt)
                 .weekday(.wide).day().month(.wide))
     }
 
@@ -86,23 +77,21 @@ public struct HealthFormatter: Sendable {
         count == 1 ? "1 step" : "\(number(count)) steps"
     }
 
-    /// Kilometres, or miles where the locale uses US units, with one decimal: "6.1 km", "3.8 mi".
+    /// The style for `distance(meters:)` and `spokenDistance(meters:)`: the locale's road units
+    /// (kilometres, or miles in the US and UK), with at most one decimal.
+    public func distanceStyle(width: Measurement<UnitLength>.FormatStyle.UnitWidth) -> Measurement<UnitLength>.FormatStyle {
+        Measurement<UnitLength>.FormatStyle(
+            width: width, locale: locale, usage: .road, numberFormatStyle: .number.precision(.fractionLength(0...1)))
+    }
+
+    /// "6.1 km", "3.8 mi".
     public func distance(meters: Int) -> String {
-        let (value, unit) = distanceParts(meters: meters)
-        return "\(value.formatted(.number.precision(.fractionLength(1)).locale(locale))) \(unit.short)"
+        Measurement(value: Double(meters), unit: UnitLength.meters).formatted(distanceStyle(width: .abbreviated))
     }
 
     /// "6.1 kilometres", "3.8 miles".
     public func spokenDistance(meters: Int) -> String {
-        let (value, unit) = distanceParts(meters: meters)
-        return "\(value.formatted(.number.precision(.fractionLength(1)).locale(locale))) \(unit.long)"
-    }
-
-    private func distanceParts(meters: Int) -> (Double, (short: String, long: String)) {
-        if locale.measurementSystem == .us {
-            return (Double(meters) / 1609.344, ("mi", "miles"))
-        }
-        return (Double(meters) / 1000, ("km", "kilometres"))
+        Measurement(value: Double(meters), unit: UnitLength.meters).formatted(distanceStyle(width: .wide))
     }
 
     /// "52–118 bpm, mean 64".

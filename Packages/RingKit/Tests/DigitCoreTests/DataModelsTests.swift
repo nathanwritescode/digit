@@ -21,6 +21,21 @@ private func clock(_ h: Int, _ m: Int) -> String {
         Date.FormatStyle(date: .omitted, time: .shortened, locale: Locale(identifier: "en_GB"), timeZone: .gmt))
 }
 
+/// `minutes` as en_GB writes a duration of hours and minutes, built from Foundation's style
+/// directly rather than through `HealthFormatter`, so the tests follow this system's wording.
+private func dur(_ minutes: Int, wide: Bool = false) -> String {
+    Duration.seconds(minutes * 60).formatted(
+        Duration.UnitsFormatStyle(allowedUnits: [.hours, .minutes], width: wide ? .wide : .abbreviated)
+            .locale(Locale(identifier: "en_GB")))
+}
+
+/// `meters` as `locale` writes a road distance, built from Foundation's style directly.
+private func road(_ meters: Int, wide: Bool = false, locale: String = "en_GB") -> String {
+    Measurement(value: Double(meters), unit: UnitLength.meters).formatted(
+        .measurement(width: wide ? .wide : .abbreviated, usage: .road, numberFormatStyle: .number.precision(.fractionLength(0...1)))
+            .locale(Locale(identifier: locale)))
+}
+
 private func night(
     day: RingDay, start: Date, hours: Double, main: Bool = true, source: TimeSource = .resolved, offset: Int = 0
 ) -> SleepNightSummary {
@@ -42,8 +57,9 @@ private func summary(_ day: RingDay, steps: Int, source: TimeSource = .resolved)
 }
 
 /// An error whose own text carries a made-up name, identifier and value, so tests can check none
-/// of it reaches the screen.
-private struct LeakyError: Error, CustomStringConvertible {
+/// of it reaches the screen. Not private: a private type's reflected name holds an address, whose
+/// digits could match the value by chance.
+struct LeakyError: Error, CustomStringConvertible {
     var description: String { "\(syntheticName) \(syntheticIdentifier) 61 bpm" }
 }
 
@@ -133,11 +149,11 @@ struct SleepListModelTests {
         #expect(groups[0].title == "Friday 15 January")
         let row = groups[0].nights[0]
         #expect(row.kindText == "Main sleep")
-        #expect(row.asleepText == "7 h 30 min")
+        #expect(row.asleepText == dur(450))
         #expect(row.bedtimeText == clock(23, 0))
         #expect(row.wakeText == clock(6, 30))
         #expect(row.uncertainty == nil)
-        #expect(row.accessibilityLabel == "Friday 15 January, main sleep, 7 hours 30 minutes asleep, bedtime \(clock(23, 0)), woke \(clock(6, 30))")
+        #expect(row.accessibilityLabel == "Friday 15 January, main sleep, \(dur(450, wide: true)) asleep, bedtime \(clock(23, 0)), woke \(clock(6, 30))")
         #expect(groups[0].nights[1].kindText == "Nap")
     }
 
@@ -232,11 +248,11 @@ struct NightDetailModelTests {
         #expect(page.wakeText == clock(9, 30))
         #expect(page.stages.map(\.kind) == [.light, .deep, .rem])
         #expect(page.stages.map(\.name) == ["Light", "Deep", "REM"])
-        #expect(page.stages[1].accessibilityLabel == "Deep, \(clock(8, 30)) to \(clock(9, 15)), 45 minutes")
+        #expect(page.stages[1].accessibilityLabel == "Deep, \(clock(8, 30)) to \(clock(9, 15)), \(dur(45, wide: true))")
         #expect(page.totals.map(\.title) == ["Asleep", "Deep", "Light", "REM", "Nap", "Interruptions"])
-        #expect(page.totals[0].value == "1 h 30 min")
-        #expect(page.totals[0].accessibilityLabel == "1 hour 30 minutes asleep")
-        #expect(page.totals[5].value == "5 min")
+        #expect(page.totals[0].value == dur(90))
+        #expect(page.totals[0].accessibilityLabel == "\(dur(90, wide: true)) asleep")
+        #expect(page.totals[5].value == dur(5))
         #expect(moved == 0)
     }
 
@@ -287,10 +303,10 @@ struct DailyModelTests {
         let rows = try #require(model.state.value)
         #expect(rows.map(\.summary.day) == [day15, day(14), day(13)])
         #expect(rows[0].stepsText == "8,412 steps")
-        #expect(rows[0].distanceText == "6.3 km")
+        #expect(rows[0].distanceText == road(6309))
         #expect(rows[0].heartRateText == "52–118 bpm, mean 64")
         #expect(rows[0].uncertainty == "Times uncertain")
-        #expect(rows[0].accessibilityLabel == "Friday 15 January, 8,412 steps, 6.3 kilometres, heart rate 52 to 118 beats per minute, average 64, times uncertain")
+        #expect(rows[0].accessibilityLabel == "Friday 15 January, 8,412 steps, \(road(6309, wide: true)), heart rate 52 to 118 beats per minute, average 64, times uncertain")
         #expect(rows[1].uncertainty == nil)
     }
 
@@ -352,14 +368,47 @@ struct DataReloadTests {
         let model = model(f, history)
         #expect(model.sleep.state == .loading)
         await model.load()
-        #expect(model.sleep.state == .noData)
-        #expect(model.days.state.value?.count == 1)
+        // Loading reads only the ring; the first activation reads the data, once.
+        #expect(history.calls.isEmpty)
+        model.sceneDidBecomeActive()
+        #expect(await eventually { model.sleep.state == .noData && model.days.state.value?.count == 1 })
+        #expect(history.count("sleepNights") == 1 && history.count("dailySummaries") == 1)
+    }
+
+    @Test func aLaunchThatStaysInTheBackgroundLoadsTheDataOnTheFirstActivation() async throws {
+        let f = try Fixture()
+        try await f.storePairedRing()
+        let history = FakeHistory()
+        history.days = [summary(day15, steps: 10)]
+        let model = model(f, history)
+        await model.load()
+        model.sceneDidEnterBackground()
+        try? await Task.sleep(for: .milliseconds(20))
+        #expect(history.calls.isEmpty)
+        #expect(model.days.state == .loading)
+        model.sceneDidBecomeActive()
+        #expect(await eventually { model.days.state.value?.count == 1 && model.sleep.state == .noData })
+    }
+
+    @Test func tryAgainAfterAFailedLoadAlsoLoadsTheData() async throws {
+        let f = try Fixture()
+        try await f.storePairedRing()
+        f.registry.suspendedCalls = ["rings"]
+        let history = FakeHistory()
+        let model = model(f, history)
+        await model.load()
+        #expect(model.loadFailure != nil)
+        f.registry.suspendedCalls = []
+        await model.retryLoad()
+        #expect(model.loadFailure == nil)
+        #expect(model.sleep.state == .noData && model.days.state == .noData)
     }
 
     @Test func notPairedIsShownOnceTheStoreHasBeenRead() async throws {
         let f = try Fixture()
         let model = model(f, FakeHistory())
         await model.load()
+        await model.reloadData()
         #expect(model.sleep.state == .notPaired)
         #expect(model.days.state == .notPaired)
     }
@@ -370,6 +419,7 @@ struct DataReloadTests {
         let history = FakeHistory()
         let model = model(f, history)
         await model.load()
+        await model.reloadData()  // what the first activation does
         #expect(history.count("sleepNights") == 1 && history.count("dailySummaries") == 1)
 
         history.nights = [night(day: day15, start: at(hours: -9), hours: 7)]
@@ -393,6 +443,7 @@ struct DataReloadTests {
         history.failure = RingStoreError.suspended
         let model = model(f, history)
         await model.load()
+        await model.reloadData()  // what the first activation does
         #expect(model.sleep.state == .failed("Digit was interrupted while reading your data. It tries again when you return to the app."))
 
         history.failure = nil
@@ -425,19 +476,21 @@ struct DataReloadTests {
 
 @Suite(.timeLimit(.minutes(1)))
 struct HealthFormatterTests {
-    @Test func durationsInHoursAndMinutes() {
-        #expect(gb.duration(seconds: 7 * 3600 + 12 * 60) == "7 h 12 min")
-        #expect(gb.duration(seconds: 45 * 60) == "45 min")
-        #expect(gb.duration(seconds: 8 * 3600) == "8 h")
-        #expect(gb.duration(seconds: 0) == "0 min")
-        // Rounded to the nearest minute.
-        #expect(gb.duration(seconds: 89) == "1 min")
-        #expect(gb.duration(seconds: 90) == "2 min")
-        #expect(gb.duration(seconds: 3600 - 20) == "1 h")
-        #expect(gb.spokenDuration(seconds: 7 * 3600 + 12 * 60) == "7 hours 12 minutes")
-        #expect(gb.spokenDuration(seconds: 3600 + 60) == "1 hour 1 minute")
-        #expect(gb.spokenDuration(seconds: 2 * 3600) == "2 hours")
-        #expect(gb.spokenDuration(seconds: 0) == "0 minutes")
+    @Test func durationsInHoursAndMinutesRoundedToTheMinute() {
+        #expect(gb.duration(seconds: 7 * 3600 + 12 * 60) == dur(432))
+        #expect(gb.duration(seconds: 45 * 60) == dur(45))
+        #expect(gb.duration(seconds: 0) == dur(0))
+        // Rounded to the nearest minute before formatting, so no seconds are ever shown.
+        #expect(gb.duration(seconds: 89) == dur(1))
+        #expect(gb.duration(seconds: 90) == dur(2))
+        #expect(gb.duration(seconds: 3600 - 20) == dur(60))
+        #expect(gb.spokenDuration(seconds: 7 * 3600 + 12 * 60) == dur(432, wide: true))
+        #expect(gb.spokenDuration(seconds: 3600 + 60) == dur(61, wide: true))
+        // Plurals come from the locale, not from hand-written English.
+        #expect(gb.spokenDuration(seconds: 3600).contains("hour") && !gb.spokenDuration(seconds: 3600).contains("hours"))
+        #expect(gb.spokenDuration(seconds: 2 * 3600).contains("hours"))
+        // Another locale's own words.
+        #expect(HealthFormatter(locale: Locale(identifier: "de_DE")).spokenDuration(seconds: 2 * 3600).contains("Stunden"))
     }
 
     @Test func timesAreOnTheRowsOwnOffsetNotTheDevicesZone() {
@@ -453,6 +506,46 @@ struct HealthFormatterTests {
                 Date.FormatStyle(date: .omitted, time: .shortened, locale: Locale(identifier: "en_GB"), timeZone: .gmt)))
     }
 
+    /// The night's own whole hours, whatever the device zone: no input here is the device's zone,
+    /// so a +05:30 night viewed on a +00:00 device and the reverse are these two cases.
+    @Test func hourTicksAreWholeHoursOfTheNightsOwnClock() {
+        // 17:00 UTC to 01:00 UTC: 22:30 to 06:30 at +05:30, eight hours, so every two hours.
+        let start = Date(timeIntervalSince1970: 1_799_971_200 - 7 * 3600)
+        let end = start.addingTimeInterval(8 * 3600)
+        let plus530 = 5 * 3600 + 30 * 60
+        let ticks = SleepNightPage.hourTicks(from: start, to: end, utcOffsetSeconds: plus530)
+        #expect(ticks.map { gb.time($0, utcOffsetSeconds: plus530) } == [clock(0, 0), clock(2, 0), clock(4, 0), clock(6, 0)])
+        // On UTC those are half past: never the device zone's hours.
+        #expect(ticks.allSatisfy { Int($0.timeIntervalSince1970) % 3600 == 1800 })
+
+        // The reverse: a +00:00 night, ticks on whole UTC hours.
+        let utcTicks = SleepNightPage.hourTicks(from: start, to: end, utcOffsetSeconds: 0)
+        #expect(utcTicks.map { gb.time($0, utcOffsetSeconds: 0) } == [clock(18, 0), clock(20, 0), clock(22, 0), clock(0, 0)])
+        #expect(utcTicks.allSatisfy { Int($0.timeIntervalSince1970) % 3600 == 0 })
+
+        // Short nights tick every hour, long ones every three; a start on the hour is included.
+        let short = SleepNightPage.hourTicks(from: start, to: start.addingTimeInterval(2 * 3600), utcOffsetSeconds: 0)
+        #expect(short.map { Int($0.timeIntervalSince(start)) } == [0, 3600, 7200])
+        let long = SleepNightPage.hourTicks(from: start, to: start.addingTimeInterval(12 * 3600), utcOffsetSeconds: 0)
+        #expect(long.count == 4)
+        #expect(SleepNightPage.hourTicks(from: end, to: start, utcOffsetSeconds: 0).isEmpty)
+    }
+
+    @MainActor @Test func aNightPageCarriesItsOwnZoneAndTicks() async throws {
+        let history = FakeHistory()
+        let summary = night(day: day15, start: at(hours: -9), hours: 7, offset: 5 * 3600 + 30 * 60)
+        history.details[summary.start] = SleepNightDetail(summary: summary, stages: [])
+        let model = NightDetailModel(ringID: UUID(), start: summary.start, history: history, formatter: gb, onMoved: {})
+        await model.reload()
+        guard case .loaded(let page) = model.state else {
+            Issue.record("expected a night, got \(model.state)")
+            return
+        }
+        #expect(page.timeZone.secondsFromGMT() == 5 * 3600 + 30 * 60)
+        #expect(page.hourTicks == SleepNightPage.hourTicks(from: summary.start, to: summary.end, utcOffsetSeconds: 5 * 3600 + 30 * 60))
+        #expect(!page.hourTicks.isEmpty)
+    }
+
     @Test func daysAreReadWithoutAZone() {
         #expect(gb.day(RingDay(year: 2027, month: 1, day: 16)) == "Saturday 16 January")
     }
@@ -460,9 +553,17 @@ struct HealthFormatterTests {
     @Test func valuesFollowTheLocale() {
         #expect(gb.steps(8412) == "8,412 steps")
         #expect(gb.steps(1) == "1 step")
-        #expect(gb.distance(meters: 6100) == "6.1 km")
-        #expect(HealthFormatter(locale: Locale(identifier: "en_US")).distance(meters: 6100) == "3.8 mi")
-        #expect(gb.spokenDistance(meters: 6100) == "6.1 kilometres")
+        // Road units: miles in the UK and the US, kilometres in Germany.
+        #expect(gb.distance(meters: 6100) == road(6100))
+        #expect(gb.distance(meters: 6100).hasSuffix("mi"))
+        #expect(gb.spokenDistance(meters: 6100) == road(6100, wide: true))
+        #expect(HealthFormatter(locale: Locale(identifier: "en_US")).distance(meters: 6100) == road(6100, locale: "en_US"))
+        let de = HealthFormatter(locale: Locale(identifier: "de_DE"))
+        #expect(de.distance(meters: 6100) == road(6100, locale: "de_DE"))
+        #expect(de.distance(meters: 6100).hasSuffix("km"))
+        // A whole mile is "1 mile", not "1.0 miles".
+        #expect(gb.spokenDistance(meters: 1609) == road(1609, wide: true))
+        #expect(!gb.spokenDistance(meters: 1609).contains(".0"))
         let hr = HeartRateDaySummary(readingCount: 3, minimumBPM: 52, maximumBPM: 118, meanBPM: 64)
         #expect(gb.heartRate(hr) == "52–118 bpm, mean 64")
         #expect(gb.spokenHeartRate(hr) == "heart rate 52 to 118 beats per minute, average 64")

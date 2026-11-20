@@ -137,6 +137,11 @@ public struct SleepNightPage: Sendable, Equatable {
     public let wakeText: String
     public let totals: [SleepTotal]
     public let stages: [SleepStageSegment]
+    /// Where the timeline's axis marks go: whole hours on the night's own clock (every one, two or
+    /// three hours depending on the night's length), never the device zone's hours.
+    public let hourTicks: [Date]
+    /// The night's clock as a fixed-offset zone, for anything that formats its dates.
+    public let timeZone: TimeZone
     public let uncertainty: String?
     public let uncertaintyExplanation: String?
 
@@ -171,8 +176,36 @@ public struct SleepNightPage: Sendable, Equatable {
                     + "\(formatter.time(end, utcOffsetSeconds: offset)), \(formatter.spokenDuration(seconds: stage.durationSeconds))",
                 id: index)
         }
+        hourTicks = Self.hourTicks(from: summary.start, to: summary.end, utcOffsetSeconds: offset)
+        timeZone = HealthFormatter.zone(utcOffsetSeconds: offset)
         uncertainty = HealthFormatter.uncertaintyMarker(for: summary.timeSource)
         uncertaintyExplanation = HealthFormatter.uncertaintyExplanation(for: summary.timeSource)
+    }
+
+    /// Instants in `start...end` that fall on a whole hour of the clock `utcOffsetSeconds` ahead of
+    /// UTC, every `step` hours (1 up to 4 hours, 2 up to 10, 3 beyond), aligned to multiples of
+    /// the step on that clock (so 00:00, 02:00, 04:00).
+    public static func hourTicks(from start: Date, to end: Date, utcOffsetSeconds: Int) -> [Date] {
+        let span = end.timeIntervalSince(start)
+        guard span >= 0 else { return [] }
+        let step = Int64(span <= 4 * 3600 ? 1 : span <= 10 * 3600 ? 2 : 3) * 3600
+        let localStart = Int64(start.timeIntervalSince1970.rounded(.up)) + Int64(utcOffsetSeconds)
+        let localEnd = Int64(end.timeIntervalSince1970.rounded(.down)) + Int64(utcOffsetSeconds)
+        // First multiple of the step at or after the start (floor division, safe for any sign).
+        var tick = (localStart + step - 1).floorDivided(by: step) * step
+        var ticks: [Date] = []
+        while tick <= localEnd {
+            ticks.append(Date(timeIntervalSince1970: TimeInterval(tick - Int64(utcOffsetSeconds))))
+            tick += step
+        }
+        return ticks
+    }
+}
+
+private extension Int64 {
+    func floorDivided(by divisor: Int64) -> Int64 {
+        let q = self / divisor
+        return (self % divisor != 0 && (self < 0) != (divisor < 0)) ? q - 1 : q
     }
 }
 

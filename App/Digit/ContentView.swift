@@ -25,7 +25,7 @@ struct ReadyView: View {
         if let failure = model.loadFailure {
             NavigationStack {
                 ErrorScreen(message: failure) {
-                    Task { await model.load() }
+                    Task { await model.retryLoad() }
                 }
                 .navigationTitle("Digit")
             }
@@ -80,6 +80,7 @@ struct DataStateView<Value: Sendable & Equatable, Content: View>: View {
     let state: DataState<Value>
     /// What the screen holds, for "Sync your ring to see your …".
     let subject: String
+    /// Reloads: "Try Again" after a failure, "Refresh" when there is no data yet.
     let retry: () async -> Void
     @ViewBuilder let content: (Value) -> Content
 
@@ -92,9 +93,13 @@ struct DataStateView<Value: Sendable & Equatable, Content: View>: View {
                 "No Ring Paired", systemImage: "circle.dashed",
                 description: Text("Pair your ring in the Ring tab to see your \(subject)."))
         case .noData:
-            ContentUnavailableView(
-                "Nothing Yet", systemImage: "arrow.triangle.2.circlepath",
-                description: Text("Sync your ring to see your \(subject)."))
+            ContentUnavailableView {
+                Label("Nothing Yet", systemImage: "arrow.triangle.2.circlepath")
+            } description: {
+                Text("Sync your ring to see your \(subject).")
+            } actions: {
+                Button("Refresh") { Task { await retry() } }
+            }
         case .failed(let message):
             ContentUnavailableView {
                 Label("Couldn't Load", systemImage: "exclamationmark.triangle")

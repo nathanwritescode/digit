@@ -29,12 +29,12 @@ public struct RingDay: Comparable, Hashable, Sendable {
 
     /// The day `count` days later (earlier when negative).
     public func adding(days count: Int) -> RingDay {
-        RingDay(instant: midnight.addingTimeInterval(TimeInterval(count) * 86400), utcOffsetSeconds: 0)
+        RingDay(instant: gmtMidnight.addingTimeInterval(TimeInterval(count) * 86400), utcOffsetSeconds: 0)
     }
 
     /// The start of this day read as GMT: the instant whose GMT wall clock is this day at 00:00.
     /// Adding a row's offset to its instant and comparing with this gives the row's day.
-    public var midnight: Date {
+    public var gmtMidnight: Date {
         Self.calendar.date(from: DateComponents(year: year, month: month, day: day))!
     }
 

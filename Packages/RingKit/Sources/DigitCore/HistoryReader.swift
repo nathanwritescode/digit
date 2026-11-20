@@ -37,7 +37,8 @@ public enum RecentDays {
     /// The last `count` days ending today, plus tomorrow. Today is read on `timeZone` (the
     /// device's), the only place a device zone is used: it says which days are recent, never what
     /// day a row falls on (each row's own offset does). Tomorrow is included because the ring's
-    /// clock can be ahead of the device's zone after travel east, until the next sync sets it.
+    /// clock can be ahead of the device's zone after travel west (the ring keeps the earlier,
+    /// eastern zone's clock until the next sync sets it).
     public static func window(now: Date, timeZone: TimeZone) -> (first: RingDay, last: RingDay) {
         let today = RingDay(instant: now, utcOffsetSeconds: timeZone.secondsFromGMT(for: now))
         return (today.adding(days: 1 - count), today.adding(days: 1))
@@ -57,7 +58,7 @@ enum DataLoadFailure {
     /// The words for a failed load with nothing kept on screen.
     static func message(for error: any Error) -> String {
         if isSuspension(error) { return interrupted }
-        return "Digit couldn't read your data (\(SyncError(error).description)). Pull down to try again."
+        return "Digit couldn't read your data (\(SyncError(error).description)). Tap Try Again."
     }
 
     /// The state after a failed load. A load refused because the store was suspended keeps what

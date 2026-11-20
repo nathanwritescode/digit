@@ -37,7 +37,7 @@ private struct PreviewHistory: RingHistoryReader {
         (0..<7).flatMap { back -> [SleepNightDetail] in
             let day = today.adding(days: -back)
             // 23:10 the evening before to about 06:40.
-            let start = day.midnight.addingTimeInterval(-50 * 60 + Double(back * 7 * 60))
+            let start = day.gmtMidnight.addingTimeInterval(-50 * 60 + Double(back * 7 * 60))
             let pattern: [(SleepStageKind, Int)] = [
                 (.light, 25), (.deep, 50), (.light, 40), (.rem, 20), (.light, 45), (.deep, 35),
                 (.light, 50), (.rem, 30), (.light, 55), (.rem, 35), (.light, 25),
@@ -51,7 +51,7 @@ private struct PreviewHistory: RingHistoryReader {
             var main = summary(day: day, stages: stages, main: true)
             if back == 1 { main.timeSource = .ambiguous }
             guard back == 2 else { return [SleepNightDetail(summary: main, stages: stages)] }
-            let napStart = day.midnight.addingTimeInterval(14 * 3600 + 20 * 60)
+            let napStart = day.gmtMidnight.addingTimeInterval(14 * 3600 + 20 * 60)
             let nap = [SleepStageEntry(kind: .light, start: napStart, durationSeconds: 25 * 60)]
             return [
                 SleepNightDetail(summary: main, stages: stages),
@@ -103,15 +103,11 @@ private func previewModel(paired: Bool, withData: Bool = true) async -> DigitMod
         try! await store.setPeripheralIdentifier(UUID(), forRing: ring.id)
     }
     let model = DigitModel(
-        services: DigitServices(
-            ringAccess: PreviewRingAccess(), registry: store, history: PreviewHistory(empty: !withData),
-            makeSync: { ring, ringID in
-                RingSyncer(
-                    ring: ring, store: store, ringID: ringID, monitoringInterval: SyncSettings.monitoringInterval,
-                    budget: SyncSettings.foregroundBudget)
-            }),
+        services: DigitServices(ringAccess: PreviewRingAccess(), store: store, history: PreviewHistory(empty: !withData)),
         backgroundTasks: PreviewBackgroundTasks(), announce: {}, suspend: {}, resume: {})
+    // As the app does: the first activation after loading reads the data screens.
     await model.load()
+    await model.reloadData()
     return model
 }
 

@@ -16,23 +16,26 @@ struct SleepListView: View {
             List(groups) { group in
                 Section(group.title) {
                     ForEach(group.nights) { row in
-                        NavigationLink(value: row.summary.start) {
+                        NavigationLink(value: NightRoute(start: row.summary.start)) {
                             SleepNightRowView(row: row)
                         }
-                        .accessibilityElement(children: .ignore)
                         .accessibilityLabel(row.accessibilityLabel)
                         .accessibilityHint(row.uncertaintyExplanation ?? "Shows the night's stages.")
-                        .accessibilityAddTraits(.isButton)
                     }
                 }
             }
             .refreshable { await sleep.reload() }
         }
         .navigationTitle("Sleep")
-        .navigationDestination(for: Date.self) { start in
-            NightScreen(model: model, start: start)
+        .navigationDestination(for: NightRoute.self) { route in
+            NightScreen(model: model, start: route.start)
         }
     }
+}
+
+/// The sleep list's navigation value: a night, found again by its start.
+struct NightRoute: Hashable {
+    let start: Date
 }
 
 struct SleepNightRowView: View {
@@ -40,12 +43,17 @@ struct SleepNightRowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(row.kindText)
-                    .font(.headline)
-                Spacer()
-                Text("\(row.asleepText) asleep")
-                    .monospacedDigit()
+            // Side by side while they fit, one above the other at large text sizes.
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline) {
+                    kind
+                    Spacer()
+                    asleep
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    kind
+                    asleep
+                }
             }
             Text("\(row.bedtimeText) – \(row.wakeText)")
                 .foregroundStyle(.secondary)
@@ -56,6 +64,9 @@ struct SleepNightRowView: View {
         }
         .padding(.vertical, 2)
     }
+
+    private var kind: some View { Text(row.kindText).font(.headline) }
+    private var asleep: some View { Text("\(row.asleepText) asleep").monospacedDigit() }
 }
 
 /// One night: bedtime and wake time, the stage timeline and the totals. Returns to the list when
@@ -148,6 +159,8 @@ struct NightPageView: View {
 struct StageTimeline: View {
     let page: SleepNightPage
     private let formatter = HealthFormatter()
+    /// Grows with the text size, so the stage names on the axis keep their rows.
+    @ScaledMetric(relativeTo: .body) private var height: CGFloat = 180
 
     /// Top to bottom, the usual order for a sleep chart.
     private static let order: [SleepStageKind] = [.awake, .rem, .light, .deep, .nap]
@@ -169,7 +182,8 @@ struct StageTimeline: View {
             domain: kinds.map(HealthFormatter.name(of:)), range: kinds.map(Self.color(for:)))
         .chartYScale(domain: kinds.map(HealthFormatter.name(of:)))
         .chartXAxis {
-            AxisMarks(values: .automatic(desiredCount: 4)) { value in
+            // Whole hours of the night's own clock, computed in DigitCore, not the device zone's.
+            AxisMarks(values: page.hourTicks) { value in
                 AxisGridLine()
                 AxisTick()
                 AxisValueLabel {
@@ -180,7 +194,9 @@ struct StageTimeline: View {
             }
         }
         .chartLegend(position: .bottom)
-        .frame(minHeight: 180)
+        // Anything Charts formats itself is on the night's clock too.
+        .environment(\.timeZone, page.timeZone)
+        .frame(minHeight: height)
         .padding(.vertical, 8)
     }
 

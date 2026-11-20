@@ -80,8 +80,8 @@ extension RingStore {
     {
         guard first <= last else { return [] }
         let dayMS: Int64 = 86_400_000
-        let lowLocal = HistoryTransfer.millisecondsSince1970(first.midnight)
-        let highLocal = HistoryTransfer.millisecondsSince1970(last.adding(days: 1).midnight)  // exclusive
+        let lowLocal = HistoryTransfer.millisecondsSince1970(first.gmtMidnight)
+        let highLocal = HistoryTransfer.millisecondsSince1970(last.adding(days: 1).gmtMidnight)  // exclusive
         func arguments() -> StatementArguments {
             [ringID.uuidString, lowLocal - dayMS, highLocal + dayMS, lowLocal, highLocal]
         }
@@ -121,11 +121,13 @@ extension RingStore {
         {
             let rank = Self.rank(try source(row))
             let number: Int64 = try column(row, "day_number")
-            days[number, default: Partial()].steps += try column(row, "steps") as Int
-            days[number]!.distance += try column(row, "distance") as Int
-            days[number]!.kilocalories += try column(row, "kcal") as Int
-            days[number]!.buckets += try column(row, "buckets") as Int
-            days[number]!.rank = max(days[number]!.rank, rank)
+            var partial = days[number] ?? Partial()
+            partial.steps += try column(row, "steps") as Int
+            partial.distance += try column(row, "distance") as Int
+            partial.kilocalories += try column(row, "kcal") as Int
+            partial.buckets += try column(row, "buckets") as Int
+            partial.rank = max(partial.rank, rank)
+            days[number] = partial
         }
 
         for row in try Row.fetchAll(
@@ -142,11 +144,13 @@ extension RingStore {
         {
             let rank = Self.rank(try source(row))
             let number: Int64 = try column(row, "day_number")
-            days[number, default: Partial()].readings += try column(row, "readings") as Int
-            days[number]!.bpmSum += try column(row, "bpm_sum") as Int
-            days[number]!.minimum = min(days[number]!.minimum, try column(row, "minimum"))
-            days[number]!.maximum = max(days[number]!.maximum, try column(row, "maximum"))
-            days[number]!.rank = max(days[number]!.rank, rank)
+            var partial = days[number] ?? Partial()
+            partial.readings += try column(row, "readings") as Int
+            partial.bpmSum += try column(row, "bpm_sum") as Int
+            partial.minimum = min(partial.minimum, try column(row, "minimum"))
+            partial.maximum = max(partial.maximum, try column(row, "maximum"))
+            partial.rank = max(partial.rank, rank)
+            days[number] = partial
         }
 
         let sources = TimeSource.allCases.sorted { rank($0) < rank($1) }

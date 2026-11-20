@@ -27,11 +27,17 @@ struct DayRowView: View {
         VStack(alignment: .leading, spacing: 4) {
             Text(row.title)
                 .font(.headline)
-            HStack(alignment: .firstTextBaseline) {
-                Label(row.stepsText, systemImage: "figure.walk")
-                Spacer()
-                Text(row.distanceText)
-                    .foregroundStyle(.secondary)
+            // Side by side while they fit, one above the other at large text sizes.
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline) {
+                    steps
+                    Spacer()
+                    distance
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    steps
+                    distance
+                }
             }
             .monospacedDigit()
             if let heartRate = row.heartRateText {
@@ -47,4 +53,7 @@ struct DayRowView: View {
         }
         .padding(.vertical, 2)
     }
+
+    private var steps: some View { Label(row.stepsText, systemImage: "figure.walk") }
+    private var distance: some View { Text(row.distanceText).foregroundStyle(.secondary) }
 }

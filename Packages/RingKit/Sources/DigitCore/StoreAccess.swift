@@ -56,7 +56,13 @@ public struct DigitServices: Sendable {
     /// The production wiring: one store for everything, and `RingSyncer` with the default
     /// monitoring interval and the foreground budget.
     public init(ringAccess: any RingAccess, store: RingStore) {
-        self.init(ringAccess: ringAccess, registry: store, history: store, makeSync: { ring, ringID in
+        self.init(ringAccess: ringAccess, store: store, history: store)
+    }
+
+    /// The production wiring with another source for the data screens' reads (previews use
+    /// synthetic data); the sync is built exactly as in production.
+    public init(ringAccess: any RingAccess, store: RingStore, history: any RingHistoryReader) {
+        self.init(ringAccess: ringAccess, registry: store, history: history, makeSync: { ring, ringID in
             RingSyncer(
                 ring: ring, store: store, ringID: ringID,
                 monitoringInterval: SyncSettings.monitoringInterval, budget: SyncSettings.foregroundBudget)
