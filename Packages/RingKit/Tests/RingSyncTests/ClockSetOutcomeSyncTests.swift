@@ -45,7 +45,8 @@ func eachSentClockSetHasItsOutcomeRecordedBeforeIngestion(_ reply: FakeRing.Repl
     let log = store.log
     let recorded = try #require(log.firstIndex(of: "clockSetOutcome \(expected)"))
     let firstIngest = try #require(log.firstIndex { $0.hasPrefix("ingest") })
-    #expect(log.firstIndex(of: "clockSet")! < recorded && recorded < firstIngest)
+    let logged = try #require(log.firstIndex(of: "clockSet"))
+    #expect(logged < recorded && recorded < firstIngest)
     #expect(result.ingestions.values.allSatisfy { $0.succeeded })
 }
 
@@ -128,8 +129,10 @@ func eachSentClockSetHasItsOutcomeRecordedBeforeIngestion(_ reply: FakeRing.Repl
 }
 
 /// A suspension while recording the outcome ends the ring phase like any other store step: the
-/// clock-set stays as it happened, the interval is skipped and ingestion does not start.
-@Test(.timeLimit(.minutes(1))) func aSuspensionWhileRecordingTheOutcomeEndsTheSync() async throws {
+/// clock-set stays as it happened and ingestion does not start. An acknowledged clock-set's outcome
+/// is recorded after the interval, so the interval was sent: a write that changes nothing for time
+/// resolution must not keep it back.
+@Test(.timeLimit(.minutes(1))) func aSuspensionWhileRecordingAnAcknowledgedOutcomeEndsTheSyncAfterTheInterval() async throws {
     let (base, id) = try await makeStore()
     let store = SuspendingStore(base, outcomeFails: RingStoreError.suspended)
     let ring = FakeRing(store: base, ringID: id)
@@ -137,9 +140,9 @@ func eachSentClockSetHasItsOutcomeRecordedBeforeIngestion(_ reply: FakeRing.Repl
 
     #expect(phase.clockSet.wasAcknowledged)
     #expect(phase.clockSetOutcomeRecord == .failed(.acknowledged, error: .store(.suspended)))
-    #expect(phase.monitoringInterval == .skipped(.tenMinutes, .storeSuspended))
+    #expect(phase.monitoringInterval == .accepted(.tenMinutes))
     #expect(phase.endedBecauseStoreSuspended)
-    #expect(await ring.log == completeLog.filter { $0 != "interval 10" })
+    #expect(await ring.log == completeLog)
 
     let result = await outcomeSyncer(FakeRing(store: base, ringID: id), SuspendingStore(base, outcomeFails: RingStoreError.suspended), id).run()
     for kind in HistoryKind.allCases { #expect(result.ingestions[kind] == .storeSuspended) }
@@ -150,4 +153,29 @@ func eachSentClockSetHasItsOutcomeRecordedBeforeIngestion(_ reply: FakeRing.Repl
     #expect(SyncError(RingStoreError.unknownClockSet(7)) == .store(.unknownClockSet(7)))
     #expect(SyncError(RingStoreError.clockSetOutcomeConflict(8)) == .store(.clockSetOutcomeConflict(8)))
     #expect(SyncError(RingStoreError.unknownClockSet(7)).description == "store: the clock-set is not in the store's log")
+}
+
+/// Any other outcome is recorded straight after the send, so a suspension there skips the interval
+/// (which a clock-set the ring did not acknowledge would not get anyway) with `.storeSuspended`.
+@Test(.timeLimit(.minutes(1))) func aSuspensionWhileRecordingANotAppliedOutcomeEndsTheSyncBeforeTheInterval() async throws {
+    let (base, id) = try await makeStore()
+    let store = SuspendingStore(base, outcomeFails: RingStoreError.suspended)
+    let ring = FakeRing(store: base, ringID: id, clock: .fail(RingError.busy("synthetic")))
+    let phase = await outcomeSyncer(ring, store, id).syncRing()
+
+    #expect(phase.clockSetOutcomeRecord == .failed(.notApplied, error: .store(.suspended)))
+    #expect(phase.monitoringInterval == .skipped(.tenMinutes, .storeSuspended))
+    #expect(phase.endedBecauseStoreSuspended)
+    #expect(try await storedOutcomes(base, id) == [nil, nil])
+}
+
+/// An acknowledged outcome is written after the interval, and still before the derive phase.
+@Test(.timeLimit(.minutes(1))) func anAcknowledgedOutcomeIsRecordedAfterTheInterval() async throws {
+    let (base, id) = try await makeStore()
+    let store = SuspendingStore(base)
+    let ring = FakeRing(store: base, ringID: id)
+    let result = await outcomeSyncer(ring, store, id).run()
+    #expect(await ring.outcomesWhenIntervalSent == [nil, nil])
+    #expect(result.clockSetOutcomeRecord == .recorded(.acknowledged))
+    #expect(try await storedOutcomes(base, id) == [nil, .acknowledged])
 }

@@ -65,7 +65,7 @@ let syntheticHistory: [HistoryKind: [UInt8]] = [
 func makeStore() async throws -> (RingStore, UUID) {
     let store = try RingStore()
     let ring = try await store.registerRing(protocolFamily: "ycbt")
-    try await store.recordClockSet(ClockSetEvent(
+    _ = try await store.recordClockSet(ClockSetEvent(
         ringID: ring.id, instant: t0.addingTimeInterval(-3 * 86_400), timeZoneIdentifier: "Europe/London",
         utcOffsetSeconds: 0))
     return (store, ring.id)
@@ -139,6 +139,8 @@ actor FakeRing: SyncableRing {
     private(set) var storedWhenAcknowledged: [HistoryKind] = []
     /// The clock-set log as it was when `setTime` was called.
     private(set) var clockSetsWhenSent: [ClockSetEvent] = []
+    /// The clock-set log's outcomes when the interval was sent.
+    private(set) var outcomesWhenIntervalSent: [LoggedClockSetOutcome?] = []
     /// Typed row counts seen when the interval (or, if none, the clock) was sent.
     private(set) var typedRowsDuringRingSteps: [Int] = []
 
@@ -224,6 +226,7 @@ actor FakeRing: SyncableRing {
 
     func setMonitoringInterval(_ interval: MonitoringInterval) async throws {
         record("interval \(interval.rawValue)")
+        outcomesWhenIntervalSent = try await store.loggedClockSets(ringID: ringID).map(\.outcome)
         typedRowsDuringRingSteps = try await typedRowCounts(store, ringID)
         if case .fail(let error) = self.interval { throw error }
     }

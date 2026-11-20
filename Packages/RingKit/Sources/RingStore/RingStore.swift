@@ -635,7 +635,6 @@ public final class RingStore: Sendable {
     /// resolution reads them. Events are appended, never merged. Throws `unknownRing(event.ringID)`
     /// if the ring is not stored. A `CancellationError` rolls the write back, so the caller cannot
     /// assume it was logged.
-    @discardableResult
     public func recordClockSet(_ event: ClockSetEvent) async throws -> Int64 {
         try await write { db in try Self.recordClockSet(db, event) }
     }
@@ -688,9 +687,9 @@ public final class RingStore: Sendable {
 
     /// The clock-set log for a ring with row ids and recorded outcomes, in the same order as
     /// `clockSets(ringID:)` (time order, ties in the order recorded). Every entry is listed,
-    /// including ones time resolution ignores. Empty for a ring that is not stored. Can throw
-    /// `CancellationError`.
-    public func loggedClockSets(ringID: UUID) async throws -> [LoggedClockSet] {
+    /// including ones time resolution ignores. Empty for a ring that is not stored. Internal: what
+    /// ingestion reads, exposed for tests. Can throw `CancellationError`.
+    func loggedClockSets(ringID: UUID) async throws -> [LoggedClockSet] {
         try await read { db in try Self.loggedClockSets(db, ringID: ringID) }
     }
 

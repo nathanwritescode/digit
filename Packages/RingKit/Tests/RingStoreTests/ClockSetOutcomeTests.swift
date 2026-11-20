@@ -125,6 +125,65 @@ private func phantomFixture(_ store: RingStore) throws -> (Fixture, phantom: Int
         #expect(try resolve(phantom: .notSent) == ResolvedOffset(seconds: plus1, source: .resolved))
     }
 
+    /// The same phantom against a sleep session and an activity bucket: `phantom` is the phantom's
+    /// recorded outcome, the record's bytes are first seen at `firstSeen` after an unchanged fetch at
+    /// 7200, and `reference` and `start` are ring-local (stamped under the ring's real +1 h).
+    private func resolveWithPhantom(
+        _ phantom: LoggedClockSetOutcome?, kind: HistoryKind, reference: Date, start: Date? = nil, firstSeen: Double
+    ) throws -> ResolvedOffset {
+        let ring = UUID()
+        let record = [UInt8](repeating: 1, count: 6)
+        let observations = [
+            observation(ring, kind, data: [], at: at(-10), id: 1), observation(ring, kind, data: [], at: at(7200), id: 2),
+            observation(ring, kind, data: record, at: at(firstSeen), id: 3),
+        ]
+        let log = [(1, -200_000.0, plus1, LoggedClockSetOutcome?.some(.acknowledged)), (2, 0, plus1, .acknowledged), (3, 7210, 0, phantom)]
+            .map { id, seconds, offset, outcome in
+                LoggedClockSet(
+                    id: Int64(id),
+                    event: ClockSetEvent(ringID: ring, instant: at(seconds), timeZoneIdentifier: "Europe/London", utcOffsetSeconds: offset),
+                    outcome: outcome)
+            }
+        let r = TimeResolver(ringID: ring, kind: kind, observations: observations, loggedClockSets: log)
+        let w = try r.window(sightings: r.sightings(in: record), offset: 0, length: record.count)
+        return r.resolve(window: w, reference: reference, start: start)
+    }
+
+    /// A session from real 8000 to 10000 under +1 h, after the phantom: the phantom alone makes it
+    /// `resolved` an hour wrong.
+    @Test func aNotAppliedPhantomNoLongerChangesASleepSession() throws {
+        func resolve(_ phantom: LoggedClockSetOutcome?) throws -> ResolvedOffset {
+            try resolveWithPhantom(phantom, kind: .sleep, reference: at(10_000 + 3600), start: at(8000 + 3600), firstSeen: 14_400)
+        }
+        #expect(try resolve(nil) == ResolvedOffset(seconds: 0, source: .resolved))
+        #expect(try resolve(.unknown) == ResolvedOffset(seconds: 0, source: .resolved))
+        #expect(try resolve(.notApplied) == ResolvedOffset(seconds: plus1, source: .resolved))
+        #expect(try resolve(.notSent) == ResolvedOffset(seconds: plus1, source: .resolved))
+    }
+
+    /// A session from real 6000 to 9000 under +1 h spans the phantom's instant, so with the phantom
+    /// it is `ambiguous` by the offset-change rule; ignored, there is no offset change and it is
+    /// `resolved` to the ring's real clock.
+    @Test func aNotAppliedPhantomInsideASleepSessionNoLongerMakesItAmbiguous() throws {
+        func resolve(_ phantom: LoggedClockSetOutcome?) throws -> ResolvedOffset {
+            try resolveWithPhantom(phantom, kind: .sleep, reference: at(9000 + 3600), start: at(6000 + 3600), firstSeen: 14_400)
+        }
+        #expect(try resolve(nil) == ResolvedOffset(seconds: 0, source: .ambiguous))
+        #expect(try resolve(.unknown) == ResolvedOffset(seconds: 0, source: .ambiguous))
+        #expect(try resolve(.notApplied) == ResolvedOffset(seconds: plus1, source: .resolved))
+    }
+
+    /// An activity bucket ending at real 10800 under +1 h, first seen at 16000.
+    @Test func aNotAppliedPhantomNoLongerChangesAnActivityBucket() throws {
+        func resolve(_ phantom: LoggedClockSetOutcome?) throws -> ResolvedOffset {
+            try resolveWithPhantom(phantom, kind: .activity, reference: at(10_800 + 3600), firstSeen: 16_000)
+        }
+        #expect(try resolve(nil) == ResolvedOffset(seconds: 0, source: .resolved))
+        #expect(try resolve(.unknown) == ResolvedOffset(seconds: 0, source: .resolved))
+        #expect(try resolve(.notApplied) == ResolvedOffset(seconds: plus1, source: .resolved))
+        #expect(try resolve(.notSent) == ResolvedOffset(seconds: plus1, source: .resolved))
+    }
+
     /// An entry with no outcome or `unknown` resolves exactly as the plain event list does.
     @Test func entriesWithNoOutcomeOrUnknownResolveAsThePlainLog() throws {
         let ring = UUID()
@@ -229,7 +288,7 @@ private func phantomFixture(_ store: RingStore) throws -> (Fixture, phantom: Int
         #expect(try await store.loggedClockSets(ringID: id).map(\.outcome) == [nil, .notApplied])
         let next = try await store.recordClockSet(
             ClockSetEvent(ringID: id, instant: at(0), timeZoneIdentifier: "UTC", utcOffsetSeconds: 0))
-        #expect(next > logged.map(\.id).max()!)
+        #expect(next > (try #require(logged.map(\.id).max())))
     }
 }
 

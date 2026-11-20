@@ -119,7 +119,7 @@ public enum ClockSetOutcome: Sendable, Equatable {
 
     /// The outcome to record against the log entry, or `nil` when there is no entry
     /// (`notLogged`, `skipped`).
-    public var loggedOutcome: LoggedClockSetOutcome? {
+    var loggedOutcome: LoggedClockSetOutcome? {
         switch self {
         case .acknowledgedAndLogged: .acknowledged
         case .notAppliedButLogged: .notApplied

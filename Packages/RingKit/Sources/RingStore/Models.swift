@@ -124,10 +124,11 @@ public struct ClockSetEvent: Equatable, Sendable {
 public enum LoggedClockSetOutcome: Sendable, CaseIterable {
     /// Sent, and the ring acknowledged it.
     case acknowledged
-    /// Sent, but the ring certainly did not apply it: an error reply, or a refusal before anything
-    /// was written. Time resolution ignores the entry.
+    /// Not applied: the ring replied with an error, or the transport refused the command before
+    /// writing it (so nothing reached the ring). Time resolution ignores the entry. That an error
+    /// reply to a clock-set leaves the clock unchanged is unverified on hardware.
     case notApplied
-    /// Logged but never sent (for example because logging took too long and the time was stale).
+    /// Logged, but the sync withheld the command (logging took too long, so the time was stale).
     /// Time resolution ignores the entry.
     case notSent
     /// Sent, but whether the ring applied it is not known (a timeout, a lost connection). Time
@@ -136,7 +137,7 @@ public enum LoggedClockSetOutcome: Sendable, CaseIterable {
 
     /// Whether time resolution leaves the entry out: only when the ring's clock certainly did not
     /// change. `unknown` stays a candidate, because the ring may have applied it.
-    public var excludesFromTimeResolution: Bool {
+    var excludesFromTimeResolution: Bool {
         switch self {
         case .notApplied, .notSent: true
         case .acknowledged, .unknown: false
@@ -144,19 +145,13 @@ public enum LoggedClockSetOutcome: Sendable, CaseIterable {
     }
 }
 
-/// A clock-set as the log holds it: its row id (`RingStore.recordClockSet` returns it), the event,
-/// and its recorded outcome, `nil` when none was recorded (an entry written before outcomes
-/// existed, one whose outcome write failed, or one whose code this version does not know).
-public struct LoggedClockSet: Equatable, Sendable {
-    public var id: Int64
-    public var event: ClockSetEvent
-    public var outcome: LoggedClockSetOutcome?
-
-    public init(id: Int64, event: ClockSetEvent, outcome: LoggedClockSetOutcome?) {
-        self.id = id
-        self.event = event
-        self.outcome = outcome
-    }
+/// A clock-set as the log holds it, for ingestion: its row id (`RingStore.recordClockSet` returns
+/// it), the event, and its recorded outcome, `nil` when none was recorded (an entry written before
+/// outcomes existed, one whose outcome write failed, or one whose code this version does not know).
+struct LoggedClockSet: Equatable, Sendable {
+    let id: Int64
+    let event: ClockSetEvent
+    let outcome: LoggedClockSetOutcome?
 }
 
 public enum RingStoreError: Error, Equatable, Sendable {
@@ -187,8 +182,8 @@ public enum RingStoreError: Error, Equatable, Sendable {
     /// not know. Opening refuses it so an older build never writes into a newer schema.
     case schemaTooNew
     /// `ingest` or `rebuild` found, `RingStore.maximumDerivationAttempts` times in a row, that
-    /// another write had changed its inputs (transfers, fetch log, clock-sets or their outcomes) between deriving
-    /// the typed rows and applying them. Nothing was applied: the typed tables are as they were.
+    /// another write had changed its inputs (transfers, fetch log, clock-sets or their outcomes)
+    /// between deriving the typed rows and applying them. Nothing was applied: the typed tables are as they were.
     /// The stored history is intact; call again once the other writer has finished.
     case ingestionInputsKeptChanging
 }

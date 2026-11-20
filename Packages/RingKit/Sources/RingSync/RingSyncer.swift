@@ -21,7 +21,8 @@ import RingTransport
 ///    not sent (the clock-set is skipped, and so is the interval). A logged clock-set the ring did
 ///    not apply stays in the log (see "Phantom clock-sets" below). Once the send has finished (or
 ///    been withheld because logging was too slow), its outcome is recorded against the entry with
-///    `recordClockSetOutcome` (best effort, `ClockSetOutcomeRecord`).
+///    `recordClockSetOutcome` (best effort, `ClockSetOutcomeRecord`); an acknowledged one only
+///    after step 3.
 /// 3. Only if the ring acknowledged the clock-set, and an interval was supplied: send the
 ///    monitoring interval. The clock goes first because readings align to the ring's clock.
 ///
@@ -29,8 +30,9 @@ import RingTransport
 /// any store step of the ring phase ends it: the failing kind is `failed`, the remaining kinds are
 /// `notAttempted(.storeSuspended)`, and the clock-set and the interval are skipped with
 /// `.storeSuspended`. A suspension while recording the clock-set's outcome (after the send) leaves
-/// the clock-set as it happened, reports the record as failed and skips the interval with
-/// `.storeSuspended`. `run()` then does not start the derive phase, and its kinds are
+/// the clock-set as it happened and reports the record as failed; for an acknowledged clock-set
+/// the outcome is recorded after the interval, which has then already been sent, and otherwise
+/// the interval is skipped with `.storeSuspended`. `run()` then does not start the derive phase, and its kinds are
 /// `IngestionOutcome.storeSuspended` too. In `ingestAll()` the first suspension makes every remaining
 /// kind `IngestionOutcome.storeSuspended`. It is detected on the raw error where it is caught, not on
 /// the sanitised `SyncError`. Nothing is retried after the app resumes: that is the caller's
@@ -179,17 +181,31 @@ public struct RingSyncer: Sendable {
     ///
     /// Run it at most once per session (connect, create a session, sync once). A late reply to an
     /// earlier request can be taken as the reply to a later one of the same type, so a second
-    /// clock-set on the same session could be answered by a late error reply to the first, be
-    /// classed as not applied, and be left out of the log although the ring applied it.
+    /// clock-set on the same session could be answered by a late error reply to the first and be
+    /// classed as not applied although the ring applied it. Its entry would then be recorded as
+    /// `notApplied` and ignored by time resolution: the same harm as a clock-set missing from the log.
+    ///
+    /// The outcome of an acknowledged clock-set is recorded after the interval: an `acknowledged`
+    /// outcome resolves exactly like no outcome, so its write must not be able to keep the interval
+    /// from being sent (a suspension during it would). Every other outcome is recorded at once, and
+    /// the interval is skipped for those anyway. Both are recorded before the phase returns, so
+    /// before the derive phase.
     public func syncRing() async -> RingPhaseResult {
         let deadline = monotonicNow() + budget
         let budgetLeft = { monotonicNow() < deadline }
         let fetched = await fetchAll(budgetLeft: budgetLeft)
         let (clockSet, entryID) = await setClock(
             after: fetched.outcomes, storeSuspended: fetched.storeSuspended, budgetLeft: budgetLeft)
-        let record = await recordOutcome(of: clockSet, entryID: entryID)
-        let interval = await sendInterval(
-            after: clockSet, outcomeRecordSuspended: record.storeSuspended, budgetLeft: budgetLeft)
+        let record: (record: ClockSetOutcomeRecord, storeSuspended: Bool)
+        let interval: MonitoringIntervalOutcome
+        if clockSet.wasAcknowledged {
+            interval = await sendInterval(after: clockSet, outcomeRecordSuspended: false, budgetLeft: budgetLeft)
+            record = await recordOutcome(of: clockSet, entryID: entryID)
+        } else {
+            record = await recordOutcome(of: clockSet, entryID: entryID)
+            interval = await sendInterval(
+                after: clockSet, outcomeRecordSuspended: record.storeSuspended, budgetLeft: budgetLeft)
+        }
         // A suspension while logging the clock-set, or while recording its outcome, ends the phase too.
         let suspended = fetched.storeSuspended || clockSet == .skipped(.storeSuspended) || record.storeSuspended
         return RingPhaseResult(
@@ -336,8 +352,9 @@ public struct RingSyncer: Sendable {
 
     /// Records the clock-set's outcome against its log entry (#72). Best effort: a failure leaves
     /// the entry without an outcome, which time resolution treats as before, and changes nothing
-    /// else in the sync, except that a suspension ends the ring phase like any other store step.
-    /// Runs before the derive phase, so the same sync's ingestion sees the outcome.
+    /// else in the sync, except that a suspension ends the ring phase like any other store step
+    /// (after an acknowledged clock-set the interval has already been sent by then). Runs before
+    /// the derive phase, so the same sync's ingestion sees the outcome.
     private func recordOutcome(
         of clockSet: ClockSetOutcome, entryID: Int64?
     ) async -> (record: ClockSetOutcomeRecord, storeSuspended: Bool) {
@@ -401,6 +418,12 @@ public struct RingSyncer: Sendable {
     /// command was refused before anything could be written. Everything else leaves the outcome
     /// unknown, including `stopped` (a `stop()` can come after the write) and errors that are not
     /// `RingError`.
+    ///
+    /// Unverified for an error reply: no error reply to `0x0100` has been seen on hardware, so that
+    /// an error reply means the clock was left unchanged is an assumption (a planner decision).
+    /// Such an entry is recorded as `notApplied` and ignored by time resolution (#72), so if the
+    /// ring ever applied a clock-set it answered with an error, the log would in effect lack a
+    /// clock-set the ring applied, which is the worse error.
     static func definitelyNotApplied(_ error: any Error) -> Bool {
         guard let error = error as? RingError else { return false }
         switch error {
