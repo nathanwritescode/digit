@@ -241,30 +241,32 @@ extension RingStore {
     }
 
     /// Identifies what derivation read for one ring and kind: the ids of its transfers, of its
-    /// fetch-log entries, and of the ring's clock-sets, each in id order. Read in the same snapshot
-    /// as the inputs, and again inside the apply step's write; any difference means the derivation
-    /// is stale.
+    /// fetch-log entries, of the ring's clock-sets and of their recorded outcomes, each in id
+    /// order. Read in the same snapshot as the inputs, and again inside the apply step's write; any
+    /// difference means the derivation is stale.
     ///
-    /// Ids are enough, with no false negatives through the store's API, because those three tables
+    /// Ids are enough, with no false negatives through the store's API, because those four tables
     /// are append-only except for pruning, and no statement updates a row of them: a transfer row
-    /// is only ever inserted or deleted (pruned), a fetch-log entry or clock-set only inserted.
-    /// `history_transfer` and `clock_set` use AUTOINCREMENT, so an id is never reused, and
-    /// `transfer_observation` could reuse one only after its highest row was deleted, which nothing
-    /// does. Every write that can change a derivation (an `insert` that stores, prunes or only logs
-    /// a fetch, a `recordClockSet`) therefore changes the fingerprint; an `insert` of a fetch
-    /// already logged at that instant changes nothing and is rightly not stale. Reading ids only
-    /// touches the indexes, never a transfer's data, so the check is cheap and the apply step stays
-    /// short. A fingerprint of a hash instead of the lists would be smaller but would need hashing
-    /// inside the write.
+    /// is only ever inserted or deleted (pruned), a fetch-log entry, clock-set or clock-set outcome
+    /// only inserted. `history_transfer`, `clock_set` and `clock_set_outcome` use AUTOINCREMENT, so
+    /// an id is never reused, and `transfer_observation` could reuse one only after its highest row
+    /// was deleted, which nothing does. Every write that can change a derivation (an `insert` that
+    /// stores, prunes or only logs a fetch, a `recordClockSet`, a `recordClockSetOutcome`) therefore
+    /// changes the fingerprint; an `insert` of a fetch already logged at that instant, or an outcome
+    /// recorded again, changes nothing and is rightly not stale. Reading ids only touches the
+    /// indexes, never a transfer's data, so the check is cheap and the apply step stays short. A
+    /// fingerprint of a hash instead of the lists would be smaller but would need hashing inside
+    /// the write.
     ///
     /// **Rule:** every table `loadInputs` reads must contribute to this fingerprint, and the id-list
     /// form holds only while those tables stay append-only as described. A change that updates or
-    /// deletes their rows (the observation migration in #32, an erase feature, recording clock-set
-    /// outcomes in #72) must extend the fingerprint.
+    /// deletes their rows (the observation migration in #32, an erase feature) must extend the
+    /// fingerprint.
     struct InputFingerprint: Equatable, Sendable {
         var transferIDs: [Int64]
         var observationIDs: [Int64]
         var clockSetIDs: [Int64]
+        var clockSetOutcomeIDs: [Int64]
     }
 
     /// Internal only for tests.
@@ -279,15 +281,23 @@ extension RingStore {
                 db, sql: "SELECT id FROM transfer_observation WHERE ring_id = ? AND kind = ? ORDER BY id",
                 arguments: [ring, code]),
             clockSetIDs: try Int64.fetchAll(
-                db, sql: "SELECT id FROM clock_set WHERE ring_id = ? ORDER BY id", arguments: [ring]))
+                db, sql: "SELECT id FROM clock_set WHERE ring_id = ? ORDER BY id", arguments: [ring]),
+            clockSetOutcomeIDs: try Int64.fetchAll(
+                db,
+                sql: """
+                    SELECT o.id FROM clock_set_outcome o JOIN clock_set c ON c.id = o.clock_set_id
+                    WHERE c.ring_id = ? ORDER BY o.id
+                    """,
+                arguments: [ring]))
     }
 
-    /// Everything derivation reads for one kind, from one snapshot, with its fingerprint.
+    /// Everything derivation reads for one kind, from one snapshot, with its fingerprint. The
+    /// clock-set log comes with its outcomes; `TimeResolver` leaves out the entries they rule out.
     struct IngestionInputs: Sendable {
         var kind: HistoryKind
         var transfers: [StoredTransfer]
         var observations: [TransferObservation]
-        var clockSets: [ClockSetEvent]
+        var clockSets: [LoggedClockSet]
         var fingerprint: InputFingerprint
     }
 
@@ -296,7 +306,7 @@ extension RingStore {
     /// the tests' one-transaction reference.
     static func loadInputs(_ db: Database, ringID: UUID, kinds: [HistoryKind]) throws -> [IngestionInputs] {
         try Self.requireRing(db, ringID)
-        let clockSets = try Self.clockSets(db, ringID: ringID)
+        let clockSets = try Self.loggedClockSets(db, ringID: ringID)
         return try kinds.map { kind in
             IngestionInputs(
                 kind: kind,
@@ -424,7 +434,7 @@ extension RingStore {
         try checkpoint()
         let transfers = inputs.transfers
         let resolver = TimeResolver(
-            ringID: ringID, kind: kind, observations: inputs.observations, clockSets: inputs.clockSets)
+            ringID: ringID, kind: kind, observations: inputs.observations, loggedClockSets: inputs.clockSets)
         var result = IngestionResult()
         let rows: IngestionPlan.Rows
         switch kind {

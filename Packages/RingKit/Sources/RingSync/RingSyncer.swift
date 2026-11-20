@@ -19,14 +19,20 @@ import RingTransport
 ///    and one fixed copy of the zone used for the log entry and the command alike. The entry is
 ///    logged with `recordClockSet` **before** `0x0100` is sent, and if logging fails the command is
 ///    not sent (the clock-set is skipped, and so is the interval). A logged clock-set the ring did
-///    not apply stays in the log (see "Phantom clock-sets" below).
+///    not apply stays in the log (see "Phantom clock-sets" below). Once the send has finished (or
+///    been withheld because logging was too slow), its outcome is recorded against the entry with
+///    `recordClockSetOutcome` (best effort, `ClockSetOutcomeRecord`); an acknowledged one only
+///    after step 3.
 /// 3. Only if the ring acknowledged the clock-set, and an interval was supplied: send the
 ///    monitoring interval. The clock goes first because readings align to the ring's clock.
 ///
 /// **Store suspension.** `RingStoreError.suspended` (the app announced it is about to suspend) in
 /// any store step of the ring phase ends it: the failing kind is `failed`, the remaining kinds are
 /// `notAttempted(.storeSuspended)`, and the clock-set and the interval are skipped with
-/// `.storeSuspended`. `run()` then does not start the derive phase, and its kinds are
+/// `.storeSuspended`. A suspension while recording the clock-set's outcome (after the send) leaves
+/// the clock-set as it happened and reports the record as failed; for an acknowledged clock-set
+/// the outcome is recorded after the interval, which has then already been sent, and otherwise
+/// the interval is skipped with `.storeSuspended`. `run()` then does not start the derive phase, and its kinds are
 /// `IngestionOutcome.storeSuspended` too. In `ingestAll()` the first suspension makes every remaining
 /// kind `IngestionOutcome.storeSuspended`. It is detected on the raw error where it is caught, not on
 /// the sanitised `SyncError`. Nothing is retried after the app resumes: that is the caller's
@@ -54,9 +60,10 @@ import RingTransport
 /// after an error reply or a refusal before writing (`ClockSetOutcome.notAppliedButLogged`:
 /// `RingError.rejected`, `refusedDestructive`, `refusedUploadGroup`, `busy`), after any error that
 /// leaves the outcome unknown, and when logging was too slow to send safely
-/// (`ClockSetOutcome.notSentLogTooSlow`). Time resolution may therefore see a phantom clock-set;
-/// that is the accepted error for now. Recording outcomes so the resolver can ignore unapplied
-/// entries is #72.
+/// (`ClockSetOutcome.notSentLogTooSlow`). The sync then records the outcome against the entry
+/// (#72), and time resolution ignores entries recorded as `notApplied` or `notSent`. An entry whose
+/// outcome is `unknown`, or whose outcome could not be recorded, stays a candidate for time
+/// resolution: a phantom there is still the accepted error.
 ///
 /// **Stale time.** The time sent is read before the log write, and the entry must stay the event
 /// sent, so it is not re-read. If the log write took longer than `maximumClockLogDelay` (a write
@@ -174,19 +181,36 @@ public struct RingSyncer: Sendable {
     ///
     /// Run it at most once per session (connect, create a session, sync once). A late reply to an
     /// earlier request can be taken as the reply to a later one of the same type, so a second
-    /// clock-set on the same session could be answered by a late error reply to the first, be
-    /// classed as not applied, and be left out of the log although the ring applied it.
+    /// clock-set on the same session could be answered by a late error reply to the first and be
+    /// classed as not applied although the ring applied it. Its entry would then be recorded as
+    /// `notApplied` and ignored by time resolution: the same harm as a clock-set missing from the log.
+    ///
+    /// The outcome of an acknowledged clock-set is recorded after the interval: an `acknowledged`
+    /// outcome resolves exactly like no outcome, so its write must not be able to keep the interval
+    /// from being sent (a suspension during it would). Every other outcome is recorded at once, and
+    /// the interval is skipped for those anyway. Both are recorded before the phase returns, so
+    /// before the derive phase.
     public func syncRing() async -> RingPhaseResult {
         let deadline = monotonicNow() + budget
         let budgetLeft = { monotonicNow() < deadline }
         let fetched = await fetchAll(budgetLeft: budgetLeft)
-        let clockSet = await setClock(after: fetched.outcomes, storeSuspended: fetched.storeSuspended, budgetLeft: budgetLeft)
-        let interval = await sendInterval(after: clockSet, budgetLeft: budgetLeft)
-        // A suspension while logging the clock-set ends the phase too.
-        let suspended = fetched.storeSuspended || clockSet == .skipped(.storeSuspended)
+        let (clockSet, entryID) = await setClock(
+            after: fetched.outcomes, storeSuspended: fetched.storeSuspended, budgetLeft: budgetLeft)
+        let record: (record: ClockSetOutcomeRecord, storeSuspended: Bool)
+        let interval: MonitoringIntervalOutcome
+        if clockSet.wasAcknowledged {
+            interval = await sendInterval(after: clockSet, outcomeRecordSuspended: false, budgetLeft: budgetLeft)
+            record = await recordOutcome(of: clockSet, entryID: entryID)
+        } else {
+            record = await recordOutcome(of: clockSet, entryID: entryID)
+            interval = await sendInterval(
+                after: clockSet, outcomeRecordSuspended: record.storeSuspended, budgetLeft: budgetLeft)
+        }
+        // A suspension while logging the clock-set, or while recording its outcome, ends the phase too.
+        let suspended = fetched.storeSuspended || clockSet == .skipped(.storeSuspended) || record.storeSuspended
         return RingPhaseResult(
-            fetches: fetched.outcomes, clockSet: clockSet, monitoringInterval: interval,
-            endedBecauseStoreSuspended: suspended)
+            fetches: fetched.outcomes, clockSet: clockSet, clockSetOutcomeRecord: record.record,
+            monitoringInterval: interval, endedBecauseStoreSuspended: suspended)
     }
 
     /// The derive phase: ingest every kind, each on its own, so one failure does not stop the
@@ -282,12 +306,13 @@ public struct RingSyncer: Sendable {
         return FetchStep(outcome: .failed(stage: .notPersistedBeforeAcknowledgement, error: .persistNotCalled))
     }
 
+    /// The outcome, and the log entry's id when one was written.
     private func setClock(
         after fetches: PerKind<FetchOutcome>, storeSuspended: Bool, budgetLeft: () -> Bool
-    ) async -> ClockSetOutcome {
-        if storeSuspended { return .skipped(.storeSuspended) }
-        guard fetches.values.allSatisfy(\.isFetched) else { return .skipped(.historyIncomplete) }
-        guard budgetLeft() else { return .skipped(.budgetExhausted) }
+    ) async -> (ClockSetOutcome, entryID: Int64?) {
+        if storeSuspended { return (.skipped(.storeSuspended), nil) }
+        guard fetches.values.allSatisfy(\.isFetched) else { return (.skipped(.historyIncomplete), nil) }
+        guard budgetLeft() else { return (.skipped(.budgetExhausted), nil) }
         // One reading of each, and a fixed copy of the zone: reading twice, or an auto-updating
         // zone changing in between, could log a different offset from the one sent at a
         // daylight-saving boundary.
@@ -303,32 +328,53 @@ public struct RingSyncer: Sendable {
         // Log first: an entry for a clock-set that was not applied is the safer error than a
         // clock-set the ring applied that the log does not know about. If logging fails, nothing
         // is sent.
+        let entryID: Int64
         do {
-            try await store.recordClockSet(event)
+            entryID = try await store.recordClockSet(event)
         } catch {
-            if Self.isSuspension(error) { return .skipped(.storeSuspended) }
-            return .notLogged(SyncError(error))
+            if Self.isSuspension(error) { return (.skipped(.storeSuspended), nil) }
+            return (.notLogged(SyncError(error)), nil)
         }
         // The time was read before the write; the entry must stay the event sent, so it is not
         // re-read. If the write was slow the time is stale: leave the entry as a phantom. This bounds
         // only the log write; the session's write turn and the link's `writeTimeout` can add more
         // before the ring receives the command, bounded by the transport's own deadlines.
         let elapsed = monotonicNow() - readAt
-        if elapsed > maximumLogDelay { return .notSentLogTooSlow(event, elapsed: elapsed) }
+        if elapsed > maximumLogDelay { return (.notSentLogTooSlow(event, elapsed: elapsed), entryID) }
         do {
             try await ring.setTime(date, timeZone: zone)
         } catch {
-            if Self.definitelyNotApplied(error) { return .notAppliedButLogged(event, error: SyncError(error)) }
-            return .unknownAndLogged(event, error: SyncError(error))
+            if Self.definitelyNotApplied(error) { return (.notAppliedButLogged(event, error: SyncError(error)), entryID) }
+            return (.unknownAndLogged(event, error: SyncError(error)), entryID)
         }
-        return .acknowledgedAndLogged(event)
+        return (.acknowledgedAndLogged(event), entryID)
     }
 
-    private func sendInterval(after clockSet: ClockSetOutcome, budgetLeft: () -> Bool) async -> MonitoringIntervalOutcome {
+    /// Records the clock-set's outcome against its log entry (#72). Best effort: a failure leaves
+    /// the entry without an outcome, which time resolution treats as before, and changes nothing
+    /// else in the sync, except that a suspension ends the ring phase like any other store step
+    /// (after an acknowledged clock-set the interval has already been sent by then). Runs before
+    /// the derive phase, so the same sync's ingestion sees the outcome.
+    private func recordOutcome(
+        of clockSet: ClockSetOutcome, entryID: Int64?
+    ) async -> (record: ClockSetOutcomeRecord, storeSuspended: Bool) {
+        guard let entryID, let outcome = clockSet.loggedOutcome else { return (.noLogEntry, false) }
+        do {
+            try await store.recordClockSetOutcome(id: entryID, outcome: outcome)
+            return (.recorded(outcome), false)
+        } catch {
+            return (.failed(outcome, error: SyncError(error)), Self.isSuspension(error))
+        }
+    }
+
+    private func sendInterval(
+        after clockSet: ClockSetOutcome, outcomeRecordSuspended: Bool, budgetLeft: () -> Bool
+    ) async -> MonitoringIntervalOutcome {
         guard let interval = monitoringInterval else { return .notRequested }
         if case .skipped(let reason) = clockSet, reason == .budgetExhausted || reason == .storeSuspended {
             return .skipped(interval, reason)
         }
+        if outcomeRecordSuspended { return .skipped(interval, .storeSuspended) }
         switch clockSet {
         case .notLogged, .notSentLogTooSlow: return .skipped(interval, .clockNotSent)
         case .acknowledgedAndLogged, .unknownAndLogged, .notAppliedButLogged, .skipped: break
@@ -372,6 +418,12 @@ public struct RingSyncer: Sendable {
     /// command was refused before anything could be written. Everything else leaves the outcome
     /// unknown, including `stopped` (a `stop()` can come after the write) and errors that are not
     /// `RingError`.
+    ///
+    /// Unverified for an error reply: no error reply to `0x0100` has been seen on hardware, so that
+    /// an error reply means the clock was left unchanged is an assumption (a planner decision).
+    /// Such an entry is recorded as `notApplied` and ignored by time resolution (#72), so if the
+    /// ring ever applied a clock-set it answered with an error, the log would in effect lack a
+    /// clock-set the ring applied, which is the worse error.
     static func definitelyNotApplied(_ error: any Error) -> Bool {
         guard let error = error as? RingError else { return false }
         switch error {

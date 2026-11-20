@@ -10,11 +10,12 @@ import RingTransport
 //   superseded, colliding or without vitals; unusable bytes; skipped sleep stages; rows per time
 //   source);
 // - in a clock-set entry, the store's own ring id, the instant sent (whole milliseconds), the zone
-//   identifier and the UTC offset;
+//   identifier and the UTC offset; whether its outcome was recorded, and which outcome code;
 // - the monitoring interval, and `MonitoringSettingError` codes;
 // - sanitised errors (`SyncError`, never a raw error): ring error case names, the session's
-//   timeout text, command types and reply codes; store failures with the store's own ring ids, an
-//   errno, or a constant naming what could not be read; SQLite result codes; an error's type name.
+//   timeout text, command types and reply codes; store failures with the store's own ring ids or
+//   clock-set row ids, an errno, or a constant naming what could not be read; SQLite result codes;
+//   an error's type name.
 // Row ids and the store's ring ids are the app's own, not device identifiers. It holds no history
 // bytes, no decoded reading, no `Frame`, no file path and no device identifier. This target prints
 // and logs nothing.
@@ -80,12 +81,13 @@ public enum FetchOutcome: Sendable, Equatable {
 
 /// What happened to the clock-set.
 ///
-/// The clock-set is logged before it is sent, and time resolution treats every logged clock-set as
-/// one that happened. A logged clock-set the ring did not apply therefore stays in the log, by
-/// design (there is no delete). That is the safer error than a missing entry only while the
-/// phantom's offset equals the ring's real one: a phantom with a different offset makes later
-/// records resolve wrongly, just as a missing entry does. Recording outcomes so the resolver can
-/// ignore unapplied entries is #72.
+/// The clock-set is logged before it is sent, and a logged clock-set the ring did not apply stays in
+/// the log, by design (there is no delete). After the send, the sync records the outcome against
+/// the entry (`ClockSetOutcomeRecord`, #72): time resolution ignores an entry recorded as
+/// `notApplied` or `notSent`, and treats one recorded as `unknown`, or with no outcome (the write
+/// failed), as a clock-set that happened. Such an entry is the safer error than a missing one only
+/// while its offset equals the ring's real one: a phantom with a different offset makes later
+/// records resolve wrongly, just as a missing entry does.
 public enum ClockSetOutcome: Sendable, Equatable {
     /// Logged, sent, and the ring acknowledged it.
     case acknowledgedAndLogged(ClockSetEvent)
@@ -114,6 +116,33 @@ public enum ClockSetOutcome: Sendable, Equatable {
     public var wasAcknowledged: Bool {
         if case .acknowledgedAndLogged = self { true } else { false }
     }
+
+    /// The outcome to record against the log entry, or `nil` when there is no entry
+    /// (`notLogged`, `skipped`).
+    var loggedOutcome: LoggedClockSetOutcome? {
+        switch self {
+        case .acknowledgedAndLogged: .acknowledged
+        case .notAppliedButLogged: .notApplied
+        case .notSentLogTooSlow: .notSent
+        case .unknownAndLogged: .unknown
+        case .notLogged, .skipped: nil
+        }
+    }
+}
+
+/// Whether the clock-set's outcome reached the store (#72), so time resolution can ignore a logged
+/// clock-set the ring certainly did not apply. Recording is best effort: when it fails the entry
+/// stays without an outcome, which time resolution treats as a clock-set that happened, as it did
+/// before outcomes were recorded. It is recorded in the ring phase, so the same sync's ingestion
+/// already sees it.
+public enum ClockSetOutcomeRecord: Sendable, Equatable {
+    /// Recorded against the log entry.
+    case recorded(LoggedClockSetOutcome)
+    /// There is no log entry to record against: the clock-set was not logged, or was skipped.
+    case noLogEntry
+    /// The write failed (sanitised). The entry has no outcome. A store suspension also ends the
+    /// ring phase (`RingPhaseResult.endedBecauseStoreSuspended`), as in any other store step.
+    case failed(LoggedClockSetOutcome, error: SyncError)
 }
 
 /// What happened to the monitoring interval.
@@ -170,6 +199,8 @@ public struct PerKind<Value: Sendable & Equatable>: Sendable, Equatable {
 public struct RingPhaseResult: Sendable, Equatable {
     public let fetches: PerKind<FetchOutcome>
     public let clockSet: ClockSetOutcome
+    /// Whether the clock-set's outcome was recorded in the store.
+    public let clockSetOutcomeRecord: ClockSetOutcomeRecord
     public let monitoringInterval: MonitoringIntervalOutcome
 
     /// Whether the phase ended because the store was suspended (set by `syncRing()`), so the derive
@@ -182,6 +213,8 @@ public struct SyncResult: Sendable, Equatable {
     /// Every history kind, in fetch order.
     public let fetches: PerKind<FetchOutcome>
     public let clockSet: ClockSetOutcome
+    /// Whether the clock-set's outcome was recorded in the store.
+    public let clockSetOutcomeRecord: ClockSetOutcomeRecord
     public let monitoringInterval: MonitoringIntervalOutcome
     /// Every history kind's ingestion, in the same order; ingestion runs whatever happened before it.
     public let ingestions: PerKind<IngestionOutcome>
@@ -190,6 +223,7 @@ public struct SyncResult: Sendable, Equatable {
     public init(ringPhase: RingPhaseResult, ingestions: PerKind<IngestionOutcome>) {
         fetches = ringPhase.fetches
         clockSet = ringPhase.clockSet
+        clockSetOutcomeRecord = ringPhase.clockSetOutcomeRecord
         monitoringInterval = ringPhase.monitoringInterval
         self.ingestions = ingestions
     }

@@ -56,7 +56,9 @@ struct Fixture {
         try setClock(at: instant, offset: offset, zone: zone)
     }
 
-    func setClock(at instant: Date, offset: Int, zone: String = "Europe/London") throws {
+    /// Returns the entry's id, for recording its outcome.
+    @discardableResult
+    func setClock(at instant: Date, offset: Int, zone: String = "Europe/London") throws -> Int64 {
         try store.recordClockSet(ClockSetEvent(
             ringID: ring.id, instant: instant, timeZoneIdentifier: zone, utcOffsetSeconds: offset))
     }

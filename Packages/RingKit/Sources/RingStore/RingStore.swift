@@ -625,19 +625,21 @@ public final class RingStore: Sendable {
     // MARK: Clock sets
 
     /// Blocking form of `recordClockSet(_:)` (internal, for tests).
-    func recordClockSet(_ event: ClockSetEvent) throws {
+    @discardableResult
+    func recordClockSet(_ event: ClockSetEvent) throws -> Int64 {
         try writeBlocking { db in try Self.recordClockSet(db, event) }
     }
 
-    /// Logs that the app set the ring's clock, with the zone and UTC offset it sent. Every
-    /// clock-set must be logged, because time resolution reads them. Events are appended, never
-    /// merged. Throws `unknownRing(event.ringID)` if the ring is not stored. A `CancellationError`
-    /// rolls the write back, so the caller cannot assume it was logged.
-    public func recordClockSet(_ event: ClockSetEvent) async throws {
+    /// Logs that the app set the ring's clock, with the zone and UTC offset it sent, and returns
+    /// the entry's id, for `recordClockSetOutcome`. Every clock-set must be logged, because time
+    /// resolution reads them. Events are appended, never merged. Throws `unknownRing(event.ringID)`
+    /// if the ring is not stored. A `CancellationError` rolls the write back, so the caller cannot
+    /// assume it was logged.
+    public func recordClockSet(_ event: ClockSetEvent) async throws -> Int64 {
         try await write { db in try Self.recordClockSet(db, event) }
     }
 
-    private static func recordClockSet(_ db: Database, _ event: ClockSetEvent) throws {
+    private static func recordClockSet(_ db: Database, _ event: ClockSetEvent) throws -> Int64 {
         try Self.requireRing(db, event.ringID)
         try db.execute(
             sql: "INSERT INTO clock_set (ring_id, instant, time_zone_identifier, utc_offset_seconds) VALUES (?, ?, ?, ?)",
@@ -645,6 +647,69 @@ public final class RingStore: Sendable {
                 event.ringID.uuidString, HistoryTransfer.millisecondsSince1970(event.instant),
                 event.timeZoneIdentifier, event.utcOffsetSeconds,
             ])
+        return db.lastInsertedRowID
+    }
+
+    /// Blocking form of `recordClockSetOutcome(id:outcome:)` (internal, for tests).
+    func recordClockSetOutcome(id: Int64, outcome: LoggedClockSetOutcome) throws {
+        try writeBlocking { db in try Self.recordClockSetOutcome(db, id: id, outcome: outcome) }
+    }
+
+    /// Records what became of the logged clock-set `id` once the app tried to send it (#72), so
+    /// time resolution can ignore one the ring certainly did not apply (`notApplied`, `notSent`).
+    /// Append-only, one outcome per clock-set: recording the outcome it already has does nothing,
+    /// and a different one throws `clockSetOutcomeConflict(id)` and changes nothing. Throws
+    /// `unknownClockSet(id)` if the log has no such entry. Typed rows change only when `ingest` or
+    /// `rebuild` next runs; an ingestion that read its inputs before this write sees it as stale
+    /// and derives again. A `CancellationError` rolls the write back.
+    public func recordClockSetOutcome(id: Int64, outcome: LoggedClockSetOutcome) async throws {
+        try await write { db in try Self.recordClockSetOutcome(db, id: id, outcome: outcome) }
+    }
+
+    private static func recordClockSetOutcome(_ db: Database, id: Int64, outcome: LoggedClockSetOutcome) throws {
+        let exists = try Bool.fetchOne(db, sql: "SELECT EXISTS (SELECT 1 FROM clock_set WHERE id = ?)", arguments: [id])
+        if exists != true { throw RingStoreError.unknownClockSet(id) }
+        let code = ClockSetOutcomeCode.code(for: outcome)
+        if let existing = try String.fetchOne(
+            db, sql: "SELECT outcome FROM clock_set_outcome WHERE clock_set_id = ?", arguments: [id]
+        ) {
+            if existing == code { return }
+            throw RingStoreError.clockSetOutcomeConflict(id)
+        }
+        try db.execute(
+            sql: "INSERT INTO clock_set_outcome (clock_set_id, outcome) VALUES (?, ?)", arguments: [id, code])
+    }
+
+    /// Blocking form of `loggedClockSets(ringID:)` (internal, for tests).
+    func loggedClockSets(ringID: UUID) throws -> [LoggedClockSet] {
+        try readBlocking { db in try Self.loggedClockSets(db, ringID: ringID) }
+    }
+
+    /// The clock-set log for a ring with row ids and recorded outcomes, in the same order as
+    /// `clockSets(ringID:)` (time order, ties in the order recorded). Every entry is listed,
+    /// including ones time resolution ignores. Empty for a ring that is not stored. Internal: what
+    /// ingestion reads, exposed for tests. Can throw `CancellationError`.
+    func loggedClockSets(ringID: UUID) async throws -> [LoggedClockSet] {
+        try await read { db in try Self.loggedClockSets(db, ringID: ringID) }
+    }
+
+    static func loggedClockSets(_ db: Database, ringID: UUID) throws -> [LoggedClockSet] {
+        try Row.fetchAll(
+            db,
+            sql: """
+                SELECT c.*, o.outcome AS outcome FROM clock_set c
+                LEFT JOIN clock_set_outcome o ON o.clock_set_id = c.id
+                WHERE c.ring_id = ? ORDER BY c.instant, c.id
+                """,
+            arguments: [ringID.uuidString]
+        ).map { row in
+            // An outcome code this version does not know reads as no outcome, which time
+            // resolution treats exactly as before outcomes existed.
+            let code: String? = try Self.column(row, "outcome")
+            return LoggedClockSet(
+                id: try Self.column(row, "id"), event: try Self.clockSetEvent(row),
+                outcome: code.flatMap(ClockSetOutcomeCode.outcome(forCode:)))
+        }
     }
 
     /// Blocking form of `clockSets(ringID:)` (internal, for tests).
@@ -653,7 +718,8 @@ public final class RingStore: Sendable {
     }
 
     /// Clock-set events for a ring in time order (ties in the order recorded); empty for a ring that
-    /// is not stored. Can throw `CancellationError`.
+    /// is not stored. Every logged entry, whatever its outcome (see `loggedClockSets(ringID:)`).
+    /// Can throw `CancellationError`.
     public func clockSets(ringID: UUID) async throws -> [ClockSetEvent] {
         try await read { db in try Self.clockSets(db, ringID: ringID) }
     }
@@ -661,12 +727,33 @@ public final class RingStore: Sendable {
     static func clockSets(_ db: Database, ringID: UUID) throws -> [ClockSetEvent] {
         try Row.fetchAll(
             db, sql: "SELECT * FROM clock_set WHERE ring_id = ? ORDER BY instant, id", arguments: [ringID.uuidString]
-        ).map { row in
-            ClockSetEvent(
-                ringID: try Self.uuid(try Self.column(row, "ring_id")),
-                instant: HistoryTransfer.date(millisecondsSince1970: try Self.column(row, "instant")),
-                timeZoneIdentifier: try Self.column(row, "time_zone_identifier"),
-                utcOffsetSeconds: try Self.column(row, "utc_offset_seconds"))
+        ).map(Self.clockSetEvent)
+    }
+
+    private static func clockSetEvent(_ row: Row) throws -> ClockSetEvent {
+        ClockSetEvent(
+            ringID: try Self.uuid(try Self.column(row, "ring_id")),
+            instant: HistoryTransfer.date(millisecondsSince1970: try Self.column(row, "instant")),
+            timeZoneIdentifier: try Self.column(row, "time_zone_identifier"),
+            utcOffsetSeconds: try Self.column(row, "utc_offset_seconds"))
+    }
+
+    /// The strings stored in `clock_set_outcome.outcome`. NEVER CHANGE an existing code: rows already
+    /// on devices hold them, and an unknown code reads as no outcome, so a rename would silently turn
+    /// ignored phantom clock-sets back into candidates. The switch has no default, so a new case
+    /// fails to compile until it gets a new code here.
+    enum ClockSetOutcomeCode {
+        static func code(for outcome: LoggedClockSetOutcome) -> String {
+            switch outcome {
+            case .acknowledged: "acknowledged"
+            case .notApplied: "notApplied"
+            case .notSent: "notSent"
+            case .unknown: "unknown"
+            }
+        }
+
+        static func outcome(forCode code: String) -> LoggedClockSetOutcome? {
+            LoggedClockSetOutcome.allCases.first { self.code(for: $0) == code }
         }
     }
 
@@ -852,6 +939,20 @@ public final class RingStore: Sendable {
                 ALTER TABLE ring ADD COLUMN peripheral_identifier TEXT;
                 CREATE UNIQUE INDEX ring_peripheral_identifier ON ring(peripheral_identifier COLLATE NOCASE)
                     WHERE peripheral_identifier IS NOT NULL;
+                """)
+        }
+        // What became of each logged clock-set (#72), so time resolution can ignore one the ring
+        // certainly did not apply. A table of its own, not a column on `clock_set`: the log stays
+        // insert-only, and so does this table (one row per clock-set, never updated or deleted), so
+        // ingestion's id-list fingerprint covers it. AUTOINCREMENT so an id is never reused. `outcome`
+        // holds a frozen text code (`ClockSetOutcomeCode`), unchecked like the other codes.
+        migrator.registerMigration("v6-clock-set-outcome") { db in
+            try db.execute(sql: """
+                CREATE TABLE clock_set_outcome (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    clock_set_id INTEGER NOT NULL UNIQUE REFERENCES clock_set(id),
+                    outcome TEXT NOT NULL
+                ) STRICT;
                 """)
         }
         return migrator

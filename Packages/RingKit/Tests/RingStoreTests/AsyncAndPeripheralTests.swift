@@ -45,8 +45,13 @@ struct BlockingView {
         try store.transfers(ringID: ringID, kind: kind, fetchedWithin: range)
     }
     func observations(ringID: UUID) throws -> ObservationListing { try store.observations(ringID: ringID) }
-    func recordClockSet(_ event: ClockSetEvent) throws { try store.recordClockSet(event) }
+    @discardableResult
+    func recordClockSet(_ event: ClockSetEvent) throws -> Int64 { try store.recordClockSet(event) }
     func clockSets(ringID: UUID) throws -> [ClockSetEvent] { try store.clockSets(ringID: ringID) }
+    func recordClockSetOutcome(id: Int64, outcome: LoggedClockSetOutcome) throws {
+        try store.recordClockSetOutcome(id: id, outcome: outcome)
+    }
+    func loggedClockSets(ringID: UUID) throws -> [LoggedClockSet] { try store.loggedClockSets(ringID: ringID) }
     @discardableResult
     func ingest(ringID: UUID, kind: HistoryKind) throws -> IngestionResult { try store.ingest(ringID: ringID, kind: kind) }
     @discardableResult
@@ -253,7 +258,7 @@ private func rawExecute(_ store: RingStore, _ sql: String, _ arguments: Statemen
     /// The registered migrations, in order. Applied migrations are tracked by name, so a rename
     /// or reorder would break existing databases.
     @Test func migrationNamesAndOrderArePinned() {
-        #expect(RingStore.migrator.migrations == ["v1", "v2", "v3", "v4-vitals", "v5-ring-peripheral"])
+        #expect(RingStore.migrator.migrations == ["v1", "v2", "v3", "v4-vitals", "v5-ring-peripheral", "v6-clock-set-outcome"])
     }
 
     @Test func setReplaceAndClear() async throws {

@@ -128,6 +128,10 @@ public enum RingFailure: Sendable, Equatable, CustomStringConvertible {
 /// result already carries the ring id); a file path is not.
 public enum StoreFailure: Sendable, Equatable, CustomStringConvertible {
     case unknownRing(UUID)
+    /// A clock-set id the store's log does not hold (the store's own row id).
+    case unknownClockSet(Int64)
+    /// The clock-set already had a different outcome recorded (the store's own row id).
+    case clockSetOutcomeConflict(Int64)
     case peripheralIdentifierInUse(UUID)
     case fileAccess(errno: Int32)
     /// The store names what could not be read with a constant (a column or a field), never a value.
@@ -143,6 +147,8 @@ public enum StoreFailure: Sendable, Equatable, CustomStringConvertible {
     init(_ error: RingStoreError) {
         switch error {
         case .unknownRing(let id): self = .unknownRing(id)
+        case .unknownClockSet(let id): self = .unknownClockSet(id)
+        case .clockSetOutcomeConflict(let id): self = .clockSetOutcomeConflict(id)
         case .peripheralIdentifierInUse(let id): self = .peripheralIdentifierInUse(id)
         case .fileAccess(_, let code): self = .fileAccess(errno: code)
         case .corruptRow(let what): self = .corruptRow(what)
@@ -156,6 +162,8 @@ public enum StoreFailure: Sendable, Equatable, CustomStringConvertible {
     public var description: String {
         switch self {
         case .unknownRing: "the ring is not in the store"
+        case .unknownClockSet: "the clock-set is not in the store's log"
+        case .clockSetOutcomeConflict: "the clock-set already has a different outcome recorded"
         case .peripheralIdentifierInUse: "the peripheral identifier belongs to another ring"
         case .fileAccess(let code): "the database file could not be accessed (errno \(code))"
         case .corruptRow(let what): "a stored value could not be read (\(what))"
