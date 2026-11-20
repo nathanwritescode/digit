@@ -667,36 +667,47 @@ private final class ZoneBox: @unchecked Sendable {
     }
 }
 
-@Test(.timeLimit(.minutes(1))) func sessionRefusesDeleteRangeFramesEvenIfTheLinkWouldSendThem() async throws {
-    let link = FakeLink()
-    try await using(session(link), link) { s async throws in
-        do {
-            _ = try await s.request(Frame(group: 0x05, key: 0x40))
-            Issue.record("expected a refusal")
-        } catch RingError.refusedDestructive {
-        }
-        #expect(link.sent.isEmpty)
+// Every known destructive or reset command, and the first, last and a middle key of each refused
+// group (#83), is refused by `request` and by `transmit` (reached by skipping `request`'s own
+// checks; the fake would send it) before anything reaches the link.
+private let refusedTypes: [UInt16] = {
+    var types: [UInt16] = [0x0540, 0x0546, 0x0552, 0x0568, 0x0575, 0x0578, 0x0730, 0x0731,
+                           0x010E, 0x0151, 0x0157, 0x0316, 0x0809, 0x031A, 0x031B]
+    for group: UInt16 in [0x07, 0x0A, 0x0C, 0x0E] {
+        types += [group << 8, group << 8 | 0x80, group << 8 | 0xFF]
     }
-}
+    return types
+}()
 
-// `request` refuses delete-range frames before taking a turn; this reaches the refusal every
-// write goes through, in `transmit`, by skipping `request`'s own checks. The fake would send it.
-@Test(.timeLimit(.minutes(1))) func everyWriteRefusesDeleteRangeFrames() async throws {
+@Test(.timeLimit(.minutes(1))) func sessionRefusesEveryKnownDestructiveCommandBeforeWriting() async throws {
     let link = FakeLink()
     try await using(session(link), link) { s async throws in
-        for key in [0x40, 0x46, 0x52] as [UInt8] {
-            do {
-                _ = try await s.requestSkippingChecks(Frame(group: 0x05, key: key))
-                Issue.record("expected a refusal")
-            } catch RingError.refusedDestructive {
+        for type in refusedTypes {
+            let frame = Frame(group: UInt8(type >> 8), key: UInt8(type & 0xFF))
+            for skipChecks in [false, true] {
+                do {
+                    _ = skipChecks ? try await s.requestSkippingChecks(frame) : try await s.request(frame)
+                    Issue.record("expected a refusal of \(String(format: "%04X", type)) (skipChecks \(skipChecks))")
+                } catch RingError.refusedDestructive {
+                }
             }
         }
         #expect(link.sent.isEmpty)
     }
 }
 
-// RingConnection.send repeats the delete-range refusal, but reaching it needs a CBCentralManager
-// (Bluetooth permission). The session-level refusals above and Frame.erasesRingData's own test
+@Test(.timeLimit(.minutes(1))) func sessionStillSendsNeighbouringReadCommands() async throws {
+    let link = FakeLink { [Frame(group: $0.group, key: $0.key, payload: [0])] }
+    try await using(session(link), link) { s async throws in
+        for type: UInt16 in [0x0566, 0x0573, 0x0576, 0x0502, 0x0504, 0x0506, 0x0509, 0x0100, 0x010C, 0x0200, 0x020C] {
+            _ = try await s.request(Frame(group: UInt8(type >> 8), key: UInt8(type & 0xFF)))
+        }
+        #expect(link.sent.count == 11)
+    }
+}
+
+// RingConnection.send repeats the destructive-command refusal, but reaching it needs a CBCentralManager
+// (Bluetooth permission). The session-level refusals above and Frame.isDestructive's own test
 // in RingProtocolTests cover the check.
 
 // The reader hands every frame in these groups to subscribers, so a reply to such a request

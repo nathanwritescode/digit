@@ -44,7 +44,7 @@ public enum RingError: Error, CustomStringConvertible {
         case .rejected(let frame): String(format: "ring rejected command %04X (code %02X)", frame.type, frame.payload.first ?? 0)
         case .checksumMismatch: "history transfer failed its checksum"
         case .busy(let what): "busy: \(what)"
-        case .refusedDestructive(let frame): String(format: "refused to send %04X: it erases history from the ring", frame.type)
+        case .refusedDestructive(let frame): String(format: "refused to send %04X: it can erase data or reset the ring", frame.type)
         case .stopped: "the session was stopped"
         case .tooManyFrames(let limit): "more than \(limit) frames arrived while the conversation was not reading"
         case .refusedUploadGroup(let frame): String(format: "refused to send %04X: replies in group %02X are treated as ring uploads", frame.type, frame.group)
@@ -371,7 +371,7 @@ public final class RingConnection: NSObject, @unchecked Sendable {
     // MARK: Frames
 
     public func send(_ frame: Frame) async throws {
-        guard !frame.erasesRingData else { throw RingError.refusedDestructive(frame) }
+        guard !frame.isDestructive else { throw RingError.refusedDestructive(frame) }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async {
                 guard let peripheral = self.peripheral, peripheral.state == .connected,
